@@ -8,3 +8,12 @@ Dockerfile text eol=lf
 *.toml text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
+
+# AstrBot 装插件时下载的是仓库压缩包（zip 上限 16MB），里面只需要根目录的插件文件。
+# Bridge 服务端、示例图和部署脚本用 git clone 获取，不进压缩包。
+/docker export-ignore
+/docs export-ignore
+/scripts export-ignore
+/.github export-ignore
+/.gitattributes export-ignore
+/.gitignore export-ignore

@@ -1,0 +1,63 @@
+services:
+  arena-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arena-bridge
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      LM_BRIDGE_DATA_DIR: /data
+      LM_BRIDGE_PORT: "8000"
+      LM_BRIDGE_ADMIN_PASSWORD: ${LM_BRIDGE_ADMIN_PASSWORD:-}
+      LM_BRIDGE_API_KEY: ${LM_BRIDGE_API_KEY:-}
+      LM_BRIDGE_RPM: ${LM_BRIDGE_RPM:-30}
+      LM_BRIDGE_BROWSER_CDP_URL: ${LM_BRIDGE_BROWSER_CDP_URL:-}
+      LM_BRIDGE_BROWSER_VNC_URL: ${LM_BRIDGE_BROWSER_VNC_URL:-}
+      LM_BRIDGE_BROWSER_GATEWAY_URL: ${LM_BRIDGE_BROWSER_GATEWAY_URL:-}
+      LM_BRIDGE_INTERACTIVE_LINK_SECRET_FILE: /run/secrets/interactive_link_secret
+    volumes:
+      - ./arena-data:/data
+      - ./.interactive-link-secret:/run/secrets/interactive_link_secret:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - astrbot-network
+    shm_size: "1gb"
+
+  arena-browser:
+    build:
+      context: .
+      dockerfile: Dockerfile.arena-browser
+    container_name: arena-browser
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      NOVNC_PASSWORD: ${ARENA_NOVNC_PASSWORD:-}
+      NOVNC_GATEWAY_HOST: "0.0.0.0"
+      NOVNC_GATEWAY_PORT: "6081"
+      NOVNC_GATEWAY_SECRET_FILE: /run/secrets/interactive_link_secret
+      NOVNC_PASSWORD_FILE: /run/secrets/novnc_password
+      NOVNC_VNC_URL: "${LM_BRIDGE_BROWSER_VNC_URL:-http://HOST:6082/vnc.html?autoconnect=true&resize=scale}"
+    secrets:
+      - interactive_link_secret
+      - novnc_password
+    volumes:
+      - ./arena-browser-data:/data/browser
+    ports:
+      - "6081:6081"
+      - "127.0.0.1:6082:6080"
+    networks:
+      - astrbot-network
+    shm_size: "1gb"
+
+networks:
+  astrbot-network:
+    external: true
+    name: ${ASTRBOT_NETWORK:-astrbot_default}
+
+secrets:
+  interactive_link_secret:
+    file: ./.interactive-link-secret
+  novnc_password:
+    file: ./.novnc-password

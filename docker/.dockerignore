@@ -1,0 +1,12 @@
+.git
+.github
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+config.json
+models.json
+arena-data
+arena-browser-data
+.env
+tests

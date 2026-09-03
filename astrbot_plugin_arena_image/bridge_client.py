@@ -1,0 +1,629 @@
+"""Small, dependency-light client for the LMArenaBridge OpenAI-compatible API."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import mimetypes
+import re
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote_to_bytes, urlparse
+
+import httpx
+
+DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+class BridgeError(RuntimeError):
+    """An HTTP or protocol error returned by LMArenaBridge."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        payload: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload
+        self.code = _payload_code(payload)
+
+    @property
+    def requires_interactive_auth(self) -> bool:
+        """Whether the error is consistent with an Arena/Cloudflare challenge."""
+        if self.code in {
+            "arena_verification_required",
+            "interactive_auth_required",
+            "cloudflare_challenge",
+            "arena_auth_expired",
+            "arena_auth_required",
+            "arena_login_required",
+            "authentication_error",
+        }:
+            return True
+        text = str(self).casefold()
+        challenge_terms = (
+            "cloudflare",
+            "turnstile",
+            "recaptcha",
+            "re-captcha",
+            "cf clearance",
+            "server may be blocked",
+            "browser transport",
+            "arena auth",
+        )
+        if any(term in text for term in challenge_terms) and self.status_code in {
+            403,
+            500,
+            502,
+            503,
+        }:
+            return True
+
+        # The bridge returns OpenAI-compatible error objects for upstream
+        # authentication failures.  Those responses normally have HTTP 200
+        # at the bridge boundary, so ``status_code`` is None and the upstream
+        # code is carried as ``http_401`` (or as numeric ``401`` for SSE
+        # errors).  Distinguish this from an invalid *Bridge API key* by
+        # requiring an Arena-auth-specific marker in the message.
+        arena_auth_terms = (
+            "lmarena auth token",
+            "arena-auth",
+            "arena auth",
+            "auth token has expired",
+            "auth token is invalid",
+            "login required",
+            "login_gate",
+            "登录账号",
+        )
+        if any(term in text for term in arena_auth_terms):
+            return True
+        return self.code in {"http_401", "401"} and "unauthorized" in text
+
+    @property
+    def interactive_auth_url(self) -> str:
+        return _payload_string(self.payload, "browser_url") or _payload_string(
+            self.payload,
+            "verification_url",
+        )
+
+
+def normalize_api_base(value: str) -> str:
+    """Normalize a configured bridge URL to the ``/api/v1`` root."""
+    normalized = str(value or "").strip().rstrip("/")
+    if not normalized:
+        raise ValueError("bridge_url 不能为空")
+
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("bridge_url 必须是没有查询参数的 http(s) URL")
+
+    if parsed.path.rstrip("/").endswith("/api/v1"):
+        return normalized
+    return f"{normalized}/api/v1"
+
+
+def _error_object(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return error
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        return detail
+    return {}
+
+
+def _payload_code(payload: Any) -> str:
+    value = _error_object(payload).get("code")
+    return str(value or "").strip().casefold()
+
+
+def _payload_string(payload: Any, key: str) -> str:
+    value = _error_object(payload).get(key)
+    return str(value or "").strip()
+
+
+def _error_message(payload: Any, fallback: str) -> str:
+    error = _error_object(payload)
+    if error:
+        message = error.get("message") or error.get("detail")
+        if message:
+            return str(message)
+    if isinstance(payload, dict) and payload.get("detail"):
+        return str(payload["detail"])
+    return fallback
+
+
+def _sniff_mime(raw: bytes) -> str | None:
+    """Detect the most common image formats without optional image libraries."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+
+    # SVG responses often begin with an XML declaration or a UTF-8 BOM.
+    prefix = raw[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if prefix.startswith(b"<svg") or (prefix.startswith(b"<?xml") and b"<svg" in prefix):
+        return "image/svg+xml"
+    return None
+
+
+def guess_image_mime(source: str | None = None, raw: bytes = b"") -> str:
+    """Infer an image MIME type from bytes or a path/URL."""
+    detected = _sniff_mime(raw)
+    if detected:
+        return detected
+
+    text = str(source or "")
+    suffix = Path(urlparse(text).path).suffix.lower()
+    guessed = mimetypes.types_map.get(suffix)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    guessed, _ = mimetypes.guess_type(text, strict=False)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "image/png"
+
+
+def _decode_base64_payload(value: str) -> bytes:
+    compact = re.sub(r"\s+", "", value)
+    if not compact:
+        return b""
+
+    # A few adapters omit padding. Restoring it is safe after validating the
+    # alphabet and makes the helper work with both common base64 conventions.
+    compact += "=" * (-len(compact) % 4)
+    try:
+        return base64.b64decode(compact, validate=True)
+    except (ValueError, binascii.Error):
+        # URL-safe base64 is occasionally used by message adapters.
+        try:
+            return base64.urlsafe_b64decode(compact)
+        except (ValueError, binascii.Error) as exc:
+            raise BridgeError("图片 Base64 数据无效") from exc
+
+
+def _decode_data_uri(value: str) -> tuple[bytes, str | None]:
+    if "," not in value:
+        raise BridgeError("图片 Data URI 格式无效")
+
+    header, encoded = value.split(",", 1)
+    if not header.lower().startswith("data:"):
+        raise BridgeError("图片 Data URI 格式无效")
+
+    metadata = header[5:].split(";")
+    mime = metadata[0].strip().lower() or None
+    is_base64 = any(part.strip().lower() == "base64" for part in metadata[1:])
+    if is_base64:
+        return _decode_base64_payload(encoded), mime
+    return unquote_to_bytes(encoded), mime
+
+
+def _select_image_mime(
+    *,
+    source: str | None,
+    raw: bytes,
+    explicit_mime: str | None,
+) -> str:
+    explicit = str(explicit_mime or "").split(";", 1)[0].strip().lower()
+    detected = _sniff_mime(raw)
+
+    if explicit and not explicit.startswith("image/"):
+        if detected:
+            return detected
+        raise BridgeError(f"不支持的图片类型：{explicit}")
+    if explicit:
+        return explicit
+    if detected:
+        return detected
+    return guess_image_mime(source, raw)
+
+
+def decode_image_value(
+    value: str | bytes,
+    *,
+    source: str | None = None,
+    mime_type: str | None = None,
+    max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> tuple[bytes, str]:
+    """Decode an image URL/data URI/base64 value and return ``(bytes, mime)``."""
+    if isinstance(value, bytes):
+        raw = value
+        embedded_mime = None
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise BridgeError("图片内容为空")
+        if text.lower().startswith("data:"):
+            raw, embedded_mime = _decode_data_uri(text)
+        else:
+            if text.lower().startswith("base64://"):
+                text = text[9:]
+            raw = _decode_base64_payload(text)
+            embedded_mime = None
+
+    if not raw:
+        raise BridgeError("图片内容为空")
+    if len(raw) > max_bytes:
+        raise BridgeError(f"图片超过大小限制（{max_bytes // 1024 // 1024} MB）")
+
+    mime = _select_image_mime(
+        source=source,
+        raw=raw,
+        explicit_mime=mime_type or embedded_mime,
+    )
+    if not mime.startswith("image/"):
+        raise BridgeError(f"不支持的图片类型：{mime}")
+    return raw, mime
+
+
+def data_uri_from_base64(
+    value: str | bytes,
+    *,
+    source: str | None = None,
+    mime_type: str | None = None,
+    max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> str:
+    """Build a validated image data URI from raw/base64 input."""
+    raw, mime = decode_image_value(
+        value,
+        source=source,
+        mime_type=mime_type,
+        max_bytes=max_bytes,
+    )
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content")
+                if text is not None:
+                    parts.append(str(text))
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "")
+    return ""
+
+
+def response_text(payload: Any) -> str:
+    """Extract assistant text from an OpenAI-compatible response."""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first.get("message"), dict) else first
+    return _content_text(message.get("content"))
+
+
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[[^\]]*\]\(\s*(?:<)?((?:https?://[^)\s>]+)|(?:data:image/[^)\s>]+))(?:>)?\s*\)",
+    re.IGNORECASE,
+)
+_DATA_URI_RE = re.compile(
+    r"data:image/[a-z0-9.+-]+(?:;[a-z0-9=._-]+)*,[a-z0-9%+/=_-]+",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+
+
+def _append_url(result: list[str], value: Any) -> None:
+    if not isinstance(value, str):
+        return
+    candidate = value.strip().rstrip(".,;:!?")
+    lower = candidate.lower()
+    if lower.startswith(("http://", "https://", "data:image/")) and candidate not in result:
+        result.append(candidate)
+
+
+def _append_base64(
+    result: list[str],
+    value: Any,
+    *,
+    mime_type: str | None = None,
+) -> None:
+    if not isinstance(value, (str, bytes)):
+        return
+    try:
+        uri = data_uri_from_base64(value, mime_type=mime_type)
+        if uri not in result:
+            result.append(uri)
+    except BridgeError:
+        return
+
+
+def _append_image_candidate(
+    result: list[str],
+    value: Any,
+    *,
+    mime_type: str | None = None,
+    raw_base64: bool = False,
+) -> None:
+    """Append one image-shaped response value, accepting common API variants."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _append_image_candidate(result, item, mime_type=mime_type)
+        return
+
+    if isinstance(value, dict):
+        media_type = value.get("mime_type") or value.get("media_type") or mime_type
+        if value.get("b64_json") is not None:
+            _append_base64(result, value.get("b64_json"), mime_type=media_type)
+        if value.get("base64") is not None:
+            _append_base64(result, value.get("base64"), mime_type=media_type)
+
+        # OpenAI, Anthropic, and several gateway formats use one of these
+        # nested fields for an image URL or source object.
+        for key in ("image_url", "url", "image", "source"):
+            if key in value:
+                nested = value[key]
+                if isinstance(nested, dict):
+                    nested_media_type = (
+                        nested.get("media_type") or nested.get("mime_type") or media_type
+                    )
+                    if nested.get("data") is not None:
+                        _append_base64(
+                            result,
+                            nested.get("data"),
+                            mime_type=nested_media_type,
+                        )
+                    _append_image_candidate(
+                        result,
+                        nested,
+                        mime_type=nested_media_type,
+                    )
+                else:
+                    _append_image_candidate(
+                        result,
+                        nested,
+                        mime_type=media_type,
+                    )
+        return
+
+    if raw_base64:
+        _append_base64(result, value, mime_type=mime_type)
+    else:
+        _append_url(result, value)
+
+
+def _extract_images_from_text(text: str, result: list[str]) -> None:
+    for match in _MARKDOWN_IMAGE_RE.findall(text):
+        _append_url(result, match)
+    for match in _DATA_URI_RE.findall(text):
+        _append_url(result, match)
+    for match in _URL_RE.findall(text):
+        _append_url(result, match)
+
+
+def _extract_images_from_content(content: Any, result: list[str]) -> None:
+    if isinstance(content, str):
+        _extract_images_from_text(content, result)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                _extract_images_from_text(item, result)
+            elif isinstance(item, dict):
+                _append_image_candidate(result, item)
+                text = item.get("text")
+                if isinstance(text, str):
+                    _extract_images_from_text(text, result)
+    elif isinstance(content, dict):
+        _append_image_candidate(result, content)
+        text = content.get("text")
+        if isinstance(text, str):
+            _extract_images_from_text(text, result)
+
+
+def image_urls(payload: Any) -> list[str]:
+    """Extract generated image URLs/data URIs from common response shapes."""
+    result: list[str] = []
+    if not isinstance(payload, dict):
+        return result
+
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else choice
+            if isinstance(message, dict):
+                _extract_images_from_content(message.get("content"), result)
+                for key in ("images", "image", "data"):
+                    if key in message:
+                        _append_image_candidate(result, message[key])
+            for key in ("images", "image", "data"):
+                if key in choice:
+                    _append_image_candidate(result, choice[key])
+
+    # Image-generation APIs commonly return a top-level data/images/output
+    # array rather than a chat message.
+    for key in ("data", "images", "output"):
+        if key in payload:
+            value = payload[key]
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and item.get("b64_json") is not None:
+                        _append_base64(
+                            result,
+                            item.get("b64_json"),
+                            mime_type=item.get("mime_type") or item.get("media_type"),
+                        )
+                    else:
+                        _append_image_candidate(result, item)
+            else:
+                _append_image_candidate(result, value)
+
+    response = payload.get("response")
+    if isinstance(response, str):
+        _extract_images_from_text(response, result)
+    return result
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def model_is_image_capable(model: dict[str, Any]) -> tuple[bool, bool]:
+    """Return ``(output_image, input_image)`` from bridge model metadata."""
+    capabilities = model.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+
+    output = capabilities.get("outputCapabilities")
+    if not isinstance(output, dict):
+        output = capabilities.get("output_capabilities")
+    if not isinstance(output, dict):
+        output = {}
+
+    inputs = capabilities.get("inputCapabilities")
+    if not isinstance(inputs, dict):
+        inputs = capabilities.get("input_capabilities")
+    if not isinstance(inputs, dict):
+        inputs = {}
+
+    output_image = _as_bool(model.get("output_image")) or _as_bool(output.get("image"))
+    input_image = _as_bool(model.get("input_image")) or _as_bool(inputs.get("image"))
+    return output_image, input_image
+
+
+class ArenaBridgeClient:
+    """Async client used by the AstrBot plugin."""
+
+    def __init__(self, base_url: str, api_key: str = "", timeout: float = 300) -> None:
+        self.base_url = normalize_api_base(base_url)
+        self.api_key = str(api_key or "").strip()
+        self.timeout = max(10.0, float(timeout))
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=self.timeout,
+                headers=self._headers(),
+            ) as client:
+                response = await client.request(method, url, **kwargs)
+        except httpx.HTTPError as exc:
+            raise BridgeError(f"连接 Bridge 失败：{exc}") from exc
+
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+
+        if response.status_code >= 400:
+            raise BridgeError(
+                _error_message(payload, f"Bridge 返回 HTTP {response.status_code}"),
+                status_code=response.status_code,
+                payload=payload,
+            )
+        if isinstance(payload, dict) and payload.get("error") and not payload.get("choices"):
+            raise BridgeError(
+                _error_message(payload, "Bridge 返回错误"),
+                payload=payload,
+            )
+        return payload
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        payload = await self._request("GET", "models")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def health(self) -> dict[str, Any]:
+        payload = await self._request("GET", "health")
+        return payload if isinstance(payload, dict) else {}
+
+    async def model_health(self) -> dict[str, Any]:
+        payload = await self._request("GET", "model-health")
+        return payload if isinstance(payload, dict) else {}
+
+    async def start_interactive_auth(self) -> dict[str, Any]:
+        payload = await self._request("POST", "interactive-auth/start")
+        return payload if isinstance(payload, dict) else {}
+
+    async def interactive_auth_status(self, session_id: str) -> dict[str, Any]:
+        clean_id = str(session_id or "").strip()
+        if not clean_id:
+            raise BridgeError("验证会话编号为空")
+        payload = await self._request(
+            "GET",
+            f"interactive-auth/status/{clean_id}",
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def latest_interactive_auth_status(self) -> dict[str, Any]:
+        payload = await self._request("GET", "interactive-auth/status")
+        return payload if isinstance(payload, dict) else {}
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        images: list[str] | None = None,
+    ) -> dict[str, Any]:
+        clean_model = str(model or "").strip()
+        clean_prompt = str(prompt or "").strip()
+        image_values = [str(image).strip() for image in (images or []) if str(image).strip()]
+        if not clean_model:
+            raise BridgeError("模型名不能为空")
+        if not clean_prompt and not image_values:
+            raise BridgeError("提示词和参考图不能同时为空")
+
+        if image_values:
+            content: Any = [
+                {
+                    "type": "text",
+                    "text": clean_prompt or "请根据参考图生成图片",
+                }
+            ]
+            content.extend(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image},
+                }
+                for image in image_values
+            )
+        else:
+            content = clean_prompt
+
+        return await self._request(
+            "POST",
+            "chat/completions",
+            json={
+                "model": clean_model,
+                "messages": [{"role": "user", "content": content}],
+                "stream": False,
+            },
+        )

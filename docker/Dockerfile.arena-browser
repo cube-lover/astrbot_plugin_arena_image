@@ -1,0 +1,28 @@
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+
+USER root
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        fonts-noto-cjk \
+        fluxbox \
+        novnc \
+        procps \
+        websockify \
+        x11vnc \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /app
+COPY arena-browser-entrypoint.sh /usr/local/bin/arena-browser-entrypoint.sh
+COPY novnc_gateway.py /app/novnc_gateway.py
+RUN sed -i "s/\r$//" /usr/local/bin/arena-browser-entrypoint.sh \
+    && chmod 755 /usr/local/bin/arena-browser-entrypoint.sh
+
+EXPOSE 6081 6082 9223
+
+ENTRYPOINT ["/usr/local/bin/arena-browser-entrypoint.sh"]

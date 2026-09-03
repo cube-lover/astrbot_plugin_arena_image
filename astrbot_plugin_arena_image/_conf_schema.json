@@ -1,0 +1,63 @@
+{
+  "bridge_url": {
+    "type": "string",
+    "description": "LMArenaBridge 根地址或 /api/v1 地址",
+    "default": "http://arena-bridge:8000"
+  },
+  "bridge_api_key": {
+    "type": "string",
+    "description": "LMArenaBridge API Key（默认零配置，留空即可）",
+    "secret": true,
+    "default": ""
+  },
+  "default_model": {
+    "type": "string",
+    "description": "默认画图模型；留空使用 Bridge 返回的第一个模型",
+    "default": "gpt-image-2 (medium)"
+  },
+  "request_timeout": {
+    "type": "int",
+    "description": "模型请求和图片下载超时（秒）",
+    "default": 300
+  },
+  "model_cache_seconds": {
+    "type": "int",
+    "description": "模型列表缓存时间（秒）",
+    "default": 30
+  },
+  "model_list_limit": {
+    "type": "int",
+    "description": "模型列表最多展示数量",
+    "default": 50
+  },
+  "model_health_cache_seconds": {
+    "type": "int",
+    "description": "模型状态码缓存时间（秒）",
+    "default": 30
+  },
+  "image_models_only": {
+    "type": "bool",
+    "description": "模型列表只显示可画图模型（关闭后显示全部 312 个）",
+    "default": true
+  },
+  "max_image_bytes": {
+    "type": "int",
+    "description": "输入或输出图片最大字节数",
+    "default": 10485760
+  },
+  "max_input_images": {
+    "type": "int",
+    "description": "一次图生图最多发送的参考图数量",
+    "default": 4
+  },
+  "max_output_images": {
+    "type": "int",
+    "description": "一次请求最多发送的生成图片数量",
+    "default": 1
+  },
+  "max_saved_outputs": {
+    "type": "int",
+    "description": "插件本地最多保留的生成图片数量",
+    "default": 32
+  }
+}

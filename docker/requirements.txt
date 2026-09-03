@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+camoufox
+playwright
+httpx
+cloudscraper
+python-multipart
+# vision-ai-recaptcha-solver  # optional: uncomment for AI-powered reCAPTCHA v2 image challenge solving (heavy dependencies: torch, ultralytics, onnxruntime)

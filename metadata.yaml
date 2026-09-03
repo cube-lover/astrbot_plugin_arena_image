@@ -1,0 +1,5 @@
+name: astrbot_plugin_arena_image
+desc: 通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图
+author: Codex
+version: 0.2.1
+repo: local

@@ -1,0 +1,14 @@
+.env
+.interactive-link-secret
+.novnc-password
+api-key.txt
+config.json
+models.json
+arena-data/
+arena-browser-data/
+__pycache__/
+*.py[co]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/

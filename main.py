@@ -48,6 +48,9 @@ DEFAULT_MAX_OUTPUT_IMAGE_BYTES = 64 * 1024 * 1024
 # Messaging platforms reject very large attachments, so anything above this is
 # re-encoded before it is sent instead of being dropped.
 DEFAULT_SEND_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+# Arena's attachment pipeline only accepts still pictures, so GIF uploads are
+# always flattened even when they hold a single frame.
+ALWAYS_FLATTEN_INPUT_MIMES = frozenset({"image/gif", "image/apng"})
 
 
 def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -108,11 +111,50 @@ def _shrink_image_bytes(raw: bytes, mime: str, limit: int) -> tuple[bytes, str]:
     return data, "image/jpeg"
 
 
+def _is_animated_upload(raw: bytes, mime: str) -> bool:
+    """Cheap check for reference images Arena cannot take as-is.
+
+    Chunk sniffing keeps the common still-image path free of Pillow work: APNG
+    declares ``acTL`` and animated WebP declares ``ANIM``/``ANMF``, both near
+    the start of the file.
+    """
+    clean = str(mime or "").split(";", 1)[0].strip().lower()
+    if clean in ALWAYS_FLATTEN_INPUT_MIMES:
+        return True
+    head = raw[:4096]
+    if clean == "image/png":
+        return b"acTL" in head
+    if clean == "image/webp":
+        return b"ANIM" in head or b"ANMF" in head
+    return False
+
+
+def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
+    """Flatten an animated reference image to its first frame as PNG.
+
+    Arena rejects animated attachments, so an untouched GIF fails the whole
+    generation.  Bytes Pillow cannot open are returned unchanged so the Bridge
+    still receives the original upload.
+    """
+    if PILImage is None or not raw:
+        return raw, mime
+    try:
+        with PILImage.open(io.BytesIO(raw)) as source:
+            source.seek(0)
+            transparent = "transparency" in source.info or source.mode in {"RGBA", "LA", "PA"}
+            frame = source.convert("RGBA" if transparent else "RGB")
+        buffer = io.BytesIO()
+        frame.save(buffer, format="PNG", optimize=True)
+    except Exception:  # Broken or unknown container: leave it to the Bridge.
+        return raw, mime
+    return buffer.getvalue(), "image/png"
+
+
 @register(
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.3.0",
+    "0.4.2",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -731,9 +773,39 @@ class ArenaImagePlugin(Star):
             ).strip()
             try:
                 raw_base64 = await component.convert_to_base64()
-                data_uri = data_uri_from_base64(
+                raw, mime = decode_image_value(
                     raw_base64,
                     source=source,
+                    max_bytes=max_bytes,
+                )
+                if _is_animated_upload(raw, mime):
+                    original_mime = mime
+                    original_size = len(raw)
+                    frame, frame_mime = await asyncio.to_thread(_first_frame_bytes, raw, mime)
+                    if frame is raw:
+                        # The helper hands back the very same object when it cannot
+                        # decode the animation, which also covers a missing Pillow.
+                        logger.warning(
+                            "[arena_image] 参考图是动图（%s）但无法取帧（缺少 Pillow？），原样上传",
+                            original_mime,
+                        )
+                    else:
+                        raw, mime = frame, frame_mime
+                        if len(raw) > max_bytes:
+                            raw, mime = await asyncio.to_thread(
+                                _shrink_image_bytes, raw, mime, max_bytes
+                            )
+                        logger.info(
+                            "[arena_image] 参考图是动图（%s），已取第一帧作为 %s：%s -> %s",
+                            original_mime,
+                            mime,
+                            _human_bytes(original_size),
+                            _human_bytes(len(raw)),
+                        )
+                data_uri = data_uri_from_base64(
+                    raw,
+                    source=source,
+                    mime_type=mime,
                     max_bytes=max_bytes,
                 )
                 if remember(data_uri):

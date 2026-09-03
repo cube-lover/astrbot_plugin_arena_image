@@ -698,6 +698,118 @@ class InputImageDedupTest(unittest.TestCase):
         self.assertEqual(images, ["https://img.example/ref.png"])
 
 
+class AnimatedInputFrameTest(unittest.TestCase):
+    """GIF references reached Arena as animations, which failed the whole draw."""
+
+    @staticmethod
+    def _animated_gif(size: int = 24) -> bytes:
+        from PIL import Image as PILImage
+
+        frames = [PILImage.new("P", (size, size), color=index) for index in (1, 2, 3)]
+        buffer = io.BytesIO()
+        frames[0].save(
+            buffer,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=80,
+        )
+        return buffer.getvalue()
+
+    def _event(self, main, payload: bytes, name: str):
+        event = FakeEvent()
+        event.message_obj = types.SimpleNamespace(
+            message=[
+                main.Image(
+                    file=name,
+                    base64_value=base64.b64encode(payload).decode("ascii"),
+                )
+            ]
+        )
+        return event
+
+    def test_animated_containers_are_detected(self) -> None:
+        main = _plugin_module()
+        self.assertTrue(main._is_animated_upload(b"GIF89a" + b"\x00" * 8, "image/gif"))
+        self.assertTrue(main._is_animated_upload(PNG_MAGIC + b"\x00\x00\x00\x08acTL", "image/png"))
+        self.assertTrue(
+            main._is_animated_upload(b"RIFF\x00\x00\x00\x00WEBPVP8X" + b"ANIM", "image/webp")
+        )
+        self.assertFalse(main._is_animated_upload(PNG_MAGIC + b"IDAT", "image/png"))
+        self.assertFalse(main._is_animated_upload(b"\xff\xd8\xff\xe0", "image/jpeg"))
+        self.assertFalse(
+            main._is_animated_upload(b"RIFF\x00\x00\x00\x00WEBPVP8 still", "image/webp")
+        )
+
+    def test_first_frame_is_a_single_frame_png(self) -> None:
+        main = _plugin_module()
+        if main.PILImage is None:
+            self.skipTest("Pillow is not installed")
+        data, mime = main._first_frame_bytes(self._animated_gif(), "image/gif")
+        self.assertEqual(mime, "image/png")
+        self.assertTrue(data.startswith(PNG_MAGIC))
+        with main.PILImage.open(io.BytesIO(data)) as flattened:
+            self.assertEqual(getattr(flattened, "n_frames", 1), 1)
+            self.assertEqual(flattened.size, (24, 24))
+
+    def test_undecodable_animation_is_left_to_the_bridge(self) -> None:
+        main = _plugin_module()
+        raw = b"GIF89a" + b"\x00" * 32
+        self.assertEqual(main._first_frame_bytes(raw, "image/gif"), (raw, "image/gif"))
+
+    def test_gif_reference_is_uploaded_as_png(self) -> None:
+        main, plugin = _make_plugin(self)
+        if main.PILImage is None:
+            self.skipTest("Pillow is not installed")
+        event = self._event(main, self._animated_gif(), "/tmp/ref.gif")
+        with patch.object(main.logger, "info"):
+            images = asyncio.run(plugin._collect_input_images(event))
+        self.assertEqual(len(images), 1)
+        self.assertTrue(images[0].startswith("data:image/png;base64,"))
+
+    def test_still_png_reference_is_passed_through_untouched(self) -> None:
+        main, plugin = _make_plugin(self)
+        payload = PNG_MAGIC + b"still-bytes"
+        event = self._event(main, payload, "/tmp/ref.png")
+        images = asyncio.run(plugin._collect_input_images(event))
+        encoded = base64.b64encode(payload).decode("ascii")
+        self.assertEqual(images, [f"data:image/png;base64,{encoded}"])
+
+    def test_apng_keeps_its_png_mime_and_is_not_reported_as_a_failure(self) -> None:
+        main, plugin = _make_plugin(self)
+        if main.PILImage is None:
+            self.skipTest("Pillow is not installed")
+        frames = [main.PILImage.new("RGB", (16, 16), color=(index * 40, 0, 0)) for index in (1, 2)]
+        buffer = io.BytesIO()
+        frames[0].save(buffer, format="PNG", save_all=True, append_images=frames[1:])
+        payload = buffer.getvalue()
+        self.assertTrue(main._is_animated_upload(payload, "image/png"))
+        event = self._event(main, payload, "/tmp/ref.png")
+        with (
+            patch.object(main.logger, "info"),
+            patch.object(main.logger, "warning") as warned,
+        ):
+            images = asyncio.run(plugin._collect_input_images(event))
+        self.assertFalse(warned.called)
+        encoded = base64.b64encode(payload).decode("ascii")
+        self.assertNotIn(encoded, images[0])
+        flattened = base64.b64decode(images[0].split(",", 1)[1])
+        with main.PILImage.open(io.BytesIO(flattened)) as still:
+            self.assertEqual(getattr(still, "n_frames", 1), 1)
+
+    def test_without_pillow_the_gif_still_goes_out_with_a_warning(self) -> None:
+        main, plugin = _make_plugin(self)
+        event = self._event(main, b"GIF89a" + b"\x00" * 16, "/tmp/ref.gif")
+        with (
+            patch.object(main, "PILImage", None),
+            patch.object(main.logger, "warning") as warned,
+        ):
+            images = asyncio.run(plugin._collect_input_images(event))
+        self.assertEqual(len(images), 1)
+        self.assertTrue(images[0].startswith("data:image/gif;base64,"))
+        self.assertTrue(warned.called)
+
+
 class SchemaAndMetadataTest(unittest.TestCase):
     def test_new_config_keys_are_declared_with_matching_defaults(self) -> None:
         import json
@@ -717,8 +829,12 @@ class SchemaAndMetadataTest(unittest.TestCase):
             self.assertIn(key, schema)
         self.assertIn("输入", schema["max_image_bytes"]["description"])
         metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 0.4.1", metadata)
+        self.assertIn("version: 0.4.2", metadata)
         self.assertIn("author: cube-lover", metadata)
+        # The @register version used to drift behind metadata.yaml, which made the
+        # AstrBot console show a stale plugin version after an upgrade.
+        source = (root / "main.py").read_text(encoding="utf-8")
+        self.assertIn('    "0.4.2",\n)', source)
 
     def test_repository_root_is_the_installable_plugin_directory(self) -> None:
         """AstrBot installs the repo into ``data/plugins/<repo_name>`` and then

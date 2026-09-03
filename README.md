@@ -5,11 +5,15 @@
 
 ---
 
+## 🎨 支持 Arena 灰测模型：蒙娜丽莎（GPT-Image-2.5）
 
-> [!IMPORTANT]
+可在模型列表中选择 Arena 灰测画图模型 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
 
----
+| 成品效果 | 成品效果 |
+| --- | --- |
+| ![蒙娜丽莎成品示例 1](docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](docs/examples/mona-sample-boy.png) |
 
+官网入口：[https://arena.ai](https://arena.ai)
 
 AstrBot 的 Arena 画图插件和配套 LMArenaBridge Docker 服务。支持文生图、图生图、模型列表、按会话切换模型、Arena 登录态自动采集。
 
@@ -65,6 +69,8 @@ chmod +x setup.sh
 - 校验 Compose 配置
 
 Bridge API Key 默认留空。服务只监听 `127.0.0.1` 和 Docker 内网，不需要填 API Key。
+
+国内服务器可选配置代理：编辑 `docker/.env`，设置 `LM_BRIDGE_PROXY_URL=http://你的代理地址:端口`；香港/海外服务器保持为空即可。详见 [docker/USAGE.md](docker/USAGE.md)。
 
 ### 3. 启动 Docker
 
@@ -166,7 +172,7 @@ bridge_api_key = 留空
 
 - `arena-bridge` 的 `8000` 端口只绑定宿主机 `127.0.0.1`
 - noVNC `6082` 只绑定宿主机 `127.0.0.1`
-- 短时验证链接 `6081` 对外开放，链接带签名和有效期
+- 短时验证链接 `6081` 对外开放，链接带签名和有效期；noVNC 页面和 WebSocket 也由 `6081` 网关同端口代理，不会跳转到本机-only 的 `6082`
 - Arena Cookie、浏览器登录态、密钥文件只保存在服务器本地
 
 不要把以下文件发给其他人：
@@ -207,6 +213,10 @@ http://arena-bridge:8000
 ### 429 Too Many Requests
 
 Arena 上游限速。等待几分钟再试，不要连续请求。可在 `.env` 里调低 `LM_BRIDGE_RPM`。
+
+### 国内服务器无法访问 Arena
+
+在 `docker/.env` 中设置 `LM_BRIDGE_PROXY_URL`，然后重新执行 `docker compose -f docker-compose.arena.yml --env-file .env up -d`。
 
 ## License
 

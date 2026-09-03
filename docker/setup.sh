@@ -99,6 +99,17 @@ else
   info "Docker 网络已配置，跳过检测"
 fi
 
+# ---------- 4.1 兼容旧版 .env ----------
+if ! grep -q '^LM_BRIDGE_PROXY_URL=' .env; then
+  cat >> .env <<'EOF'
+
+# Optional HTTP/HTTPS proxy for servers in mainland China.
+# Leave empty on servers that can reach Arena directly.
+LM_BRIDGE_PROXY_URL=
+EOF
+  info "已补充可选代理配置 LM_BRIDGE_PROXY_URL"
+fi
+
 # ---------- 5. 生成密钥文件 ----------
 if [[ ! -f .interactive-link-secret ]]; then
   rand_hex 32 > .interactive-link-secret

@@ -3,6 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${LM_BRIDGE_PROXY_URL:-}
+        HTTPS_PROXY: ${LM_BRIDGE_PROXY_URL:-}
+        NO_PROXY: localhost,127.0.0.1,arena-browser,arena-bridge,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
     container_name: arena-bridge
     restart: unless-stopped
     environment:
@@ -15,6 +19,13 @@ services:
       LM_BRIDGE_BROWSER_CDP_URL: ${LM_BRIDGE_BROWSER_CDP_URL:-}
       LM_BRIDGE_BROWSER_VNC_URL: ${LM_BRIDGE_BROWSER_VNC_URL:-}
       LM_BRIDGE_BROWSER_GATEWAY_URL: ${LM_BRIDGE_BROWSER_GATEWAY_URL:-}
+      LM_BRIDGE_PROXY_URL: ${LM_BRIDGE_PROXY_URL:-}
+      HTTP_PROXY: ${LM_BRIDGE_PROXY_URL:-}
+      HTTPS_PROXY: ${LM_BRIDGE_PROXY_URL:-}
+      NO_PROXY: localhost,127.0.0.1,arena-browser,arena-bridge,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
+      http_proxy: ${LM_BRIDGE_PROXY_URL:-}
+      https_proxy: ${LM_BRIDGE_PROXY_URL:-}
+      no_proxy: localhost,127.0.0.1,arena-browser,arena-bridge,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
       LM_BRIDGE_INTERACTIVE_LINK_SECRET_FILE: /run/secrets/interactive_link_secret
     volumes:
       - ./arena-data:/data
@@ -29,10 +40,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.arena-browser
+      args:
+        HTTP_PROXY: ${LM_BRIDGE_PROXY_URL:-}
+        HTTPS_PROXY: ${LM_BRIDGE_PROXY_URL:-}
+        NO_PROXY: localhost,127.0.0.1,arena-browser,arena-bridge,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
     container_name: arena-browser
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+      LM_BRIDGE_PROXY_URL: ${LM_BRIDGE_PROXY_URL:-}
       NOVNC_PASSWORD: ${ARENA_NOVNC_PASSWORD:-}
       NOVNC_GATEWAY_HOST: "0.0.0.0"
       NOVNC_GATEWAY_PORT: "6081"

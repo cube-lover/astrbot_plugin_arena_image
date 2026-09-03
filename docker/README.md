@@ -1,5 +1,9 @@
 # LMArenaBridge + AstrBot 画图插件
 
+## 🎨 支持 Arena 灰测模型：蒙娜丽莎（GPT-Image-2.5）
+
+可在模型列表中选择 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
+
 本项目把 LMArenaBridge 和 AstrBot 画图插件组合成一条本地服务链：
 
 ```text
@@ -109,10 +113,10 @@ Cookie 存储，并在后续请求中优先使用；如果后台刷新成功，�
 LM_BRIDGE_BROWSER_GATEWAY_URL=http://HOST:6081
 ```
 
-短时签名服务内置于 `arena-browser`，不再需要独立 gateway 容器。它只
-负责验证签名链接并把 VNC 密码放入浏览器端的 URL fragment；密码不会
-进入 QQ/AstrBot 消息、HTTP 请求路径或网关日志。若未配置网关，Bridge
-仍兼容返回原始 noVNC 地址。
+短时签名服务内置于 `arena-browser`，不再需要独立 gateway 容器。它会
+验证签名链接，并在同一个 `6081` 端口下代理 noVNC 页面和 WebSocket；
+密码不会进入 QQ/AstrBot 消息、HTTP 请求路径或网关日志。若未配置网关，
+Bridge 仍兼容返回原始 noVNC 地址。
 
 ## AstrBot 插件安装
 

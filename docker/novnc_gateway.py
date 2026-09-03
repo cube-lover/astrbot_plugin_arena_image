@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import mimetypes
+import select
+import socket
 import html
 import json
 import os
@@ -23,6 +26,17 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 
 TOKEN_RE = re.compile(r"^(?P<expires>[0-9]+)\.(?P<nonce>[A-Za-z0-9_-]+)\.(?P<signature>[a-f0-9]{64})$")
+
+
+def _safe_static_path(root: Path, relative_path: str) -> Path | None:
+    """Resolve a noVNC asset while refusing directory traversal."""
+    root = root.resolve()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
 
 
 def _read_value(path_env: str, fallback_env: str = "") -> str:
@@ -115,10 +129,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _token_parts(self) -> tuple[str, str] | None:
         path = urlsplit(self.path).path.rstrip("/")
         parts = path.split("/")
-        if len(parts) == 3 and parts[1] == "v" and parts[2]:
-            return parts[2], "page"
-        if len(parts) == 4 and parts[1] == "v" and parts[3] == "connect":
-            return parts[2], "connect"
+        if len(parts) >= 3 and parts[1] == "v" and parts[2]:
+            return parts[2], "/".join(parts[3:])
         return None
 
     def do_HEAD(self) -> None:  # noqa: N802
@@ -137,18 +149,143 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         parsed = self._token_parts()
+        resource = parsed[1] if parsed else ""
         if parsed is None:
             self._send_error(HTTPStatus.NOT_FOUND, "not found")
             return
-        token, action = parsed
+        token = parsed[0]
         if not _verify_token(token, self.gateway.secret):
             self._send_error(HTTPStatus.GONE, "link expired")
             return
 
-        if action == "connect":
-            self._connect(token)
-        else:
+        if not resource:
             self._page(token)
+        elif resource == "connect":
+            self._redirect_to_novnc(token)
+        elif resource == "websockify":
+            self._proxy_websocket()
+        else:
+            self._send_static_file(resource)
+
+    def _redirect_to_novnc(self, token: str) -> None:
+        password = self.gateway.password
+        if not password:
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "gateway is not configured")
+            return
+        fragment = urlencode(
+            [
+                ("autoconnect", "true"),
+                ("resize", "scale"),
+                ("path", "websockify"),
+                ("password", password),
+            ],
+            doseq=True,
+            safe="",
+        )
+        target = f"/v/{quote(token, safe='')}/vnc.html#{fragment}"
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", target)
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _send_static_file(self, relative_path: str) -> None:
+        target = _safe_static_path(self.gateway.novnc_root, relative_path)
+        if target is None:
+            self._send_error(HTTPStatus.NOT_FOUND, "not found")
+            return
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        payload = target.read_bytes()
+        self._send_bytes(
+            payload,
+            content_type=f"{content_type}; charset=utf-8"
+            if content_type.startswith("text/")
+            else content_type,
+        )
+
+    def _proxy_websocket(self) -> None:
+        upgrade = (self.headers.get("Upgrade") or "").strip().lower()
+        connection = (self.headers.get("Connection") or "").strip().lower()
+        if upgrade != "websocket" or "upgrade" not in connection:
+            self._send_error(HTTPStatus.BAD_REQUEST, "websocket required")
+            return
+
+        client = self.connection
+        backend: socket.socket | None = None
+        handshake_sent = False
+        try:
+            backend = socket.create_connection(
+                (self.gateway.novnc_host, self.gateway.novnc_port),
+                timeout=5,
+            )
+            backend.settimeout(None)
+            headers = [
+                f"GET /websockify HTTP/1.1",
+                f"Host: {self.gateway.novnc_host}:{self.gateway.novnc_port}",
+                "Connection: Upgrade",
+                "Upgrade: websocket",
+            ]
+            for key, value in self.headers.items():
+                if key.lower() in {"host", "connection", "upgrade"}:
+                    continue
+                headers.append(f"{key}: {value}")
+            request = ("\r\n".join(headers) + "\r\n\r\n").encode("latin-1")
+            backend.sendall(request)
+
+            response = bytearray()
+            while b"\r\n\r\n" not in response:
+                chunk = backend.recv(4096)
+                if not chunk:
+                    raise OSError("no response from websockify")
+                response.extend(chunk)
+            head, remainder = bytes(response).split(b"\r\n\r\n", 1)
+            status_line = head.split(b"\r\n", 1)[0]
+            if b" 101 " not in status_line:
+                client.sendall(head + b"\r\n\r\n" + remainder)
+                self.close_connection = True
+                return
+
+            client.settimeout(None)
+            client.sendall(head + b"\r\n\r\n")
+            handshake_sent = True
+            if remainder:
+                client.sendall(remainder)
+            self._bridge_sockets(client, backend)
+            self.close_connection = True
+        except OSError:
+            if backend is not None:
+                backend.close()
+            self.close_connection = True
+            if not handshake_sent:
+                try:
+                    self._send_error(HTTPStatus.BAD_GATEWAY, "websocket proxy failed")
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _bridge_sockets(client: socket.socket, backend: socket.socket) -> None:
+        sockets = [client, backend]
+        try:
+            while True:
+                readable, _, _ = select.select(sockets, [], [], 60)
+                if not readable:
+                    continue
+                for source in readable:
+                    target = backend if source is client else client
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    target.sendall(data)
+        except OSError:
+            return
+        finally:
+            for sock in sockets:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
 
     def _page(self, token: str) -> None:
         frame_src = html.escape(self.gateway.vnc_origin, quote=True)
@@ -198,17 +335,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._send_bytes(payload.encode("utf-8"), content_type="text/html; charset=utf-8")
 
     def _connect(self, token: str) -> None:
-        password = self.gateway.password
-        if not password:
-            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "gateway is not configured")
-            return
-        target = _vnc_url_with_password(self.gateway.vnc_url, password)
-        self.send_response(HTTPStatus.FOUND)
-        self.send_header("Location", target)
-        self.send_header("Cache-Control", "no-store, max-age=0")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._redirect_to_novnc(token)
 
 
 class GatewayServer(ThreadingHTTPServer):
@@ -226,6 +353,17 @@ class GatewayServer(ThreadingHTTPServer):
             "NOVNC_PASSWORD",
         )
         self.vnc_url = os.environ.get("NOVNC_VNC_URL", "").strip()
+        self.novnc_root = Path(
+            os.environ.get("NOVNC_STATIC_ROOT", "/usr/share/novnc")
+        )
+        self.novnc_host = os.environ.get("NOVNC_INTERNAL_HOST", "127.0.0.1").strip()
+        try:
+            self.novnc_port = max(
+                1,
+                min(65535, int(os.environ.get("NOVNC_INTERNAL_PORT", "6080"))),
+            )
+        except ValueError:
+            self.novnc_port = 6080
         vnc_parts = urlsplit(self.vnc_url)
         self.vnc_origin = (
             f"{vnc_parts.scheme}://{vnc_parts.netloc}"

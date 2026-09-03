@@ -4,6 +4,13 @@ export DISPLAY=:99
 STATE_DIR=/data/browser
 PROFILE="$STATE_DIR/chrome-profile"
 mkdir -p "$PROFILE"
+if [ -z "${NOVNC_PASSWORD:-}" ] && [ -r "${NOVNC_PASSWORD_FILE:-}" ]; then
+    NOVNC_PASSWORD="$(tr -d '\r\n' < "$NOVNC_PASSWORD_FILE")"
+fi
+if [ -z "${NOVNC_PASSWORD:-}" ]; then
+    echo "NOVNC_PASSWORD or NOVNC_PASSWORD_FILE is required" >&2
+    exit 1
+fi
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 rm -f "$PROFILE/SingletonLock" "$PROFILE/SingletonSocket" "$PROFILE/SingletonCookie"
 Xvfb "$DISPLAY" -screen 0 1280x900x24 -ac +extension GLX +render -noreset >/tmp/arena-xvfb.log 2>&1 &
@@ -13,10 +20,19 @@ x11vnc -storepasswd "${NOVNC_PASSWORD}" "$STATE_DIR/vnc.pass" >/dev/null
 x11vnc -display "$DISPLAY" -forever -shared -rfbauth "$STATE_DIR/vnc.pass" -rfbport 5900 -localhost -noxdamage >/tmp/arena-x11vnc.log 2>&1 &
 websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/arena-novnc.log 2>&1 &
 python3 /app/novnc_gateway.py >/tmp/arena-auth-gateway.log 2>&1 &
-CHROME="$(find "${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}" /root/.cache/ms-playwright -type f \( -path "*/chrome-linux64/chrome" -o -path "*/chrome-linux/chrome" \) 2>/dev/null | head -n 1)"
+CHROME="$(find "${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}" /root/.cache/ms-playwright -type f \( -path "*/chrome-linux64/chrome" -o -path "*/chrome-linux/chrome" \) -print -quit 2>/dev/null)"
 if [ -z "$CHROME" ]; then
   echo "chromium executable not found" >&2
   exit 1
+fi
+PROXY_URL="${LM_BRIDGE_PROXY_URL:-${HTTP_PROXY:-}}"
+proxy_args=()
+if [ -n "$PROXY_URL" ]; then
+  proxy_args=(
+    --proxy-server="$PROXY_URL"
+    --proxy-bypass-list="localhost;127.0.0.1;arena-browser;arena-bridge;172.16.0.0/12;192.168.0.0/16;10.0.0.0/8"
+  )
+  echo "arena browser proxy enabled: $PROXY_URL" >&2
 fi
 run_chrome() {
   while true; do
@@ -34,6 +50,7 @@ run_chrome() {
       --remote-debugging-port=9222 \
       --remote-debugging-address=0.0.0.0 \
       --user-data-dir="$PROFILE" \
+      "${proxy_args[@]}" \
       --window-position=0,0 \
       --window-size=1280,900 \
       "https://arena.ai/?mode=direct" \

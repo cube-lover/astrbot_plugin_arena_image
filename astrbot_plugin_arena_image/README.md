@@ -1,17 +1,14 @@
 # astrbot_plugin_arena_image
 
-
 > [!IMPORTANT]
 > **有问题请进 QQ 群 `460973561` 交流，不点 Star 不给进。**
 
 ---
 
+## 🎨 支持 Arena 灰测模型：蒙娜丽莎（GPT-Image-2.5）
 
+安装并完成 Arena 登录后，可在模型列表中选择 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
 
-> [!IMPORTANT]
-> **有问题请进 QQ 群 `460973561` 交流，不点 Star 不给进。**
-
----
 
 
 通过 LMArenaBridge 为 AstrBot 提供 Arena 画图能力：文生图、图生图、模型列表、按会话切换模型、Arena 登录态自动采集。

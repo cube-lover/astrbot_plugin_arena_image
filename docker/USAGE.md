@@ -5,11 +5,17 @@
 
 ---
 
+## 🎨 支持 Arena 灰测模型：蒙娜丽莎（GPT-Image-2.5）
 
-> [!IMPORTANT]
+部署完成后，可在画图模型列表中选择 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
 
----
+成品示例：
 
+| 成品效果 | 成品效果 |
+| --- | --- |
+| ![蒙娜丽莎成品示例 1](../docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](../docs/examples/mona-sample-boy.png) |
+
+官网入口：[https://arena.ai](https://arena.ai)
 
 本文档面向第一次部署的用户，从零开始完成：Docker 服务启动、AstrBot 插件安装、Arena 登录、画图测试。
 
@@ -92,6 +98,36 @@ LM_BRIDGE_BROWSER_CDP_URL=http://arena-browser:9223
 LM_BRIDGE_BROWSER_GATEWAY_URL=http://你的服务器IP或域名:6081
 LM_BRIDGE_BROWSER_VNC_URL=http://你的服务器IP或域名:6082/vnc.html?autoconnect=true&resize=scale
 ARENA_NOVNC_PASSWORD=强VNC密码
+```
+
+### 代理配置（可选）
+
+香港、海外等可以直连 Arena 的服务器不需要填写代理，保持下面这一行为空即可：
+
+```dotenv
+LM_BRIDGE_PROXY_URL=
+```
+
+国内服务器如果无法稳定访问 Arena，可以填写一个服务器可访问的 HTTP/HTTPS 或 SOCKS5 代理：
+
+```dotenv
+# HTTP 代理示例
+LM_BRIDGE_PROXY_URL=http://192.168.1.100:7890
+
+# SOCKS5 代理示例
+LM_BRIDGE_PROXY_URL=socks5://192.168.1.100:1080
+```
+
+说明：
+
+- 代理会同时作用于 `arena-bridge` 和 `arena-browser`
+- 代理会在运行阶段生效；重新 `--build` 时也会作为 Docker Build 代理传入
+- Docker 内网、`localhost`、`arena-bridge`、`arena-browser` 已自动排除，不需要手动再配 `NO_PROXY`
+- 如果代理部署在你自己的电脑上，请填写服务器能访问到的地址；除非代理也在服务器上，否则不要填 `127.0.0.1`
+- 修改代理后需要重建容器：
+
+```bash
+docker compose -f docker-compose.arena.yml --env-file .env up -d
 ```
 
 ---
@@ -282,13 +318,14 @@ Cookie 会自动保存。后续 Cookie 失效时执行：
 | 端口 | 绑定 | 用途 |
 | --- | --- | --- |
 | 8000 | `127.0.0.1` | Bridge API |
-| 6081 | `0.0.0.0` | 短时验证链接网关 |
+| 6081 | `0.0.0.0` | 短时验证链接网关，同时代理 noVNC 页面和 WebSocket |
 | 6082 | `127.0.0.1` | noVNC |
 | 9223 | Docker 内网 | CDP 代理 |
 
 安全建议：
 
 - 不要把 `8000` 直接暴露公网
+- 正常情况下只需要开放 `6081`；验证链接会在同端口加载 noVNC 静态资源并代理 WebSocket，不需要开放 `6082`
 - 如需远程访问管理页面，用 SSH 隧道：
 
 ```bash
@@ -449,6 +486,20 @@ Attachments: 1 images
 ### 8. 画图很慢
 
 Arena 图像模型生成时间通常在 20–90 秒，属于正常范围。请求超时配置默认 300 秒。
+
+### 9. 国内服务器无法访问 Arena
+
+在 `.env` 中配置：
+
+```dotenv
+LM_BRIDGE_PROXY_URL=http://你的代理地址:端口
+```
+
+然后执行：
+
+```bash
+docker compose -f docker-compose.arena.yml --env-file .env up -d
+```
 
 ---
 

@@ -1,4 +1,15 @@
-# AstrBot Arena 画图插件 + LMArenaBridge
+# AstrBot Arena Image Plugin + LMArenaBridge
+
+> [!IMPORTANT]
+> **有问题请进 QQ 群 `460973561` 交流，不点 Star 不给进。**
+
+---
+
+
+> [!IMPORTANT]
+
+---
+
 
 AstrBot 的 Arena 画图插件和配套 LMArenaBridge Docker 服务。支持文生图、图生图、模型列表、按会话切换模型、Arena 登录态自动采集。
 

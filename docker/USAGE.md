@@ -1,4 +1,15 @@
-# AstrBot 竞技场画图插件 + LMArenaBridge 详细部署指南
+# AstrBot Arena Image Plugin + LMArenaBridge Deployment Guide
+
+> [!IMPORTANT]
+> **有问题请进 QQ 群 `460973561` 交流，不点 Star 不给进。**
+
+---
+
+
+> [!IMPORTANT]
+
+---
+
 
 本文档面向第一次部署的用户，从零开始完成：Docker 服务启动、AstrBot 插件安装、Arena 登录、画图测试。
 

@@ -9,9 +9,9 @@
 
 安装并完成 Arena 登录后，可在模型列表中选择 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
 
-| 最新成品效果 | 成品效果 | 成品效果 |
-| --- | --- | --- |
-| ![蒙娜丽莎最新成品示例](../docs/examples/mona-sample-promo.png) | ![蒙娜丽莎成品示例 1](../docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](../docs/examples/mona-sample-boy.png) |
+| 最新成品效果 | 最新成品效果 | 成品效果 | 成品效果 |
+| --- | --- | --- | --- |
+| ![蒙娜丽莎最新成品示例 1](../docs/examples/mona-sample-promo.png) | ![蒙娜丽莎最新成品示例 2](../docs/examples/mona-sample-promo-2.jpg) | ![蒙娜丽莎成品示例 1](../docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](../docs/examples/mona-sample-boy.png) |
 
 
 

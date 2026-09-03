@@ -176,7 +176,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             [
                 ("autoconnect", "true"),
                 ("resize", "scale"),
-                ("path", "websockify"),
+                # noVNC concatenates host + "/" + path when building the
+                # WebSocket URL.  Keep the signed token in the path so the
+                # browser connects through this gateway instead of /websockify.
+                ("path", f"v/{token}/websockify"),
                 ("password", password),
             ],
             doseq=True,

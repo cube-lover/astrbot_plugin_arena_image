@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, build_opener
 from urllib.request import Request, urlopen
 
@@ -91,7 +92,7 @@ def test_gateway_page_hides_password_until_connect(tmp_path, monkeypatch) -> Non
             location = exc.headers["Location"]
             assert location.startswith("/v/")
             assert "/vnc.html#" in location
-            assert "path=websockify" in location
+            assert f"path=v%2F{quote(token, safe='')}%2Fwebsockify" in location
             assert "vnc-secret" in location
             assert "&password=" in location
             assert "?password=" not in location

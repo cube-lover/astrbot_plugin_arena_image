@@ -11,9 +11,9 @@
 
 成品示例：
 
-| 成品效果 | 成品效果 |
-| --- | --- |
-| ![蒙娜丽莎成品示例 1](../docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](../docs/examples/mona-sample-boy.png) |
+| 最新成品效果 | 成品效果 | 成品效果 |
+| --- | --- | --- |
+| ![蒙娜丽莎最新成品示例](../docs/examples/mona-sample-promo.png) | ![蒙娜丽莎成品示例 1](../docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](../docs/examples/mona-sample-boy.png) |
 
 官网入口：[https://arena.ai](https://arena.ai)
 

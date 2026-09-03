@@ -9,6 +9,10 @@
 
 安装并完成 Arena 登录后，可在模型列表中选择 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
 
+| 最新成品效果 | 成品效果 | 成品效果 |
+| --- | --- | --- |
+| ![蒙娜丽莎最新成品示例](../docs/examples/mona-sample-promo.png) | ![蒙娜丽莎成品示例 1](../docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](../docs/examples/mona-sample-boy.png) |
+
 
 
 通过 LMArenaBridge 为 AstrBot 提供 Arena 画图能力：文生图、图生图、模型列表、按会话切换模型、Arena 登录态自动采集。

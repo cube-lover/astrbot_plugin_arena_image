@@ -9,9 +9,9 @@
 
 可在模型列表中选择 Arena 灰测画图模型 **「蒙娜丽莎 / GPT-Image-2.5」**，文生图和图生图均可调用。
 
-| 成品效果 | 成品效果 |
-| --- | --- |
-| ![蒙娜丽莎成品示例 1](docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](docs/examples/mona-sample-boy.png) |
+| 最新成品效果 | 成品效果 | 成品效果 |
+| --- | --- | --- |
+| ![蒙娜丽莎最新成品示例](docs/examples/mona-sample-promo.png) | ![蒙娜丽莎成品示例 1](docs/examples/mona-sample-girl.png) | ![蒙娜丽莎成品示例 2](docs/examples/mona-sample-boy.png) |
 
 官网入口：[https://arena.ai](https://arena.ai)
 

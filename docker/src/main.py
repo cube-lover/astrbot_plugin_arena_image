@@ -2964,7 +2964,18 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Check if conversation exists for this API key (robust to tests patching chat_sessions to a plain dict)
         per_key_sessions = chat_sessions.setdefault(api_key_str, {})
-        session = per_key_sessions.get(conversation_id)
+        # conversation_id only hashes the first 100 chars of the first user message, so a
+        # client that resends the same prompt lands on the same id.  Only continue a stored
+        # session when the client actually replayed history; a request without an assistant
+        # turn is a fresh one-shot call and must get its own Arena evaluation session,
+        # otherwise repeated identical prompts pile up in one window and the model sees
+        # every earlier attempt as context.
+        client_sent_history = any(
+            isinstance(m, dict) and m.get("role") == "assistant" for m in messages
+        )
+        session = per_key_sessions.get(conversation_id) if client_sent_history else None
+        if not client_sent_history and per_key_sessions.pop(conversation_id, None) is not None:
+            debug_print(f"🧹 Stateless request: dropped cached session {conversation_id}")
         
         # Detect retry: if session exists and last message is same user message (no assistant response after it)
         is_retry = False

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import mimetypes
 import time
@@ -16,6 +18,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.star.filter.command import GreedyStr
+
+try:  # Pillow ships with AstrBot, but stay importable without it.
+    from PIL import Image as PILImage
+except ImportError:  # pragma: no cover - exercised only on minimal installs
+    PILImage = None
 
 try:
     from astrbot.core.utils.quoted_message import extract_quoted_message_images
@@ -34,6 +41,13 @@ from .bridge_client import (
 
 PLUGIN_NAME = "astrbot_plugin_arena_image"
 GLOBAL_SELECTION_KEY = "__global__"
+
+# Outputs are capped far above the input cap: Arena returns high-resolution
+# PNGs that legitimately exceed the 10 MB reference-image budget.
+DEFAULT_MAX_OUTPUT_IMAGE_BYTES = 64 * 1024 * 1024
+# Messaging platforms reject very large attachments, so anything above this is
+# re-encoded before it is sent instead of being dropped.
+DEFAULT_SEND_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -56,11 +70,49 @@ def _display_error(exc: Exception, *, limit: int = 500) -> str:
     return text if len(text) <= limit else f"{text[:limit]}…"
 
 
+def _human_bytes(value: int) -> str:
+    if value >= 1024 * 1024:
+        return f"{value / 1024 / 1024:.1f} MB"
+    return f"{max(0, value) // 1024} KB"
+
+
+def _shrink_image_bytes(raw: bytes, mime: str, limit: int) -> tuple[bytes, str]:
+    """Re-encode an oversized image so a chat platform still accepts it.
+
+    Transparency is dropped because the fallback container is JPEG; this only
+    runs for images that would otherwise be rejected for their size.
+    """
+    if PILImage is None or limit <= 0 or len(raw) <= limit:
+        return raw, mime
+    try:
+        with PILImage.open(io.BytesIO(raw)) as source:
+            source.load()
+            image = source.convert("RGB")
+    except Exception:  # Unknown/animated formats stay untouched.
+        return raw, mime
+
+    resample = getattr(PILImage, "LANCZOS", 1)
+    data = raw
+    for scale, quality in ((1.0, 88), (1.0, 72), (0.75, 75), (0.5, 75), (0.35, 70)):
+        candidate = image
+        if scale < 1.0:
+            candidate = image.resize(
+                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                resample,
+            )
+        buffer = io.BytesIO()
+        candidate.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= limit:
+            return data, "image/jpeg"
+    return data, "image/jpeg"
+
+
 @register(
     PLUGIN_NAME,
-    "Codex",
+    "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.2.1",
+    "0.3.0",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -82,6 +134,8 @@ class ArenaImagePlugin(Star):
         self._model_health_lock = asyncio.Lock()
         self._selection_lock = asyncio.Lock()
         self._generation_lock = asyncio.Lock()
+        self._active_generations = 0
+        self._last_generation_seconds = 0.0
         self._interactive_auth_session_id = ""
 
     async def initialize(self):
@@ -103,6 +157,60 @@ class ArenaImagePlugin(Star):
                 10.0,
                 1800.0,
             ),
+            rate_limit_retries=_as_int(self.config.get("rate_limit_retries"), 2, 0, 5),
+            rate_limit_max_wait=_as_float(
+                self.config.get("rate_limit_max_wait"),
+                30.0,
+                1.0,
+                300.0,
+            ),
+        )
+
+    def _input_max_bytes(self) -> int:
+        return _as_int(
+            self.config.get("max_image_bytes"),
+            10 * 1024 * 1024,
+            1024,
+            50 * 1024 * 1024,
+        )
+
+    def _output_max_bytes(self) -> int:
+        return _as_int(
+            self.config.get("max_output_image_bytes"),
+            DEFAULT_MAX_OUTPUT_IMAGE_BYTES,
+            64 * 1024,
+            256 * 1024 * 1024,
+        )
+
+    def _send_max_bytes(self) -> int:
+        return _as_int(
+            self.config.get("send_image_max_bytes"),
+            DEFAULT_SEND_IMAGE_MAX_BYTES,
+            256 * 1024,
+            64 * 1024 * 1024,
+        )
+
+    @staticmethod
+    def _is_private_chat(event: AstrMessageEvent) -> bool:
+        checker = getattr(event, "is_private_chat", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return not str(getattr(event, "get_group_id", lambda: "")() or "").strip()
+
+    @staticmethod
+    def _rate_limit_hint(exc: Exception) -> str | None:
+        """Translate upstream throttling into an actionable Chinese message."""
+        if not isinstance(exc, BridgeError) or not exc.is_rate_limited:
+            return None
+        wait = int(exc.retry_after or 0)
+        cooldown = f"{wait} 秒" if wait > 0 else "半分钟到一分钟"
+        return (
+            "竞技场上游正在限流（已自动重试仍未通过）。\n"
+            f"请等待约 {cooldown} 后再试，连续重试只会继续触发限流。\n"
+            "如果一直限流，可用 /竞技场画图模型 换一个模型。"
         )
 
     @staticmethod
@@ -130,19 +238,19 @@ class ArenaImagePlugin(Star):
         if exc.code == "arena_login_required" or "login_gate" in str(exc).casefold() or "login required" in str(exc).casefold():
             return (
                 "检测到 Arena 现在要求登录账号才能出图。\n"
-                "请运行：/竞技场验证\n"
+                "请让管理员私聊机器人运行：/竞技场验证\n"
                 "打开链接后，在服务器浏览器里用 Google 或邮箱登录 Arena，不要只过 Cloudflare。"
             )
         if auth_error:
             return (
                 "检测到 Arena 会话 Cookie 已失效或无效。\n"
-                "请运行：/竞技场重新绑定，获取新的服务器浏览器链接。\n"
+                "请让管理员私聊机器人运行：/竞技场重新绑定，获取新的服务器浏览器链接。\n"
                 "打开链接后完成 Arena 登录和 CF/Turnstile 验证，Cookie 会自动保存；"
                 "完成后运行：/竞技场验证状态"
             )
         return (
             "检测到服务器端 Arena/Cloudflare 验证。\n"
-            "请运行：/竞技场验证（Cookie 失效时也可运行 /竞技场重新绑定）\n"
+            "请让管理员私聊机器人运行：/竞技场验证（Cookie 失效时改用 /竞技场重新绑定）\n"
             "打开服务器浏览器链接并完成验证后，再运行：/竞技场验证状态"
         )
 
@@ -167,7 +275,7 @@ class ArenaImagePlugin(Star):
             f"账号登录：{'已登录' if logged_in else '未登录（匿名无法出图）'}",
         ]
         if not logged_in and status in {"waiting", "expired", "starting"}:
-            details.append("重新获取链接：/竞技场重新绑定")
+            details.append("重新获取链接：/竞技场重新绑定（需私聊）")
         return "\n".join(details)
 
     def _session_key(self, event: AstrMessageEvent) -> str:
@@ -330,12 +438,14 @@ class ArenaImagePlugin(Star):
         lines.append("用法：/竞技场切换模型 编号或完整模型名（列表只含画图模型）")
         yield event.plain_result("\n".join(lines))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("竞技场切换模型", alias={"arena切换模型"})
     async def switch_model(
         self,
         event: AstrMessageEvent,
         model: GreedyStr = GreedyStr,
     ):
+        """Switch the shared model for every chat.  Admin only: it is global."""
         requested = str(model or "").strip()
         if not requested:
             yield event.plain_result("用法：/竞技场切换模型 编号或完整模型名")
@@ -477,19 +587,37 @@ class ArenaImagePlugin(Star):
         return payload
 
     @staticmethod
-    def _interactive_auth_message(payload: dict[str, Any]) -> str:
+    def _interactive_auth_message(
+        payload: dict[str, Any],
+        *,
+        reveal_url: bool = False,
+    ) -> str:
         message = ArenaImagePlugin._format_verification_status(payload)
         status = str(payload.get("status") or "")
         browser_url = str(payload.get("browser_url") or "").strip()
         if status in {"starting", "waiting"} and browser_url:
-            message += f"\n服务器浏览器链接：\n{browser_url}"
+            if reveal_url:
+                message += f"\n服务器浏览器链接：\n{browser_url}"
+            else:
+                message += "\n验证链接只在私聊发放，请私聊机器人运行：/竞技场验证"
         elif status == "verified":
-            message += "\n如需重新绑定 Cookie，请运行：/竞技场重新绑定"
+            message += "\n如需重新绑定 Cookie，请私聊运行：/竞技场重新绑定"
         return message
 
+    # The browser link hands out control of a server-side browser that holds the
+    # logged-in Arena/Google session, so it never goes to a group chat.
+    _GROUP_LINK_REFUSAL = (
+        "为安全起见，服务器浏览器链接只在私聊发放。\n"
+        "请私聊机器人再运行一次这个命令。"
+    )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("竞技场验证", alias={"arena验证"})
     async def interactive_verify(self, event: AstrMessageEvent):
         """Open the visible server browser for a manual Arena/CF challenge."""
+        if not self._is_private_chat(event):
+            yield event.plain_result(self._GROUP_LINK_REFUSAL)
+            return
         try:
             self._interactive_auth_session_id = ""
             payload = await self._client().start_interactive_auth()
@@ -508,9 +636,13 @@ class ArenaImagePlugin(Star):
         except Exception as exc:
             yield event.plain_result(f"启动服务器浏览器验证失败：{_display_error(exc)}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("竞技场重新绑定", alias={"arena重新绑定"})
     async def interactive_rebind(self, event: AstrMessageEvent):
         """Show the link used to refresh the server-side Arena session cookie."""
+        if not self._is_private_chat(event):
+            yield event.plain_result(self._GROUP_LINK_REFUSAL)
+            return
         try:
             self._interactive_auth_session_id = ""
             payload = await self._client().start_interactive_auth()
@@ -528,6 +660,7 @@ class ArenaImagePlugin(Star):
         except Exception as exc:
             yield event.plain_result(f"生成 Cookie 重新绑定链接失败：{_display_error(exc)}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("竞技场验证状态", alias={"arena验证状态"})
     async def interactive_verify_status(self, event: AstrMessageEvent):
         """Check and persist the current server-browser verification session."""
@@ -541,11 +674,16 @@ class ArenaImagePlugin(Star):
                 self._interactive_auth_session_id = str(
                     payload.get("session_id") or ""
                 ).strip()
-            yield event.plain_result(self._interactive_auth_message(payload))
+            yield event.plain_result(
+                self._interactive_auth_message(
+                    payload,
+                    reveal_url=self._is_private_chat(event),
+                )
+            )
         except Exception as exc:
             yield event.plain_result(
                 f"读取验证状态失败：{_display_error(exc)}\n"
-                "需要验证时运行：/竞技场验证；Cookie 失效时运行：/竞技场重新绑定"
+                "需要验证时私聊运行：/竞技场验证；Cookie 失效时私聊运行：/竞技场重新绑定"
             )
 
     @filter.command("竞技场状态", alias={"arena状态"})
@@ -567,15 +705,20 @@ class ArenaImagePlugin(Star):
     async def _collect_input_images(self, event: AstrMessageEvent) -> list[str]:
         """Convert current and quoted AstrBot Image components to data URIs."""
         max_images = _as_int(self.config.get("max_input_images"), 4, 1, 8)
-        max_bytes = _as_int(
-            self.config.get("max_image_bytes"),
-            10 * 1024 * 1024,
-            1024,
-            50 * 1024 * 1024,
-        )
+        max_bytes = self._input_max_bytes()
         result: list[str] = []
         seen_sources: set[str] = set()
+        # Content digests catch the same picture arriving through two different
+        # paths, e.g. inline in the message and again via the quoted message.
+        seen_digests: set[str] = set()
         components = getattr(getattr(event, "message_obj", None), "message", []) or []
+
+        def remember(value: str) -> bool:
+            digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()
+            if digest in seen_digests:
+                return False
+            seen_digests.add(digest)
+            return True
 
         async def add_component(component: Image, source_key: str) -> None:
             if len(result) >= max_images or source_key in seen_sources:
@@ -588,19 +731,20 @@ class ArenaImagePlugin(Star):
             ).strip()
             try:
                 raw_base64 = await component.convert_to_base64()
-                result.append(
-                    data_uri_from_base64(
-                        raw_base64,
-                        source=source,
-                        max_bytes=max_bytes,
-                    )
+                data_uri = data_uri_from_base64(
+                    raw_base64,
+                    source=source,
+                    max_bytes=max_bytes,
                 )
+                if remember(data_uri):
+                    result.append(data_uri)
             except Exception as exc:
                 # Keep a remote source URL as a fallback.  The Bridge will
                 # download it and upload it to Arena, which covers adapters
                 # whose Image.convert_to_base64() is unavailable.
                 if source.lower().startswith(("http://", "https://")):
-                    result.append(source)
+                    if remember(source):
+                        result.append(source)
                     logger.warning(
                         "[arena_image] 参考图 Base64 读取失败，交给 Bridge 下载上传：%s",
                         _display_error(exc),
@@ -680,49 +824,95 @@ class ArenaImagePlugin(Star):
         input_images: list[str] | None = None,
         model_id: str | None = None,
     ):
-        async with self._generation_lock:
-            try:
-                if not model_id:
-                    selected, _ = await self._resolve_model(event)
-                    model_id = self._model_id(selected)
-                generation_started_at = time.monotonic()
-                response = await self._client().complete(
-                    model=model_id,
-                    prompt=prompt,
-                    images=input_images if include_input_images else None,
-                )
-                urls = image_urls(response)
-                if not urls:
+        # Generation is serialised, so tell the user where they are in the queue
+        # instead of leaving them on "正在提交" for several minutes.
+        max_queue = _as_int(self.config.get("max_queue_depth"), 5, 1, 50)
+        waiting = self._active_generations
+        if waiting >= max_queue:
+            yield event.plain_result(
+                f"排队已满（{waiting}/{max_queue}），前面的图还在画，请稍后再发。"
+            )
+            return
+        if waiting > 0:
+            estimate = int(self._last_generation_seconds * waiting)
+            eta = f"，预计还要等 {estimate} 秒左右" if estimate > 0 else ""
+            yield event.plain_result(f"前面还有 {waiting} 个出图任务，已排队{eta}。")
+
+        self._active_generations += 1
+        try:
+            async with self._generation_lock:
+                try:
+                    if not model_id:
+                        selected, _ = await self._resolve_model(event)
+                        model_id = self._model_id(selected)
+                    generation_started_at = time.monotonic()
+                    response = await self._client().complete(
+                        model=model_id,
+                        prompt=prompt,
+                        images=input_images if include_input_images else None,
+                    )
+                    urls = image_urls(response)
                     text = response_text(response).strip()
-                    yield event.plain_result(
-                        f"模型 {model_id} 返回了文本而不是图片：\n{text or '没有可显示的内容'}"
-                    )
-                    return
-                max_outputs = _as_int(self.config.get("max_output_images"), 1, 1, 4)
-                for url in urls[:max_outputs]:
-                    path = await self._materialize_output(url)
-                    elapsed_seconds = time.monotonic() - generation_started_at
-                    result = event.plain_result(
-                        f"模型：{model_id}\n"
-                        f"画图耗时：{elapsed_seconds:.1f} 秒"
-                    )
-                    result.chain.append(Image.fromFileSystem(str(path)))
-                    yield result
-                self._prune_outputs()
-            except Exception as exc:
-                logger.exception("[arena_image] 生成失败")
-                hint = self._verification_hint(exc)
-                if hint:
-                    yield event.plain_result(hint)
-                else:
-                    yield event.plain_result(f"生成失败：{_display_error(exc)}")
+                    if not urls:
+                        yield event.plain_result(
+                            f"模型 {model_id} 返回了文本而不是图片：\n"
+                            f"{text or '没有可显示的内容'}"
+                        )
+                        return
+
+                    max_outputs = _as_int(self.config.get("max_output_images"), 1, 1, 4)
+                    sent = 0
+                    failures: list[str] = []
+                    for url in urls:
+                        if sent >= max_outputs:
+                            break
+                        try:
+                            path = await self._materialize_output(url)
+                        except BridgeError as exc:
+                            failures.append(_display_error(exc))
+                            logger.warning(
+                                "[arena_image] 跳过无法下载的候选图片：%s",
+                                _display_error(exc),
+                            )
+                            continue
+                        elapsed_seconds = time.monotonic() - generation_started_at
+                        result = event.plain_result(
+                            f"模型：{model_id}\n"
+                            f"画图耗时：{elapsed_seconds:.1f} 秒"
+                        )
+                        result.chain.append(Image.fromFileSystem(str(path)))
+                        yield result
+                        sent += 1
+
+                    if sent:
+                        self._last_generation_seconds = time.monotonic() - generation_started_at
+                        self._prune_outputs()
+                    elif text:
+                        # Every candidate turned out not to be an image, so the
+                        # model's own answer is the useful reply.
+                        yield event.plain_result(
+                            f"模型 {model_id} 返回了文本而不是图片：\n{text}"
+                        )
+                    else:
+                        yield event.plain_result(
+                            "生成失败："
+                            + (failures[0] if failures else "Bridge 没有返回可用图片")
+                        )
+                except Exception as exc:
+                    logger.exception("[arena_image] 生成失败")
+                    hint = self._rate_limit_hint(exc) or self._verification_hint(exc)
+                    if hint:
+                        yield event.plain_result(hint)
+                    else:
+                        yield event.plain_result(f"生成失败：{_display_error(exc)}")
+        finally:
+            self._active_generations = max(0, self._active_generations - 1)
 
     async def _materialize_output(self, value: str) -> Path:
-        max_bytes = _as_int(
-            self.config.get("max_image_bytes"),
-            10 * 1024 * 1024,
-            1024,
-            50 * 1024 * 1024,
+        max_bytes = self._output_max_bytes()
+        oversize = (
+            f"生成图片过大（上限 {_human_bytes(max_bytes)}），"
+            "可在插件配置里调高 max_output_image_bytes。"
         )
         clean_value = str(value or "").strip()
         if clean_value.lower().startswith(("data:", "base64://")):
@@ -752,7 +942,9 @@ class ArenaImagePlugin(Star):
                     content_length = response.headers.get("content-length", "")
                     try:
                         if content_length and int(content_length) > max_bytes:
-                            raise BridgeError("生成图片超过大小限制")
+                            raise BridgeError(
+                                f"{oversize}（实际约 {_human_bytes(int(content_length))}）"
+                            )
                     except ValueError:
                         pass
                     chunks: list[bytes] = []
@@ -760,7 +952,7 @@ class ArenaImagePlugin(Star):
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
                         if total > max_bytes:
-                            raise BridgeError("生成图片超过大小限制")
+                            raise BridgeError(oversize)
                         chunks.append(chunk)
                     raw = b"".join(chunks)
                     response_mime = response.headers.get("content-type", "")
@@ -774,6 +966,18 @@ class ArenaImagePlugin(Star):
             )
         else:
             raise BridgeError("Bridge 返回了不支持的图片地址")
+
+        # Chat platforms reject very large attachments; re-encode rather than
+        # throwing away an image the model already spent minutes producing.
+        send_limit = self._send_max_bytes()
+        if len(raw) > send_limit:
+            original_size = len(raw)
+            raw, mime = await asyncio.to_thread(_shrink_image_bytes, raw, mime, send_limit)
+            logger.info(
+                "[arena_image] 生成图片超出发送上限，已压缩：%s -> %s",
+                _human_bytes(original_size),
+                _human_bytes(len(raw)),
+            )
 
         suffix = mimetypes.guess_extension(mime) or ".png"
         path = self.output_dir / f"image-{int(time.time())}-{uuid.uuid4().hex[:12]}{suffix}"

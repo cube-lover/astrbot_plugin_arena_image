@@ -1,6 +1,6 @@
 name: astrbot_plugin_arena_image
 desc: LMArenaBridge text-to-image and image-to-image for AstrBot
 author: cube-lover
-version: 0.2.1
+version: 0.3.0
 repo: https://github.com/cube-lover/astrbot_plugin_arena_image
 cover: astrbot_plugin_arena_image/cover.png

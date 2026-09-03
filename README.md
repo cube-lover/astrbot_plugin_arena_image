@@ -166,8 +166,31 @@ bridge_api_key = 留空
 │   ├── docker-compose.arena.yml
 │   ├── setup.sh
 │   └── USAGE.md
+├── scripts/deploy-plugin.sh      从 git 检出同步插件到 AstrBot 数据卷
 └── .github/workflows/            GHCR 镜像发布工作流
 ```
+
+## 更新插件
+
+AstrBot 的一键更新只认仓库根目录就是插件目录的布局，本仓库把插件放在子目录里，
+所以服务器上用仓库自带脚本同步（只重启 AstrBot，不动 NapCat 登录态）：
+
+```bash
+git clone https://github.com/cube-lover/astrbot_plugin_arena_image.git /opt/astrbot-plugins-src/astrbot_plugin_arena_image
+cd /opt/astrbot-plugins-src/astrbot_plugin_arena_image
+scripts/deploy-plugin.sh
+```
+
+之后每次更新：
+
+```bash
+cd /opt/astrbot-plugins-src/astrbot_plugin_arena_image
+git pull
+scripts/deploy-plugin.sh
+```
+
+脚本会自动定位 AstrBot 数据卷、备份旧目录、同步插件、清理 `main.py.bak-*` 残留，
+最后只重启 `astrbot` 容器。可用 `--dry-run` 先看要做什么，`--no-restart` 跳过重启。
 
 ## 安全
 
@@ -177,6 +200,8 @@ bridge_api_key = 留空
 - noVNC `6082` 只绑定宿主机 `127.0.0.1`
 - 短时验证链接 `6081` 对外开放，链接带签名和有效期；noVNC 页面和 WebSocket 也由 `6081` 网关同端口代理，不会跳转到本机-only 的 `6082`
 - Arena Cookie、浏览器登录态、密钥文件只保存在服务器本地
+- `/竞技场验证`、`/竞技场重新绑定`、`/竞技场验证状态`、`/竞技场切换模型` 只有 AstrBot 管理员能用；
+  验证链接只在私聊发放，群里请求会被拒绝（链接等于交出已登录 Arena 的浏览器）
 
 不要把以下文件发给其他人：
 
@@ -215,7 +240,18 @@ http://arena-bridge:8000
 
 ### 429 Too Many Requests
 
-Arena 上游限速。等待几分钟再试，不要连续请求。可在 `.env` 里调低 `LM_BRIDGE_RPM`。
+Arena 上游限速。插件已经会读 `Retry-After` 自动重试 2 次（`rate_limit_retries`），
+仍然失败时会直接告诉你要等多久，这时不要连续重试，可换个模型或调低 `.env` 里的 `LM_BRIDGE_RPM`。
+
+### 出图很久没反应 / 提示排队
+
+出图是串行的：同一时间只跑一个请求，其余排队。插件会回报前面还有几个任务和大致等待时间，
+排队超过 `max_queue_depth`（默认 5）会直接拒绝。
+
+### 成图太大发不出去
+
+`max_output_image_bytes`（默认 64 MB）是下载上限，`send_image_max_bytes`（默认 8 MB）是发送阈值，
+超过发送阈值会自动压缩/降采样成 JPEG 再发，不会丢掉已经画好的图。
 
 ### 国内服务器无法访问 Arena
 

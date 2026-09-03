@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import mimetypes
@@ -13,6 +14,44 @@ from urllib.parse import unquote_to_bytes, urlparse
 import httpx
 
 DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_OUTPUT_IMAGE_BYTES = 64 * 1024 * 1024
+
+# Upstream limiting is reported either as HTTP 429 or as an OpenAI-style error
+# object carried inside an HTTP 200 response, so both codes and message text
+# have to be inspected.
+RATE_LIMIT_CODES = frozenset(
+    {
+        "rate_limit_exceeded",
+        "rate_limited",
+        "rate_limit",
+        "too_many_requests",
+        "http_429",
+        "429",
+    }
+)
+RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "too many requests",
+    "请求过于频繁",
+    "限流",
+)
+DEFAULT_RATE_LIMIT_RETRIES = 2
+DEFAULT_RATE_LIMIT_MAX_WAIT = 30.0
+
+_IMAGE_URL_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".avif",
+    ".svg",
+    ".heic",
+    ".heif",
+)
 
 
 class BridgeError(RuntimeError):
@@ -24,11 +63,23 @@ class BridgeError(RuntimeError):
         *,
         status_code: int | None = None,
         payload: Any = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.payload = payload
         self.code = _payload_code(payload)
+        self.retry_after = retry_after
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Whether the error is an upstream/bridge rate limit worth retrying."""
+        if self.status_code == 429:
+            return True
+        if self.code in RATE_LIMIT_CODES:
+            return True
+        text = str(self).casefold()
+        return any(marker in text for marker in RATE_LIMIT_MARKERS)
 
     @property
     def requires_interactive_auth(self) -> bool:
@@ -141,6 +192,59 @@ def _error_message(payload: Any, fallback: str) -> str:
     if isinstance(payload, dict) and payload.get("detail"):
         return str(payload["detail"])
     return fallback
+
+
+def _parse_retry_after(value: Any) -> float | None:
+    """Read a ``Retry-After`` style hint expressed in seconds."""
+    if value is None:
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def _retry_after_from(response: Any, payload: Any) -> float | None:
+    headers = getattr(response, "headers", None) or {}
+    for key in ("retry-after", "Retry-After", "x-ratelimit-reset-after"):
+        try:
+            hint = _parse_retry_after(headers.get(key))
+        except AttributeError:
+            hint = None
+        if hint:
+            return hint
+    error = _error_object(payload)
+    for key in ("retry_after", "retryAfter", "retry_after_seconds"):
+        hint = _parse_retry_after(error.get(key))
+        if hint:
+            return hint
+    if isinstance(payload, dict):
+        return _parse_retry_after(payload.get("retry_after"))
+    return None
+
+
+def looks_like_image_url(value: str) -> bool:
+    """Whether a bare URL is shaped like a direct image reference."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered.startswith("data:image/"):
+        return True
+    path = urlparse(lowered).path
+    if path.endswith(_IMAGE_URL_SUFFIXES):
+        return True
+    # Signed CDN links often keep the extension in a query parameter or use a
+    # dedicated image path segment instead of a suffix.
+    if any(f"{suffix}?" in lowered or f"{suffix}&" in lowered for suffix in _IMAGE_URL_SUFFIXES):
+        return True
+    return any(
+        marker in lowered
+        for marker in ("/image", "image/", "/images/", "img", "attachment", "blob")
+    )
 
 
 def _sniff_mime(raw: bytes) -> str | None:
@@ -409,37 +513,58 @@ def _append_image_candidate(
         _append_url(result, value)
 
 
-def _extract_images_from_text(text: str, result: list[str]) -> None:
+def _extract_images_from_text(
+    text: str,
+    result: list[str],
+    weak: list[str] | None = None,
+) -> None:
     for match in _MARKDOWN_IMAGE_RE.findall(text):
         _append_url(result, match)
     for match in _DATA_URI_RE.findall(text):
         _append_url(result, match)
     for match in _URL_RE.findall(text):
-        _append_url(result, match)
+        if looks_like_image_url(match):
+            _append_url(result, match)
+            continue
+        # A bare link inside prose is usually a citation, not the generated
+        # image.  Keep it as a last-resort candidate only.
+        candidate = str(match).strip().rstrip(".,;:!?")
+        if weak is not None and candidate not in result:
+            _append_url(weak, candidate)
 
 
-def _extract_images_from_content(content: Any, result: list[str]) -> None:
+def _extract_images_from_content(
+    content: Any,
+    result: list[str],
+    weak: list[str] | None = None,
+) -> None:
     if isinstance(content, str):
-        _extract_images_from_text(content, result)
+        _extract_images_from_text(content, result, weak)
     elif isinstance(content, list):
         for item in content:
             if isinstance(item, str):
-                _extract_images_from_text(item, result)
+                _extract_images_from_text(item, result, weak)
             elif isinstance(item, dict):
                 _append_image_candidate(result, item)
                 text = item.get("text")
                 if isinstance(text, str):
-                    _extract_images_from_text(text, result)
+                    _extract_images_from_text(text, result, weak)
     elif isinstance(content, dict):
         _append_image_candidate(result, content)
         text = content.get("text")
         if isinstance(text, str):
-            _extract_images_from_text(text, result)
+            _extract_images_from_text(text, result, weak)
 
 
 def image_urls(payload: Any) -> list[str]:
-    """Extract generated image URLs/data URIs from common response shapes."""
+    """Extract generated image URLs/data URIs from common response shapes.
+
+    Structured fields, markdown images and data URIs are treated as reliable.
+    Bare links found in prose are only returned when nothing better exists, so
+    a text answer containing a citation is not mistaken for an image.
+    """
     result: list[str] = []
+    weak: list[str] = []
     if not isinstance(payload, dict):
         return result
 
@@ -450,7 +575,7 @@ def image_urls(payload: Any) -> list[str]:
                 continue
             message = choice.get("message") if isinstance(choice.get("message"), dict) else choice
             if isinstance(message, dict):
-                _extract_images_from_content(message.get("content"), result)
+                _extract_images_from_content(message.get("content"), result, weak)
                 for key in ("images", "image", "data"):
                     if key in message:
                         _append_image_candidate(result, message[key])
@@ -478,8 +603,10 @@ def image_urls(payload: Any) -> list[str]:
 
     response = payload.get("response")
     if isinstance(response, str):
-        _extract_images_from_text(response, result)
-    return result
+        _extract_images_from_text(response, result, weak)
+    if result:
+        return result
+    return weak
 
 
 def _as_bool(value: Any) -> bool:
@@ -514,10 +641,20 @@ def model_is_image_capable(model: dict[str, Any]) -> tuple[bool, bool]:
 class ArenaBridgeClient:
     """Async client used by the AstrBot plugin."""
 
-    def __init__(self, base_url: str, api_key: str = "", timeout: float = 300) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        timeout: float = 300,
+        *,
+        rate_limit_retries: int = DEFAULT_RATE_LIMIT_RETRIES,
+        rate_limit_max_wait: float = DEFAULT_RATE_LIMIT_MAX_WAIT,
+    ) -> None:
         self.base_url = normalize_api_base(base_url)
         self.api_key = str(api_key or "").strip()
         self.timeout = max(10.0, float(timeout))
+        self.rate_limit_retries = max(0, int(rate_limit_retries))
+        self.rate_limit_max_wait = max(0.0, float(rate_limit_max_wait))
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -525,7 +662,29 @@ class ArenaBridgeClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
+    def _rate_limit_delay(self, exc: BridgeError, attempt: int) -> float:
+        """Honour ``Retry-After`` when present, else back off exponentially."""
+        hint = exc.retry_after or 0.0
+        if hint <= 0:
+            hint = min(self.rate_limit_max_wait, 6.0 * (2**attempt))
+        return max(1.0, min(self.rate_limit_max_wait, hint))
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        attempts = self.rate_limit_retries + 1
+        last_error: BridgeError | None = None
+        for attempt in range(attempts):
+            try:
+                return await self._request_once(method, path, **kwargs)
+            except BridgeError as exc:
+                if not exc.is_rate_limited or attempt == attempts - 1:
+                    raise
+                last_error = exc
+                await asyncio.sleep(self._rate_limit_delay(exc, attempt))
+        if last_error is not None:  # pragma: no cover - defensive
+            raise last_error
+        raise BridgeError("Bridge 请求未产生结果")  # pragma: no cover - defensive
+
+    async def _request_once(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
         try:
             async with httpx.AsyncClient(
@@ -547,11 +706,13 @@ class ArenaBridgeClient:
                 _error_message(payload, f"Bridge 返回 HTTP {response.status_code}"),
                 status_code=response.status_code,
                 payload=payload,
+                retry_after=_retry_after_from(response, payload),
             )
         if isinstance(payload, dict) and payload.get("error") and not payload.get("choices"):
             raise BridgeError(
                 _error_message(payload, "Bridge 返回错误"),
                 payload=payload,
+                retry_after=_retry_after_from(response, payload),
             )
         return payload
 

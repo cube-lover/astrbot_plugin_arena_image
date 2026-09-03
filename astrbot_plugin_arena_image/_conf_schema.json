@@ -42,8 +42,18 @@
   },
   "max_image_bytes": {
     "type": "int",
-    "description": "输入或输出图片最大字节数",
+    "description": "输入参考图最大字节数（图生图上传用）",
     "default": 10485760
+  },
+  "max_output_image_bytes": {
+    "type": "int",
+    "description": "允许下载的生成图片最大字节数（超过则报错）",
+    "default": 67108864
+  },
+  "send_image_max_bytes": {
+    "type": "int",
+    "description": "发送前的图片大小阈值，超过会自动压缩/降采样（需要 Pillow）",
+    "default": 8388608
   },
   "max_input_images": {
     "type": "int",
@@ -59,5 +69,20 @@
     "type": "int",
     "description": "插件本地最多保留的生成图片数量",
     "default": 32
+  },
+  "max_queue_depth": {
+    "type": "int",
+    "description": "同时排队等待出图的最大任务数，超出直接拒绝",
+    "default": 5
+  },
+  "rate_limit_retries": {
+    "type": "int",
+    "description": "上游限流（429）后的自动重试次数",
+    "default": 2
+  },
+  "rate_limit_max_wait": {
+    "type": "int",
+    "description": "限流重试的单次最长等待秒数（优先遵循 Retry-After）",
+    "default": 30
   }
 }

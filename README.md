@@ -1,4 +1,7 @@
-# AstrBot Arena Image Plugin + LMArenaBridge
+# 免费gpt灰测画图模型，逆向竞技场臭gaygay插件
+
+> AstrBot 的 Arena 画图插件 + 配套 LMArenaBridge 服务：白嫖 Arena 灰测画图模型
+> 「蒙娜丽莎 / GPT-Image-2.5」，支持文生图、图生图。
 
 > [!IMPORTANT]
 > **有问题请进 QQ 群 `460973561` 交流，不点 Star 不给进。**
@@ -91,23 +94,27 @@ curl http://127.0.0.1:6081/health
 
 ### 4. 安装 AstrBot 插件
 
-方式 A：插件市场/仓库链接安装
+方式 A：插件市场安装（推荐）
 
-在 AstrBot 管理面板的插件市场中填入：
+在 AstrBot 管理面板的插件市场里搜索 **「免费gpt灰测画图模型，逆向竞技场臭gaygay插件」**，
+或直接填入仓库地址：
 
 ```text
 https://github.com/cube-lover/astrbot_plugin_arena_image
 ```
 
-安装后重载插件。
+安装后重载插件。仓库根目录就是插件目录，之后可以直接用面板的一键更新。
 
 方式 B：手动复制
 
 ```bash
+git clone https://github.com/cube-lover/astrbot_plugin_arena_image.git
 cp -r astrbot_plugin_arena_image /path/to/astrbot/data/plugins/
+rm -rf /path/to/astrbot/data/plugins/astrbot_plugin_arena_image/.git
 ```
 
-然后重载 AstrBot 插件。
+然后重载 AstrBot 插件。`docker/`、`docs/`、`scripts/` 是服务端和文档，留在插件目录里不影响加载，
+想要干净一点可以删掉，或者用 `scripts/deploy-plugin.sh` 自动排除（见下方「更新插件」）。
 
 插件默认配置：
 
@@ -151,6 +158,29 @@ bridge_api_key = 留空
 /jjc 把这张图改成赛博朋克风格
 ```
 
+## 配置项
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `bridge_url` | `http://arena-bridge:8000` | Bridge 根地址或 `/api/v1` 地址 |
+| `bridge_api_key` | 空 | Bridge API Key，零配置部署留空 |
+| `default_model` | `gpt-image-2 (medium)` | 会话未选模型时使用 |
+| `request_timeout` | 300 | 模型请求和图片下载超时（秒） |
+| `max_image_bytes` | 10 MB | **输入**参考图上限（图生图上传用） |
+| `max_output_image_bytes` | 64 MB | **输出**图片下载上限，超过才报错 |
+| `send_image_max_bytes` | 8 MB | 超过就自动压缩/降采样后再发（需要 Pillow） |
+| `max_input_images` | 4 | 一次图生图最多几张参考图 |
+| `max_output_images` | 1 | 一次请求最多发几张成图 |
+| `max_saved_outputs` | 32 | 本地保留的成图数量 |
+| `max_queue_depth` | 5 | 出图是串行的，排队超过这个数直接拒绝 |
+| `rate_limit_retries` | 2 | 上游 429 后自动重试次数 |
+| `rate_limit_max_wait` | 30 | 限流重试单次最长等待秒数，优先遵循 `Retry-After` |
+
+输入和输出上限是分开的：模型返回的大图不会再因为「输入上限 10 MB」被丢掉，
+只有超过 `max_output_image_bytes` 才失败，而超过 `send_image_max_bytes` 时会先压缩再发送。
+
+每个群聊或私聊独立保存模型选择。Pillow 是 AstrBot 自带的，缺失时只会跳过压缩，不影响画图。
+
 ## 详细文档
 
 完整部署说明见 [docker/USAGE.md](docker/USAGE.md)。
@@ -159,21 +189,31 @@ bridge_api_key = 留空
 
 ```text
 .
-├── astrbot_plugin_arena_image/   AstrBot 插件
-├── docker/                       LMArenaBridge 服务和两容器部署
+├── main.py                   插件入口，AstrBot 加载这个文件
+├── bridge_client.py          Bridge HTTP 客户端
+├── metadata.yaml             插件元数据
+├── _conf_schema.json         插件配置项定义
+├── requirements.txt
+├── cover.png                 插件市场封面
+├── docker/                   LMArenaBridge 服务和两容器部署
 │   ├── Dockerfile
 │   ├── Dockerfile.arena-browser
 │   ├── docker-compose.arena.yml
 │   ├── setup.sh
+│   ├── src/                  Bridge 源码
+│   ├── tests/                pytest 测试
 │   └── USAGE.md
-├── scripts/deploy-plugin.sh      从 git 检出同步插件到 AstrBot 数据卷
-└── .github/workflows/            GHCR 镜像发布工作流
+├── docs/examples/            示例成图
+└── scripts/deploy-plugin.sh  从 git 检出同步插件到 AstrBot 数据卷
 ```
+
+`docker/`、`docs/`、`scripts/` 只是服务端和文档，AstrBot 只会加载根目录的 `main.py`。
 
 ## 更新插件
 
-AstrBot 的一键更新只认仓库根目录就是插件目录的布局，本仓库把插件放在子目录里，
-所以服务器上用仓库自带脚本同步（只重启 AstrBot，不动 NapCat 登录态）：
+仓库根目录就是插件目录，AstrBot 面板里的插件市场更新和一键更新都能直接用。
+
+如果插件是在服务器上从 git 检出部署的，用仓库自带脚本同步（只重启 AstrBot，不动 NapCat 登录态）：
 
 ```bash
 git clone https://github.com/cube-lover/astrbot_plugin_arena_image.git /opt/astrbot-plugins-src/astrbot_plugin_arena_image
@@ -189,8 +229,9 @@ git pull
 scripts/deploy-plugin.sh
 ```
 
-脚本会自动定位 AstrBot 数据卷、备份旧目录、同步插件、清理 `main.py.bak-*` 残留，
-最后只重启 `astrbot` 容器。可用 `--dry-run` 先看要做什么，`--no-restart` 跳过重启。
+脚本会自动定位 AstrBot 数据卷、备份旧目录、同步插件（自动排除 `docker/`、`docs/`、`scripts/`、
+`__pycache__/`）、清理 `main.py.bak-*` 残留，最后只重启 `astrbot` 容器。
+可用 `--dry-run` 先看要做什么，`--no-restart` 跳过重启。
 
 ## 安全
 

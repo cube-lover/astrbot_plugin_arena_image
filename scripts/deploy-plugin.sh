@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# 把当前 git 检出里的 astrbot_plugin_arena_image 同步到 AstrBot 数据卷。
-# 插件位于仓库子目录，AstrBot 的一键更新识别不了这种布局，用本脚本更新。
+# 把当前 git 检出同步到 AstrBot 数据卷里的 data/plugins/astrbot_plugin_arena_image。
+# 仓库根目录就是插件目录，AstrBot 面板里的一键更新也能用；本脚本用于直接从
+# 服务器上的 git 检出部署（改完立即生效，不必等市场审核）。
 set -euo pipefail
 
 CONTAINER="${ASTRBOT_CONTAINER:-astrbot}"
@@ -45,9 +46,25 @@ run() {
 }
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE_DIR="$REPO_ROOT/$PLUGIN_NAME"
+# 仓库根目录本身就是插件目录（AstrBot 插件市场布局），同步时排除服务端与文档
+SOURCE_DIR="$REPO_ROOT"
+EXCLUDES=(
+    '.git/'
+    '.github/'
+    '.gitattributes'
+    '.gitignore'
+    'docker/'
+    'docs/'
+    'scripts/'
+    '__pycache__/'
+    '*.pyc'
+    'main.py.bak-*'
+    '.ruff_cache/'
+    '.pytest_cache/'
+    'config.json'
+)
 
-[ -f "$SOURCE_DIR/main.py" ] || { echo "找不到插件源码: $SOURCE_DIR" >&2; exit 1; }
+[ -f "$SOURCE_DIR/main.py" ] || { echo "找不到插件源码: $SOURCE_DIR/main.py" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "需要 docker 命令" >&2; exit 1; }
 
 if [ -z "$DATA_DIR" ]; then
@@ -87,19 +104,22 @@ fi
 
 run mkdir -p "$TARGET_DIR"
 if command -v rsync >/dev/null 2>&1; then
-    run rsync -a --delete \
-        --exclude '__pycache__/' \
-        --exclude '*.pyc' \
-        --exclude 'main.py.bak-*' \
-        "$SOURCE_DIR/" "$TARGET_DIR/"
+    rsync_args=()
+    for pattern in "${EXCLUDES[@]}"; do
+        rsync_args+=(--exclude "$pattern")
+    done
+    run rsync -a --delete "${rsync_args[@]}" "$SOURCE_DIR/" "$TARGET_DIR/"
 elif [ "$DRY_RUN" -eq 1 ]; then
     printf '[dry-run] tar 同步 %s -> %s\n' "$SOURCE_DIR" "$TARGET_DIR"
 else
     log "没有 rsync，改用 tar 同步"
+    tar_args=()
+    for pattern in "${EXCLUDES[@]}"; do
+        # GNU tar 的 --exclude 不接受结尾斜杠，去掉后按路径分量匹配
+        tar_args+=(--exclude "${pattern%/}")
+    done
     find "$TARGET_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-    tar -C "$SOURCE_DIR" \
-        --exclude='__pycache__' --exclude='*.pyc' --exclude='main.py.bak-*' \
-        -cf - . | tar -C "$TARGET_DIR" -xf -
+    tar -C "$SOURCE_DIR" "${tar_args[@]}" -cf - . | tar -C "$TARGET_DIR" -xf -
 fi
 
 if [ "$RESTART" -eq 1 ]; then

@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 from astrbot_plugin_arena_image import bridge_client
 
+# The repository root is the AstrBot plugin directory itself (plugin-market layout).
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfixture-image"
 PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
 
@@ -192,9 +195,7 @@ class BridgeClientPureFunctionsTest(unittest.TestCase):
         )
         self.assertTrue(expired.requires_interactive_auth)
 
-        plugin_source = (
-            Path(__file__).parents[2] / "astrbot_plugin_arena_image" / "main.py"
-        ).read_text(encoding="utf-8")
+        plugin_source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
         self.assertIn("/竞技场重新绑定", plugin_source)
 
         invalid_bridge_key = bridge_client.BridgeError(
@@ -291,7 +292,7 @@ class DockerEntrypointTest(unittest.TestCase):
 
 class PluginMetadataTest(unittest.TestCase):
     def test_plugin_files_are_present_and_valid_json(self) -> None:
-        root = Path(__file__).parents[2] / "astrbot_plugin_arena_image"
+        root = PLUGIN_ROOT
         schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["default_model"]["default"], "gpt-image-2 (medium)")
         self.assertTrue(schema["bridge_api_key"]["secret"])
@@ -301,9 +302,7 @@ class PluginMetadataTest(unittest.TestCase):
         self.assertTrue((root / "requirements.txt").read_text(encoding="utf-8").strip())
 
     def test_unified_jjc_command_is_present_and_reports_start(self) -> None:
-        source = (
-            Path(__file__).parents[2] / "astrbot_plugin_arena_image" / "main.py"
-        ).read_text(encoding="utf-8")
+        source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
         self.assertIn('@filter.command("jjc"', source)
         self.assertIn("开始{mode_text}", source)
         self.assertIn("include_input_images=is_image_to_image", source)

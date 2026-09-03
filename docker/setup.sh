@@ -141,7 +141,8 @@ cat <<EOF
  1. 启动服务：
     docker compose -f docker-compose.arena.yml --env-file .env up -d --build
 
- 2. 把 astrbot_plugin_arena_image/ 目录复制到 AstrBot 插件目录，
+ 2. 在 AstrBot 插件市场安装本插件（或把仓库根目录复制成
+    data/plugins/astrbot_plugin_arena_image/），
     插件默认已指向 http://arena-bridge:8000，API Key 留空即可。
 
  3. 在聊天里发送：

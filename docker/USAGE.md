@@ -195,8 +195,11 @@ https://github.com/cube-lover/astrbot_plugin_arena_image
 
 ### 方式 B：手动复制
 
+仓库根目录就是插件目录，把整个检出复制过去即可：
+
 ```bash
-cp -r ../astrbot_plugin_arena_image /path/to/astrbot/data/plugins/
+cp -r .. /path/to/astrbot/data/plugins/astrbot_plugin_arena_image
+rm -rf /path/to/astrbot/data/plugins/astrbot_plugin_arena_image/.git
 ```
 
 常见 AstrBot 插件路径：
@@ -205,7 +208,8 @@ cp -r ../astrbot_plugin_arena_image /path/to/astrbot/data/plugins/
 /data/astrbot/data/plugins/astrbot_plugin_arena_image/
 ```
 
-复制后重载插件。
+复制后重载插件。服务器上已有 git 检出时更推荐 `scripts/deploy-plugin.sh`，
+它会自动排除 `docker/`、`docs/`、`scripts/` 并只重启 AstrBot。
 
 ### 插件配置
 

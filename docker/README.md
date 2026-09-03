@@ -120,7 +120,7 @@ Bridge 仍兼容返回原始 noVNC 地址。
 
 ## AstrBot 插件安装
 
-将以下目录完整复制到 AstrBot 的插件目录：
+推荐在 AstrBot 插件市场里直接安装（仓库根目录就是插件目录）。手动安装时，把仓库根目录复制成：
 
 ```text
 data/plugins/astrbot_plugin_arena_image/
@@ -163,7 +163,7 @@ docker build -t lmarenabridge:local .
 ## 目录说明
 
 - `src/`：LMArenaBridge FastAPI 服务。
-- `astrbot_plugin_arena_image/`：AstrBot 插件。
+- 仓库根目录：AstrBot 插件本体（`main.py`、`bridge_client.py`、`metadata.yaml` 等）。
 - `Dockerfile`、`docker-compose.arena.yml`：Bridge 容器化配置。
 - `docker-entrypoint.py`：初始化 `/data/config.json`、`/data/models.json` 和 API Key 文件。
 - `tests/test_arena_image_plugin.py`：Bridge 客户端、入口初始化和插件清单测试。

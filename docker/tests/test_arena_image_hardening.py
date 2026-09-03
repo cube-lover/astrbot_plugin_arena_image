@@ -23,6 +23,9 @@ from unittest.mock import patch
 
 from astrbot_plugin_arena_image import bridge_client
 
+# The repository root is the AstrBot plugin directory itself (plugin-market layout).
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _DATA_DIR: list[str] = [""]
 
@@ -699,7 +702,7 @@ class SchemaAndMetadataTest(unittest.TestCase):
     def test_new_config_keys_are_declared_with_matching_defaults(self) -> None:
         import json
 
-        root = Path(__file__).parents[2] / "astrbot_plugin_arena_image"
+        root = PLUGIN_ROOT
         schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
         main = _plugin_module()
         self.assertEqual(
@@ -714,8 +717,35 @@ class SchemaAndMetadataTest(unittest.TestCase):
             self.assertIn(key, schema)
         self.assertIn("输入", schema["max_image_bytes"]["description"])
         metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 0.3.0", metadata)
+        self.assertIn("version: 0.4.0", metadata)
         self.assertIn("author: cube-lover", metadata)
+
+    def test_repository_root_is_the_installable_plugin_directory(self) -> None:
+        """AstrBot installs the repo into ``data/plugins/<repo_name>`` and then
+        requires ``metadata.yaml`` plus ``main.py`` at that top level, so the
+        plugin entry point must never move back into a subdirectory."""
+        import yaml
+
+        for required in ("metadata.yaml", "main.py", "_conf_schema.json"):
+            with self.subTest(file=required):
+                self.assertTrue(
+                    (PLUGIN_ROOT / required).is_file(),
+                    f"{required} must sit at the repository root",
+                )
+        self.assertFalse(
+            (PLUGIN_ROOT / "astrbot_plugin_arena_image").exists(),
+            "the plugin must not be nested in a same-named subdirectory again",
+        )
+
+        metadata = yaml.safe_load((PLUGIN_ROOT / "metadata.yaml").read_text("utf-8"))
+        for field in ("name", "desc", "version", "author"):
+            with self.subTest(field=field):
+                self.assertIsInstance(metadata.get(field), str)
+                self.assertTrue(metadata[field].strip())
+        self.assertEqual(metadata["name"], "astrbot_plugin_arena_image")
+        self.assertTrue(metadata["display_name"].strip())
+        self.assertEqual(metadata["cover"], "cover.png")
+        self.assertTrue((PLUGIN_ROOT / metadata["cover"]).is_file())
 
 
 if __name__ == "__main__":

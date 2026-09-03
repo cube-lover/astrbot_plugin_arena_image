@@ -1,6 +1,0 @@
-name: astrbot_plugin_arena_image
-desc: LMArenaBridge text-to-image and image-to-image for AstrBot, supports GPT-Image-2.5 graytest
-author: cube-lover
-version: 0.3.0
-repo: https://github.com/cube-lover/astrbot_plugin_arena_image
-cover: cover.png

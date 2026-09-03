@@ -40,6 +40,16 @@ RATE_LIMIT_MARKERS = (
 DEFAULT_RATE_LIMIT_RETRIES = 2
 DEFAULT_RATE_LIMIT_MAX_WAIT = 30.0
 
+# Bridge failures that are explicitly *not* an expired browser session.  These
+# codes must win over the challenge-term heuristics in
+# ``requires_interactive_auth``; otherwise an internal bridge error whose text
+# mentions reCAPTCHA would tell the operator to re-verify a healthy login.
+NON_INTERACTIVE_AUTH_CODES = frozenset(
+    {
+        "recaptcha_mint_failed",
+    }
+)
+
 _IMAGE_URL_SUFFIXES = (
     ".png",
     ".jpg",
@@ -84,6 +94,8 @@ class BridgeError(RuntimeError):
     @property
     def requires_interactive_auth(self) -> bool:
         """Whether the error is consistent with an Arena/Cloudflare challenge."""
+        if self.code in NON_INTERACTIVE_AUTH_CODES:
+            return False
         if self.code in {
             "arena_verification_required",
             "interactive_auth_required",

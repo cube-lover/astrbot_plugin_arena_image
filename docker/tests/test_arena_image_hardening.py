@@ -717,7 +717,7 @@ class SchemaAndMetadataTest(unittest.TestCase):
             self.assertIn(key, schema)
         self.assertIn("输入", schema["max_image_bytes"]["description"])
         metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 0.4.0", metadata)
+        self.assertIn("version: 0.4.1", metadata)
         self.assertIn("author: cube-lover", metadata)
 
     def test_repository_root_is_the_installable_plugin_directory(self) -> None:

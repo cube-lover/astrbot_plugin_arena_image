@@ -1004,6 +1004,50 @@ class InteractiveAuthManager:
         session = max(candidates, key=lambda item: item.created_at)
         return await self.check(session.session_id, config)
 
+    async def latest_or_snapshot(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Answer a status query from a client that holds no session id.
+
+        Verification sessions only live for `interactive_auth_ttl_seconds`
+        (15 minutes by default) while the cookies they produced keep working
+        for far longer.  Without this fallback, /竞技场验证状态 reports
+        "当前没有验证会话" for a server browser that is perfectly logged in.
+        """
+        try:
+            return await self.latest(config)
+        except InteractiveAuthError:
+            return await self._idle_result(config)
+
+    async def _idle_result(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Describe the persisted/live browser state with no session open."""
+        live = await self.sync_live_browser_session(config)
+        has_cf = bool(live.get("has_cf_clearance"))
+        logged_in = bool(live.get("has_logged_in"))
+        verified = bool(live.get("verified"))
+        has_auth = bool(live.get("has_arena_auth")) or _has_valid_persisted_arena_auth(config)
+        if verified:
+            message = "当前没有进行中的验证会话，服务器浏览器仍是已登录状态，可以直接画图。"
+        elif logged_in or has_auth:
+            message = (
+                "当前没有进行中的验证会话，已保存的 Arena 登录态仍在使用中。"
+                "如果画图报验证失败，请运行 /竞技场验证 打开服务器浏览器确认登录状态。"
+            )
+        else:
+            message = (
+                "当前没有进行中的验证会话，也没有可用的 Arena 登录态。"
+                "请运行 /竞技场验证 打开服务器浏览器并登录（匿名会话无法出图）。"
+            )
+        return {
+            "session_id": "",
+            "status": "verified" if verified else "idle",
+            "verified": verified,
+            "browser_url": "",
+            "expires_at": int(time.time()),
+            "has_cf_clearance": has_cf,
+            "has_arena_auth": has_auth,
+            "has_logged_in": logged_in,
+            "message": message,
+        }
+
     async def close(self) -> None:
         async with self._lock:
             sessions = list(self._sessions.values())

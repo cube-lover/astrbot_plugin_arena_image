@@ -218,6 +218,23 @@ def _verification_error_payload(message: str) -> dict[str, str]:
     }
 
 
+def _internal_token_error_payload() -> dict[str, str]:
+    """Report a Bridge-side token minting failure, not an expired session.
+
+    The message deliberately avoids challenge wording ("Cloudflare",
+    "reCAPTCHA", "Arena auth"): the plugin classifies those terms on a 5xx as
+    "operator must re-verify", which would send the user through a pointless
+    login round-trip while the server browser is still logged in.
+    """
+    return {
+        "code": "recaptcha_mint_failed",
+        "message": (
+            "服务器浏览器会话仍然有效，但 Bridge 这次没能生成出图所需的一次性令牌（内部错误）。"
+            "请稍后重试；如果一直失败，请查看 arena-bridge 日志。"
+        ),
+    }
+
+
 def _arena_auth_error_payload() -> dict[str, str]:
     """Return the stable error contract used when an Arena session expires."""
     return {
@@ -2509,7 +2526,7 @@ async def latest_interactive_auth_status(
 ):
     """Return the most recent manual verification session, if one exists."""
     try:
-        return await interactive_auth_manager.latest(get_config())
+        return await interactive_auth_manager.latest_or_snapshot(get_config())
     except InteractiveAuthError as exc:
         raise HTTPException(
             status_code=404,
@@ -2933,15 +2950,28 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 recaptcha_token = await refresh_recaptcha_token(force_new=False)
                 if not recaptcha_token:
                     debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
+                    # A mint failure can mean either "the browser needs to pass
+                    # Cloudflare/login again" or "minting crashed inside the
+                    # bridge".  Ask the visible browser which one it is so the
+                    # operator is not told to re-verify a healthy session.
+                    try:
+                        live_browser_state = await interactive_auth_manager.sync_live_browser_session(
+                            get_config()
+                        )
+                    except Exception:
+                        live_browser_state = {}
+                    if live_browser_state.get("has_logged_in"):
+                        debug_print("⚠️ Server browser is still logged in: reporting internal token failure.")
+                        raise HTTPException(
+                            status_code=503,
+                            detail=_internal_token_error_payload(),
+                        )
                     raise HTTPException(
                         status_code=503,
-                        detail={
-                            "code": "arena_verification_required",
-                            "message": (
-                                "服务器需要完成 Arena/Cloudflare 浏览器验证。"
-                                "请运行 /竞技场验证 打开服务器浏览器。"
-                            ),
-                        },
+                        detail=_verification_error_payload(
+                            "服务器需要完成 Arena/Cloudflare 浏览器验证。"
+                            "请运行 /竞技场验证 打开服务器浏览器。"
+                        ),
                     )
                 debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
         # -----------------------------------------------

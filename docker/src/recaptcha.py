@@ -14,12 +14,14 @@ accessed via _m() late-import of main so test patches remain effective.
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 
 def _m():
@@ -123,8 +125,42 @@ def get_recaptcha_settings(config: Optional[dict] = None) -> tuple[str, str]:
         )
         
         action = "chat_submit" if has_valid_token else "sign_up"
-    
+
     return sitekey, action
+
+
+def build_recaptcha_injection_script(sitekey: str) -> str:
+    """Return a zero-argument JS thunk that loads the reCAPTCHA v3 libraries.
+
+    ``safe_page_evaluate()`` forwards nothing but the script to
+    ``page.evaluate()``, so the sitekey has to be baked into the source; a
+    bare ``recaptcha_sitekey`` identifier would be undefined in page scope.
+    """
+    render = quote(str(sitekey or ""), safe="")
+    urls = json.dumps(
+        [
+            f"https://www.google.com/recaptcha/enterprise.js?render={render}",
+            f"https://www.google.com/recaptcha/api.js?render={render}",
+        ]
+    )
+    return (
+        """() => {
+            const w = window.wrappedJSObject || window;
+            if (w.__LM_BRIDGE_RECAPTCHA_INJECTED) return true;
+            w.__LM_BRIDGE_RECAPTCHA_INJECTED = true;
+            const h = w.document?.head;
+            if (!h) return false;
+            const urls = __LM_BRIDGE_RECAPTCHA_URLS__;
+            for (const u of urls) {
+                const s = w.document.createElement('script');
+                s.src = u;
+                s.async = true;
+                s.defer = true;
+                h.appendChild(s);
+            }
+            return true;
+        }"""
+    ).replace("__LM_BRIDGE_RECAPTCHA_URLS__", urls)
 
 
 async def _mint_recaptcha_v3_token_in_page(
@@ -750,26 +786,7 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                 # Inject reCAPTCHA scripts since LMArena may not have them loaded
                 await _m().safe_page_evaluate(
                     page,
-                    """() => {
-                        const w = window.wrappedJSObject || window;
-                        if (w.__LM_BRIDGE_RECAPTCHA_INJECTED) return true;
-                        w.__LM_BRIDGE_RECAPTCHA_INJECTED = true;
-                        const h = w.document?.head;
-                        if (!h) return false;
-                        const urls = [
-                            'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(recaptcha_sitekey),
-                            'https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent(recaptcha_sitekey),
-                        ];
-                        for (const u of urls) {
-                            const s = w.document.createElement('script');
-                            s.src = u;
-                            s.async = true;
-                            s.defer = true;
-                            h.appendChild(s);
-                        }
-                        return true;
-                    }""",
-                    recaptcha_sitekey=recaptcha_sitekey,
+                    build_recaptcha_injection_script(recaptcha_sitekey),
                 )
                 # Wait for scripts to load
                 await asyncio.sleep(5)

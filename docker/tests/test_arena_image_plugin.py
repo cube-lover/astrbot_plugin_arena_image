@@ -205,6 +205,28 @@ class BridgeClientPureFunctionsTest(unittest.TestCase):
         )
         self.assertFalse(invalid_bridge_key.requires_interactive_auth)
 
+    def test_internal_token_failure_does_not_ask_for_reverification(self) -> None:
+        internal = bridge_client.BridgeError(
+            "服务器浏览器会话仍然有效，但 Bridge 这次没能生成出图所需的一次性令牌（内部错误）。",
+            status_code=503,
+            payload={
+                "detail": {
+                    "code": "recaptcha_mint_failed",
+                    "message": "内部错误，请稍后重试。",
+                }
+            },
+        )
+        self.assertFalse(internal.requires_interactive_auth)
+        self.assertFalse(internal.is_rate_limited)
+
+        # The same status without the explicit code still escalates.
+        challenge = bridge_client.BridgeError(
+            "Cloudflare challenge detected.",
+            status_code=503,
+            payload={"detail": {"code": "arena_verification_required"}},
+        )
+        self.assertTrue(challenge.requires_interactive_auth)
+
     def test_model_health_endpoint_contract(self) -> None:
         FakeAsyncClient.instances.clear()
         FakeAsyncClient.response = FakeJsonResponse(

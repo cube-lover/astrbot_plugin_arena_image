@@ -2926,8 +2926,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         except Exception:
             recaptcha_token = ""
         if recaptcha_token:
+            # The signed-in verification browser mints the strongest token we can
+            # get.  The side-channel refresh below used to overwrite it, so a
+            # hiccup in that fallback failed requests whose token was already fine.
             debug_print("🔐 Using interactive-browser reCAPTCHA v3 token.")
-        if not recaptcha_token and strict_chrome_fetch_model:
+        elif strict_chrome_fetch_model:
             # If the internal proxy is active, we MUST NOT use a cached token, as it causes 403s.
             # Instead, we pass an empty string and let the in-page minting handle it.
             if (time.time() - last_userscript_poll) < 15:
@@ -2941,39 +2944,38 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     debug_print("🔐 Strict model: using cached reCAPTCHA v3 token in payload.")
                 else:
                     debug_print("🔐 Strict model: reCAPTCHA token will be minted in the Chrome fetch session.")
-        else:
+        elif stream:
             # reCAPTCHA v3 tokens can behave like single-use tokens; force a fresh token for streaming requests.
             # For streaming, we defer this until inside generate_stream to avoid blocking initial headers.
-            if stream:
-                recaptcha_token = ""
-            else:
-                recaptcha_token = await refresh_recaptcha_token(force_new=False)
-                if not recaptcha_token:
-                    debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-                    # A mint failure can mean either "the browser needs to pass
-                    # Cloudflare/login again" or "minting crashed inside the
-                    # bridge".  Ask the visible browser which one it is so the
-                    # operator is not told to re-verify a healthy session.
-                    try:
-                        live_browser_state = await interactive_auth_manager.sync_live_browser_session(
-                            get_config()
-                        )
-                    except Exception:
-                        live_browser_state = {}
-                    if live_browser_state.get("has_logged_in"):
-                        debug_print("⚠️ Server browser is still logged in: reporting internal token failure.")
-                        raise HTTPException(
-                            status_code=503,
-                            detail=_internal_token_error_payload(),
-                        )
+            recaptcha_token = ""
+        else:
+            recaptcha_token = await refresh_recaptcha_token(force_new=False)
+            if not recaptcha_token:
+                debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
+                # A mint failure can mean either "the browser needs to pass
+                # Cloudflare/login again" or "minting crashed inside the
+                # bridge".  Ask the visible browser which one it is so the
+                # operator is not told to re-verify a healthy session.
+                try:
+                    live_browser_state = await interactive_auth_manager.sync_live_browser_session(
+                        get_config()
+                    )
+                except Exception:
+                    live_browser_state = {}
+                if live_browser_state.get("has_logged_in"):
+                    debug_print("⚠️ Server browser is still logged in: reporting internal token failure.")
                     raise HTTPException(
                         status_code=503,
-                        detail=_verification_error_payload(
-                            "服务器需要完成 Arena/Cloudflare 浏览器验证。"
-                            "请运行 /竞技场验证 打开服务器浏览器。"
-                        ),
+                        detail=_internal_token_error_payload(),
                     )
-                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+                raise HTTPException(
+                    status_code=503,
+                    detail=_verification_error_payload(
+                        "服务器需要完成 Arena/Cloudflare 浏览器验证。"
+                        "请运行 /竞技场验证 打开服务器浏览器。"
+                    ),
+                )
+            debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
         # -----------------------------------------------
         
         # Generate conversation ID from context (API key + model + first user message)

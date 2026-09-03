@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -161,6 +162,100 @@ def build_recaptcha_injection_script(sitekey: str) -> str:
             return true;
         }"""
     ).replace("__LM_BRIDGE_RECAPTCHA_URLS__", urls)
+
+
+# Probing for a *callable* execute() matters: arena.ai's bundle publishes the
+# ``grecaptcha`` / ``grecaptcha.enterprise`` namespace before the API functions
+# are attached, so a truthiness check passes while the mint call still fails
+# with "No valid grecaptcha found".
+GRECAPTCHA_EXECUTE_PROBE = """() => {
+    const w = window.wrappedJSObject || window;
+    const g = w && w.grecaptcha;
+    if (!g) return 'missing';
+    const ent = g.enterprise;
+    if (ent && typeof ent.execute === 'function') return 'enterprise';
+    if (typeof g.execute === 'function') return 'v3';
+    return 'loading';
+}"""
+
+GRECAPTCHA_READY_STATES = frozenset({"enterprise", "v3"})
+
+
+async def wait_for_grecaptcha_execute(page, timeout: float = 12.0, interval: float = 0.5) -> str:
+    """Poll ``page`` until grecaptcha exposes a callable ``execute``.
+
+    Returns the probe state: ``enterprise``/``v3`` when minting can proceed,
+    ``loading`` when the namespace exists but is still half-initialised, and
+    ``missing`` when the library is absent (inject it).
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    state = "missing"
+    while True:
+        state = await _m().safe_page_evaluate(page, GRECAPTCHA_EXECUTE_PROBE) or "missing"
+        if state in GRECAPTCHA_READY_STATES:
+            return str(state)
+        if time.monotonic() >= deadline:
+            return str(state)
+        await asyncio.sleep(max(0.05, float(interval)))
+
+
+def build_recaptcha_mint_script(
+    sitekey: str,
+    action: str,
+    *,
+    wait_ms: int = 8000,
+    poll_ms: int = 250,
+) -> str:
+    """Return the JS thunk that mints a v3 token in the page compartment.
+
+    ``execute`` can still be missing for a moment after the readiness probe
+    passes, so the script waits for it instead of throwing on the first look.
+    Values are embedded with ``json.dumps`` so a quote in the sitekey or action
+    cannot break out of the literal.
+    """
+    return (
+        """async () => {
+            const w = window.wrappedJSObject || window;
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            const pickG = () => {
+                const ent = w?.grecaptcha?.enterprise;
+                if (ent && typeof ent.execute === 'function') return ent;
+                const g = w?.grecaptcha;
+                if (g && typeof g.execute === 'function') return g;
+                return null;
+            };
+
+            let g = pickG();
+            const deadline = Date.now() + __LM_BRIDGE_WAIT_MS__;
+            while (!g && Date.now() < deadline) {
+                await sleep(__LM_BRIDGE_POLL_MS__);
+                g = pickG();
+            }
+            if (!g) {
+                throw new Error('No valid grecaptcha found');
+            }
+
+            // Wait for ready (with timeout)
+            try {
+                await Promise.race([
+                    new Promise((resolve) => { try { g.ready(resolve); } catch (e) { resolve(true); } }),
+                    sleep(5000),
+                ]);
+            } catch (e) {}
+
+            // Firefox Xray wrappers: build params in the page compartment
+            const params = new w.Object();
+            params.action = __LM_BRIDGE_ACTION__;
+
+            const token = await g.execute(__LM_BRIDGE_SITEKEY__, params);
+            return String(token || '');
+        }"""
+        .replace("__LM_BRIDGE_WAIT_MS__", str(int(max(0, wait_ms))))
+        .replace("__LM_BRIDGE_POLL_MS__", str(int(max(50, poll_ms))))
+        .replace("__LM_BRIDGE_ACTION__", json.dumps(str(action or "")))
+        .replace("__LM_BRIDGE_SITEKEY__", json.dumps(str(sitekey or "")))
+    )
 
 
 async def _mint_recaptcha_v3_token_in_page(
@@ -768,33 +863,22 @@ async def get_recaptcha_v3_token() -> Optional[str]:
 
             # 2. Check for Library
             _m().debug_print("  ⏳ Checking for library...")
-            # Use wrappedJSObject to check for grecaptcha in the main world
-            lib_ready = await _m().safe_page_evaluate(
-                page,
-                "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha && w.grecaptcha.enterprise); }",
-            )
-            _m().debug_print(f"  📦 Library ready: {lib_ready}")
-            if not lib_ready:
-                _m().debug_print("  ⚠️ Library not found. Checking basic grecaptcha...")
-                lib_ready = await _m().safe_page_evaluate(
-                    page,
-                    "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha); }",
+            # A truthy grecaptcha namespace is not enough: wait for a callable
+            # execute() so the mint below cannot fail with "No valid grecaptcha".
+            lib_state = await wait_for_grecaptcha_execute(page)
+            _m().debug_print(f"  📦 Library ready: {lib_state}")
+            if lib_state not in GRECAPTCHA_READY_STATES:
+                _m().debug_print(
+                    f"  ⚠️ grecaptcha.execute unavailable ({lib_state}). Injecting reCAPTCHA scripts..."
                 )
-                _m().debug_print(f"  📦 Basic grecaptcha ready: {lib_ready}")
-            if not lib_ready:
-                _m().debug_print("  ⚠️ Library not found. Injecting reCAPTCHA scripts...")
                 # Inject reCAPTCHA scripts since LMArena may not have them loaded
                 await _m().safe_page_evaluate(
                     page,
                     build_recaptcha_injection_script(recaptcha_sitekey),
                 )
-                # Wait for scripts to load
-                await asyncio.sleep(5)
-                lib_ready = await _m().safe_page_evaluate(
-                    page,
-                    "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha && w.grecaptcha.enterprise); }",
-                )
-                if not lib_ready:
+                lib_state = await wait_for_grecaptcha_execute(page, timeout=20.0)
+                _m().debug_print(f"  📦 Library ready after injection: {lib_state}")
+                if lib_state not in GRECAPTCHA_READY_STATES:
                     _m().debug_print("❌ reCAPTCHA library still not loaded after injection.")
                     return None
 
@@ -813,38 +897,7 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                     pass
             await asyncio.sleep(1)
             
-            mint_js = f"""async () => {{
-                const w = window.wrappedJSObject || window;
-                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                
-                const pickG = () => {{
-                    const ent = w?.grecaptcha?.enterprise;
-                    if (ent && typeof ent.execute === 'function') return ent;
-                    const g = w?.grecaptcha;
-                    if (g && typeof g.execute === 'function') return g;
-                    return null;
-                }};
-                
-                const g = pickG();
-                if (!g || typeof g.execute !== 'function') {{
-                    throw new Error('No valid grecaptcha found');
-                }}
-                
-                // Wait for ready (with timeout)
-                try {{
-                    await Promise.race([
-                        new Promise((resolve) => {{ try {{ g.ready(resolve); }} catch(e) {{ resolve(true); }} }}),
-                        sleep(5000),
-                    ]);
-                }} catch(e) {{}}
-                
-                // Firefox Xray wrappers: build params in the page compartment
-                const params = new w.Object();
-                params.action = '{recaptcha_action}';
-                
-                const token = await g.execute('{recaptcha_sitekey}', params);
-                return String(token || '');
-            }}"""
+            mint_js = build_recaptcha_mint_script(recaptcha_sitekey, recaptcha_action)
             
             try:
                 token = await asyncio.wait_for(

@@ -100,6 +100,12 @@ class BridgeError(RuntimeError):
             "arena_verification_required",
             "interactive_auth_required",
             "cloudflare_challenge",
+            # Arena refused a session the bridge still considers healthy.  The
+            # remedy is a browser round-trip (``/竞技场验证``), so this is an
+            # interactive-auth hint -- but *not* an expired-cookie one, which is
+            # why ``_verification_hint`` branches on the code before the
+            # expired-session wording.
+            "arena_session_rejected",
             "arena_auth_expired",
             "arena_auth_required",
             "arena_login_required",

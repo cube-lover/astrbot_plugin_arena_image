@@ -274,11 +274,27 @@ http://arena-bridge:8000
 
 ### 提示 Cookie 失效
 
+先看 `/竞技场验证状态`，它会告出真正的原因：
+
 ```text
-/竞技场重新绑定
+/竞技场验证状态
 ```
 
-打开新链接，登录后执行 `/竞技场验证状态`。
+```text
+账号登录：已登录
+会话来源：browser_cookies（还有约 31 分钟）
+reCAPTCHA 动作：chat_submit
+```
+
+- `账号登录：未登录` 或没有任何会话 → 运行 `/竞技场重新绑定`，打开链接登录后再查一次状态。
+- 会话还在有效期内却报错 → 这是 Arena 的 reCAPTCHA / Cloudflare 风控，不是 Cookie 过期。
+  运行 `/竞技场验证` 让服务器浏览器重新过一次验证即可，重新绑定不会有帮助；插件此时会明确
+  提示「Arena 拒绝了这次请求，但服务器上保存的 Arena 会话还没有过期」。
+- `reCAPTCHA 动作` 在已登录时应该是 `chat_submit`；显示 `sign_up` 说明 Bridge 版本太旧，
+  它会用注册用的动作去出图，Arena 一定回 403，请更新 `arena-bridge` 镜像。
+
+Arena 的 `arena-auth-prod-v1` 大约每小时轮换一次。Bridge 会自己把最新的会话写回令牌池，
+所以不需要定期手动重新绑定。
 
 ### 429 Too Many Requests
 

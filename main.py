@@ -154,7 +154,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.4.2",
+    "0.4.3",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -259,6 +259,14 @@ class ArenaImagePlugin(Star):
     def _verification_hint(exc: Exception) -> str | None:
         if not isinstance(exc, BridgeError) or not exc.requires_interactive_auth:
             return None
+        text = str(exc).casefold()
+        if exc.code == "arena_session_rejected":
+            return (
+                "Arena 拒绝了这次请求，但服务器上保存的 Arena 会话还没有过期。\n"
+                "这基本都是 reCAPTCHA / Cloudflare 风控，不是登录失效，重新绑定不会有帮助。\n"
+                "请让管理员私聊机器人运行：/竞技场验证，在服务器浏览器里过一次验证后重试。\n"
+                "想确认会话细节可运行：/竞技场验证状态"
+            )
         auth_error = exc.code in {
             "arena_auth_expired",
             "arena_auth_required",
@@ -267,7 +275,7 @@ class ArenaImagePlugin(Star):
             "http_401",
             "401",
         } or any(
-            marker in str(exc).casefold()
+            marker in text
             for marker in (
                 "lmarena auth token",
                 "arena-auth",
@@ -277,7 +285,11 @@ class ArenaImagePlugin(Star):
                 "login_gate",
             )
         )
-        if exc.code == "arena_login_required" or "login_gate" in str(exc).casefold() or "login required" in str(exc).casefold():
+        if (
+            exc.code == "arena_login_required"
+            or "login_gate" in text
+            or "login required" in text
+        ):
             return (
                 "检测到 Arena 现在要求登录账号才能出图。\n"
                 "请让管理员私聊机器人运行：/竞技场验证\n"
@@ -316,6 +328,23 @@ class ArenaImagePlugin(Star):
             f"Arena 会话：{'已获取' if payload.get('has_arena_auth') else '未获取'}",
             f"账号登录：{'已登录' if logged_in else '未登录（匿名无法出图）'}",
         ]
+        source = str(payload.get("session_source") or "").strip()
+        if source:
+            expires_in = payload.get("session_expires_in")
+            try:
+                minutes = None if expires_in is None else max(0, int(expires_in) // 60)
+            except (TypeError, ValueError):
+                minutes = None
+            if minutes is None:
+                details.append(f"会话来源：{source}")
+            else:
+                details.append(f"会话来源：{source}（还有约 {minutes} 分钟）")
+        action = str(payload.get("recaptcha_action") or "").strip()
+        if action:
+            note = ""
+            if action == "sign_up" and payload.get("session_logged_in"):
+                note = "（异常：已登录时应为 chat_submit，请更新 Bridge）"
+            details.append(f"reCAPTCHA 动作：{action}{note}")
         if not logged_in and status in {"waiting", "expired", "starting"}:
             details.append("重新获取链接：/竞技场重新绑定（需私聊）")
         return "\n".join(details)

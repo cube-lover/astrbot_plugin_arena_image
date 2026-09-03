@@ -611,12 +611,20 @@ async def fetch_lmarena_stream_via_interactive_browser(
             _m().debug_print("⚠️ Interactive browser transport: no CDP URL configured.")
             return None
 
+        # Ask the single decision point for both values: a bare
+        # `cfg.get("recaptcha_action") or "submit"` used to send a third action
+        # that matched neither the minted token nor Arena's expectation.
+        try:
+            resolved_sitekey, resolved_action = _m().get_recaptcha_settings(cfg)
+        except Exception:
+            resolved_sitekey, resolved_action = "", ""
         sitekey = str(
-            cfg.get("recaptcha_sitekey")
+            resolved_sitekey
+            or cfg.get("recaptcha_sitekey")
             or getattr(_m(), "RECAPTCHA_SITEKEY", "")
             or ""
         ).strip()
-        action = str(cfg.get("recaptcha_action") or "submit").strip()
+        action = str(resolved_action or cfg.get("recaptcha_action") or "submit").strip()
 
         body_payload = dict(payload or {})
         fetch_path = urlsplit(str(url or "")).path
@@ -3140,7 +3148,21 @@ async def camoufox_proxy_worker():
                 except Exception:
                     pass
                 await _attempt_anonymous_signup(min_interval_seconds=20.0)
-             
+
+            # Re-resolve per job.  The worker usually launches at boot, before
+            # the operator has finished `/竞技场验证`, so the action captured at
+            # launch stays `sign_up` for the worker's whole lifetime -- while
+            # `get_request_headers_with_token` already sends `chat_submit`.
+            # Arena compares `tokenProperties.action` with that header and
+            # answers 403, which used to be reported as an expired cookie.
+            try:
+                (
+                    proxy_recaptcha_sitekey,
+                    proxy_recaptcha_action,
+                ) = _m().get_recaptcha_settings()
+            except Exception:
+                pass
+
             try:
                 try:
                     job["phase"] = "fetch"

@@ -328,9 +328,23 @@ def _safe_cookie_records(cookies: object) -> list[dict[str, str]]:
 
 
 def _has_valid_persisted_arena_auth(config: object) -> bool:
-    """Check persisted auth locations without exposing the cookie value."""
+    """Check persisted auth locations without exposing the cookie value.
+
+    Delegates to `auth.resolve_arena_session` so this module cannot disagree
+    with the token selector or the reCAPTCHA action decision about whether a
+    session exists.  The looser local scan stays as a fallback for opaque token
+    formats that the resolver deliberately refuses to call "plausible".
+    """
     if not isinstance(config, dict):
         return False
+
+    try:
+        from .auth import resolve_arena_session
+
+        if bool(resolve_arena_session(config).get("usable")):
+            return True
+    except Exception:
+        pass
 
     candidates: list[str] = []
     tokens = config.get("auth_tokens")
@@ -363,6 +377,42 @@ def _has_valid_persisted_arena_auth(config: object) -> bool:
             pass
         return True
     return False
+
+
+def _arena_session_diagnostics(config: object) -> dict[str, Any]:
+    """Value-free summary of the resolved session and the reCAPTCHA action.
+
+    Third-party deployments fail in ways the operator cannot see from a chat
+    error ("Cookie 已失效"), so /竞技场验证状态 reports where the session came
+    from, how long it lives, and which action the next submit will be validated
+    against.  `sign_up` on a signed-in bridge is the tell-tale of a bad setup.
+    """
+    info: dict[str, Any] = {
+        "session_source": "",
+        "session_expires_in": None,
+        "session_logged_in": False,
+        "session_candidates": 0,
+        "recaptcha_action": "",
+    }
+    if not isinstance(config, dict):
+        return info
+    try:
+        from .auth import resolve_arena_session
+
+        state = resolve_arena_session(config)
+        info["session_source"] = str(state.get("source") or "")
+        info["session_expires_in"] = state.get("expires_in")
+        info["session_logged_in"] = bool(state.get("logged_in"))
+        info["session_candidates"] = int(state.get("candidates") or 0)
+    except Exception:
+        pass
+    try:
+        from .recaptcha import get_recaptcha_settings
+
+        info["recaptcha_action"] = str(get_recaptcha_settings(config)[1] or "")
+    except Exception:
+        pass
+    return info
 
 
 def _has_persisted_cf_clearance(config: object) -> bool:
@@ -942,7 +992,13 @@ class InteractiveAuthManager:
         except Exception as exc:
             session.status = "waiting"
             session.last_error = type(exc).__name__
-        return self._public_result(session)
+        # Re-read config: `_persist_cookies` above may have just written a fresh
+        # session, and stale diagnostics are worse than none.
+        latest = self._load_config()
+        return {
+            **self._public_result(session),
+            **_arena_session_diagnostics(latest if isinstance(latest, dict) and latest else config),
+        }
 
     async def _monitor(self, session_id: str, poll: float) -> None:
         while True:
@@ -1046,6 +1102,7 @@ class InteractiveAuthManager:
             "has_arena_auth": has_auth,
             "has_logged_in": logged_in,
             "message": message,
+            **_arena_session_diagnostics(config),
         }
 
     async def close(self) -> None:

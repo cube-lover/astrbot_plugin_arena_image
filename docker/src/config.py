@@ -100,7 +100,12 @@ def _apply_config_defaults(config: dict) -> None:
 def save_config(config: dict, *, preserve_auth_tokens: bool = True) -> None:
     """
     Save configuration to file.
-    
+
+    NOTE: the Bridge runs on `src.main.save_config`, which three-way merges the
+    auth-token pool (see `_merge_auth_tokens_for_save`).  This copy is kept for
+    standalone/legacy use and takes the simpler "disk wins" route, so do not
+    route cookie captures through it.
+
     Args:
         config: Configuration dictionary to save
         preserve_auth_tokens: If True, don't overwrite auth tokens from disk

@@ -98,36 +98,44 @@ def extract_recaptcha_params_from_text(text: str) -> tuple[Optional[str], Option
     return discovered_sitekey, discovered_action
 
 
+def _has_usable_arena_session(cfg: Optional[dict]) -> bool:
+    """Ask auth.py's resolver, never raising: this decides a request header."""
+    try:
+        return bool(_m().has_usable_arena_session(cfg))
+    except Exception:
+        return False
+
+
 def get_recaptcha_settings(config: Optional[dict] = None) -> tuple[str, str]:
+    """Return the (sitekey, action) pair Arena expects for a chat/image submit.
+
+    The action matters: Arena's Enterprise assessment compares
+    `tokenProperties.action` with the `X-Recaptcha-Action` header, and a
+    signed-in submit validated as `sign_up` comes back as
+    `403 recaptcha validation failed` -- which the Bridge used to report as
+    "your Cookie expired, please log in again".
+    """
     cfg = config or _m().get_config()
     sitekey = str((cfg or {}).get("recaptcha_sitekey") or "").strip()
-    action = str((cfg or {}).get("recaptcha_action") or "").strip()
+    pinned = str((cfg or {}).get("recaptcha_action") or "").strip()
     if not sitekey:
         sitekey = _m().RECAPTCHA_SITEKEY
-    
-    if not action:
-        # Support both auth_tokens (list) and auth_token (legacy singular)
-        auth_tokens = cfg.get("auth_tokens", []) if cfg else []
-        # Backward compatibility: also check for singular auth_token
-        singular_token = cfg.get("auth_token", "") if cfg else ""
-        if singular_token and isinstance(auth_tokens, list) and not auth_tokens:
-            auth_tokens = [singular_token]
-        if isinstance(auth_tokens, list):
-            auth_tokens = [str(t or "").strip() for t in auth_tokens if str(t or "").strip()]
-        
-        # Also check legacy auth_token field
-        legacy_token = str(cfg.get("auth_token") or "").strip() if cfg else ""
-        if legacy_token and legacy_token not in auth_tokens:
-            auth_tokens.append(legacy_token)
-        
-        has_valid_token = any(
-            _m().is_probably_valid_arena_auth_token(t) 
-            for t in auth_tokens
-        )
-        
-        action = "chat_submit" if has_valid_token else "sign_up"
 
-    return sitekey, action
+    # Every storage location counts, not just `auth_tokens`: the browser rotates
+    # `arena-auth-prod-v1` roughly hourly, so the live session usually sits in
+    # `browser_cookies` while the pool still holds the previous one.
+    has_session = _has_usable_arena_session(cfg)
+
+    if pinned:
+        # `recaptcha_action` is scraped from Arena's own JS chunks, where the
+        # anonymous-signup literal is the one that turns up first.  A pinned
+        # `sign_up` must never outrank a session we can actually use, or the
+        # wrong action is frozen into config.json forever.
+        if pinned == "sign_up" and has_session:
+            return sitekey, "chat_submit"
+        return sitekey, pinned
+
+    return sitekey, ("chat_submit" if has_session else "sign_up")
 
 
 def build_recaptcha_injection_script(sitekey: str) -> str:
@@ -594,11 +602,19 @@ async def get_recaptcha_v3_token_via_interactive_browser(config: dict) -> Option
     except Exception:
         return None
 
-    sitekey, _ = get_recaptcha_settings(config)
+    # Mint with the action Arena expects for this session.  Hardcoding
+    # `submit` here made the interactive browser -- the primary mint path for
+    # image models -- produce a token whose `tokenProperties.action` disagreed
+    # with the `X-Recaptcha-Action` header the same request sent.
+    sitekey, action = get_recaptcha_settings(config)
     expr = (
         "(async () => { if (!window.grecaptcha || !window.grecaptcha.enterprise) return ''; "
         "return new Promise((r) => { window.grecaptcha.enterprise.ready(async () => { "
-        "try { r(await window.grecaptcha.enterprise.execute('" + str(sitekey) + "', {action: 'submit'})); } "
+        "try { r(await window.grecaptcha.enterprise.execute("
+        + json.dumps(str(sitekey))
+        + ", {action: "
+        + json.dumps(str(action) or "submit")
+        + "})); } "
         "catch(e) { r(''); } }); }); })()"
     )
     try:

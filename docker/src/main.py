@@ -87,6 +87,10 @@ from .auth import (
     is_arena_auth_token_expired,
     is_probably_valid_arena_auth_token,
     is_logged_in_arena_auth_token,
+    describe_arena_session_token,
+    resolve_arena_session,
+    has_usable_arena_session,
+    has_logged_in_arena_session,
     refresh_arena_auth_token_via_lmarena_http,
     refresh_arena_auth_token_via_supabase,
     maybe_refresh_expired_auth_tokens_via_lmarena_http,
@@ -193,22 +197,72 @@ def get_general_backoff_seconds(attempt: int) -> int:
     return constants.get_general_backoff_seconds(attempt)
 
 
+def _local_arena_session_state() -> dict:
+    """Value-free snapshot of the best session we hold, for error messages."""
+    try:
+        return resolve_arena_session()
+    except Exception:
+        return {
+            "usable": False,
+            "logged_in": False,
+            "source": "",
+            "expires_in": None,
+            "candidates": 0,
+        }
+
+
+def _describe_local_arena_session(state: Optional[dict] = None) -> str:
+    """One short clause the operator can act on, without leaking the cookie."""
+    info = state if isinstance(state, dict) else _local_arena_session_state()
+    if not info.get("candidates"):
+        return "本地没有保存任何 Arena 会话"
+    if not info.get("usable"):
+        return "本地保存的 Arena 会话已过期"
+    minutes = info.get("expires_in")
+    try:
+        minutes = max(0, int(minutes) // 60) if minutes is not None else None
+    except Exception:
+        minutes = None
+    kind = "已登录" if info.get("logged_in") else "匿名"
+    where = str(info.get("source") or "config")
+    if minutes is None:
+        return f"本地 Arena 会话仍然有效（{kind}，来源 {where}）"
+    return f"本地 Arena 会话仍然有效（{kind}，来源 {where}，还有约 {minutes} 分钟）"
+
+
 def _is_arena_verification_failure(status_code: int, body: object = "") -> bool:
-    """Classify upstream responses that should send the manual-verification hint."""
+    """Classify upstream responses that should send the manual-verification hint.
+
+    A bare 403/503 is *not* proof that the login died.  Arena also answers 403
+    when the reCAPTCHA assessment is rejected (wrong action, replayed token,
+    low score), and the old "any 403 means re-verify" rule sent operators
+    through an endless /竞技场验证 loop while their session was perfectly
+    healthy.  Challenge markers still count unconditionally; status-only
+    failures now require that no usable session is left.
+    """
     status = int(status_code or 0)
-    if status in {403, 503}:
-        return True
     text = str(body or "").casefold()
-    return any(
+
+    if any(
         marker in text
         for marker in (
             "cloudflare",
             "turnstile",
-            "recaptcha",
             "just a moment",
             "cf-chl-",
         )
-    )
+    ):
+        return True
+
+    if "recaptcha" in text:
+        # Token-level rejection: retrying with a fresh, correctly-actioned token
+        # is the fix, so only escalate when there is nothing left to retry with.
+        return not has_usable_arena_session()
+
+    if status in {403, 503}:
+        return not has_usable_arena_session()
+
+    return False
 
 
 def _verification_error_payload(message: str) -> dict[str, str]:
@@ -236,11 +290,27 @@ def _internal_token_error_payload() -> dict[str, str]:
 
 
 def _arena_auth_error_payload() -> dict[str, str]:
-    """Return the stable error contract used when an Arena session expires."""
+    """Return the stable error contract used when an Arena session expires.
+
+    When the session we hold is still decodable and unexpired, Arena rejecting
+    it is almost never a login problem, so do not send the operator through a
+    re-bind that changes nothing.  That case gets its own code and wording.
+    """
+    state = _local_arena_session_state()
+    if state.get("usable"):
+        return {
+            "code": "arena_session_rejected",
+            "message": (
+                f"Arena 拒绝了这次请求，但{_describe_local_arena_session(state)}。"
+                "这通常是 reCAPTCHA / Cloudflare 风控，而不是登录过期："
+                "请先运行 /竞技场验证 让服务器浏览器刷新一次验证再重试；"
+                "只有在浏览器里确认已经退出登录时，才需要 /竞技场重新绑定。"
+            ),
+        }
     return {
         "code": "arena_auth_expired",
         "message": (
-            "Arena 会话 Cookie 已失效或无效。"
+            f"Arena 会话 Cookie 已失效或无效（{_describe_local_arena_session(state)}）。"
             "请运行 /竞技场重新绑定 获取服务器浏览器链接，"
             "登录并完成验证后会自动保存新的 Cookie。"
         ),
@@ -981,6 +1051,86 @@ def _select_healthy_model_variant(
     return default_model_id
 
 
+class _ConfigWithTokenSnapshot(dict):
+    """Config mapping that remembers the auth tokens it was loaded with.
+
+    ``save_config(preserve_auth_tokens=True)`` has to tell two situations apart:
+    a background refresh that never touched the token pool (the on-disk copy
+    must win, so a token added through the dashboard is not clobbered) and a
+    caller that just captured a new Arena session (the new value must win,
+    otherwise every re-verification is silently discarded and the pool keeps
+    the first token forever).  The snapshot taken at read time is what makes
+    that distinction possible.
+    """
+
+    __slots__ = ("auth_tokens_snapshot", "auth_token_snapshot")
+
+
+def _clean_token_list(value: Any) -> Optional[list]:
+    """Normalize a token pool; ``None`` means "the caller has no list at all"."""
+    if not isinstance(value, list):
+        return None
+    return [str(item or "").strip() for item in value if str(item or "").strip()]
+
+
+def _merge_auth_tokens_for_save(config: dict, on_disk: dict) -> None:
+    """Three-way merge the token pool so concurrent writers cannot lose entries.
+
+    Caller intent wins for the values it changed; tokens another writer added
+    while this caller held its copy are appended instead of being dropped.
+    """
+    disk_tokens = _clean_token_list(on_disk.get("auth_tokens"))
+    if disk_tokens is None:
+        # Nothing to preserve: leave whatever the caller prepared.
+        return
+    caller_tokens = _clean_token_list(config.get("auth_tokens"))
+    if caller_tokens is None:
+        config["auth_tokens"] = list(disk_tokens)
+        return
+
+    snapshot = getattr(config, "auth_tokens_snapshot", None)
+    if snapshot is None:
+        # A copied/hand-built config carries no read-time snapshot.  Union the
+        # two views so a fresh capture survives without dropping other writers.
+        merged = list(caller_tokens)
+        merged.extend(token for token in disk_tokens if token not in merged)
+        config["auth_tokens"] = merged
+        return
+
+    snapshot_tokens = list(snapshot)
+    if caller_tokens == snapshot_tokens:
+        # Untouched pool: the on-disk copy is newer by definition.
+        config["auth_tokens"] = list(disk_tokens)
+        return
+
+    dropped = {token for token in snapshot_tokens if token not in caller_tokens}
+    merged = list(caller_tokens)
+    merged.extend(
+        token
+        for token in disk_tokens
+        if token not in merged and token not in dropped
+    )
+    config["auth_tokens"] = merged
+
+
+def _merge_single_auth_token_for_save(config: dict, on_disk: dict) -> None:
+    """Same rule as the pool, applied to the legacy single-token field."""
+    if "auth_token" not in on_disk:
+        return
+    disk_token = str(on_disk.get("auth_token") or "")
+    caller_token = str(config.get("auth_token") or "")
+    snapshot = getattr(config, "auth_token_snapshot", None)
+    if snapshot is None or caller_token.strip() == str(snapshot or "").strip():
+        config["auth_token"] = disk_token
+
+
+def _token_pool_fingerprint(tokens: list) -> str:
+    """Short, value-free fingerprint of a token pool for diagnostics."""
+    if not tokens:
+        return "-"
+    return hashlib.sha256(str(tokens[0]).encode("utf-8")).hexdigest()[:8]
+
+
 def get_config():
     global current_token_index, _LAST_CONFIG_FILE
     # If tests or callers swap CONFIG_FILE at runtime, reset the token round-robin index so token selection
@@ -1004,7 +1154,12 @@ def get_config():
     except Exception as e:
         debug_print(f"⚠️  Error setting config defaults: {e}")
 
-    return config
+    # Remember the tokens this read handed out so `save_config` can tell an
+    # intentional change from a caller that simply never touched them.
+    tracked = _ConfigWithTokenSnapshot(config)
+    tracked.auth_tokens_snapshot = tuple(_clean_token_list(config.get("auth_tokens")) or ())
+    tracked.auth_token_snapshot = str(config.get("auth_token") or "").strip()
+    return tracked
 
 
 def load_usage_stats():
@@ -1030,10 +1185,18 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
                 on_disk = None
 
             if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
+                before = _clean_token_list(on_disk.get("auth_tokens")) or []
+                _merge_auth_tokens_for_save(config, on_disk)
+                _merge_single_auth_token_for_save(config, on_disk)
+                after = _clean_token_list(config.get("auth_tokens")) or []
+                if after != before:
+                    # Rare (only when a caller really captured or dropped a
+                    # session), so this stays quiet during normal operation and
+                    # gives "did my re-verification stick?" a definite answer.
+                    debug_print(
+                        f"🔑 auth_tokens updated: {len(before)} -> {len(after)} "
+                        f"(head {_token_pool_fingerprint(before)} -> {_token_pool_fingerprint(after)})"
+                    )
 
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
@@ -4329,11 +4492,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         continue
                                     except HTTPException:
                                         debug_print("No more tokens available for streaming request.")
+                                        auth_payload = _arena_auth_error_payload()
                                         error_chunk = {
                                             "error": {
-                                                "message": _arena_auth_error_payload()["message"],
+                                                "message": auth_payload["message"],
                                                 "type": "authentication_error",
-                                                "code": "arena_auth_expired",
+                                                "code": auth_payload["code"],
                                             }
                                         }
                                         yield f"data: {json.dumps(error_chunk)}\n\n"
@@ -4637,11 +4801,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                             headers = get_request_headers_with_token(current_token, recaptcha_token)
                                         except HTTPException:
+                                            auth_payload = _arena_auth_error_payload()
                                             error_chunk = {
                                                 "error": {
-                                                    "message": _arena_auth_error_payload()["message"],
+                                                    "message": auth_payload["message"],
                                                     "type": "authentication_error",
-                                                    "code": "arena_auth_expired",
+                                                    "code": auth_payload["code"],
                                                 }
                                             }
                                             yield f"data: {json.dumps(error_chunk)}\n\n"
@@ -4872,13 +5037,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             # We need to ensure max_retries applies here too.
                             current_retry_attempt += 1
                             if current_retry_attempt > max_retries:
-                                error_msg = _arena_auth_error_payload()["message"]
+                                auth_payload = _arena_auth_error_payload()
+                                error_msg = auth_payload["message"]
                                 debug_print(f"❌ {error_msg}")
                                 error_chunk = {
                                     "error": {
                                         "message": error_msg,
                                         "type": "authentication_error",
-                                        "code": "arena_auth_expired",
+                                        "code": auth_payload["code"],
                                     }
                                 }
                                 yield f"data: {json.dumps(error_chunk)}\n\n"
@@ -5399,8 +5565,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     )
                     error_type = "arena_verification_error"
                 else:
-                    error_detail = "Forbidden: Access to this resource is denied."
-                    error_type = "forbidden_error"
+                    # Arena answers 403 for a rejected reCAPTCHA assessment too.
+                    # Say so, otherwise the operator re-verifies a healthy login.
+                    error_detail = (
+                        "Arena 以 403 拒绝了这次请求（通常是 reCAPTCHA 校验未通过），"
+                        f"{_describe_local_arena_session()}。请稍后重试；"
+                        "如果持续失败，请运行 /竞技场验证 刷新服务器浏览器验证。"
+                    )
+                    error_type = "recaptcha_error"
             elif e.response.status_code == HTTPStatus.NOT_FOUND:
                 error_detail = "Not Found: The requested resource doesn't exist."
                 error_type = "not_found_error"
@@ -5441,7 +5613,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     if e.response.status_code == HTTPStatus.UNAUTHORIZED
                     and _is_arena_login_gate(e.response.status_code, getattr(e.response, "text", ""))
                     else (
-                        "arena_auth_expired"
+                        # Keep the code aligned with the message: a session that
+                        # is still alive locally reports `arena_session_rejected`
+                        # so the client stops asking for a pointless re-bind.
+                        _arena_auth_error_payload()["code"]
                         if e.response.status_code == HTTPStatus.UNAUTHORIZED
                         else f"http_{e.response.status_code}"
                     )

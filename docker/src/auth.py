@@ -341,6 +341,35 @@ def get_request_headers_with_token(token: str, recaptcha_v3_token: Optional[str]
     return headers
 
 
+def _base64_payload_variants(b64: str):
+    """Yield plausible decodings of a base64 body, standard *and* URL-safe.
+
+    Arena writes the `base64-` session envelope with the standard alphabet
+    today, but Supabase's own helpers emit base64url.  `base64.b64decode`
+    without ``validate=True`` silently *discards* `-`/`_` instead of failing,
+    so a base64url cookie decodes into garbage rather than raising -- the
+    session then looks invalid and every downstream check (login state,
+    reCAPTCHA action, "should the operator re-verify") degrades.  Trying both
+    alphabets and letting the JSON parse decide keeps that failure impossible.
+    """
+    cleaned = "".join(str(b64 or "").split())
+    if not cleaned:
+        return
+    seen_inputs: set[str] = set()
+    for text in (cleaned, cleaned.replace("-", "+").replace("_", "/")):
+        padded = text + "=" * ((4 - (len(text) % 4)) % 4)
+        if padded in seen_inputs:
+            continue
+        seen_inputs.add(padded)
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                raw = decoder(padded.encode("utf-8"))
+            except Exception:
+                continue
+            if raw:
+                yield raw
+
+
 def _decode_arena_auth_session_token(token: str) -> Optional[dict]:
     """
     Decode the `arena-auth-prod-v1` cookie value when it is stored as `base64-<json>`.
@@ -356,14 +385,13 @@ def _decode_arena_auth_session_token(token: str) -> Optional[dict]:
     b64 = token[len("base64-") :]
     if not b64:
         return None
-    try:
-        b64 += "=" * ((4 - (len(b64) % 4)) % 4)
-        raw = base64.b64decode(b64.encode("utf-8"))
-        obj = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
-    if isinstance(obj, dict):
-        return obj
+    for raw in _base64_payload_variants(b64):
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
     return None
 
 
@@ -659,6 +687,182 @@ def is_logged_in_arena_auth_token(token: str) -> bool:
         if str(item or "").strip():
             return True
     return False
+
+
+# --- Single source of truth for "which Arena session can we use right now?" ---
+#
+# The same question used to be answered in three different places with three
+# different answers: `get_next_auth_token` scanned every location, while
+# `get_recaptcha_settings` looked only at `auth_tokens` and
+# `interactive_auth._has_valid_persisted_arena_auth` had its own copy.  A
+# rotated browser cookie therefore made the Bridge send a request with a live
+# session but a `sign_up` reCAPTCHA action, and told the operator to re-bind a
+# session that was perfectly fine.  Everything now funnels through
+# `resolve_arena_session`.
+
+ARENA_AUTH_COOKIE_NAME = "arena-auth-prod-v1"
+
+
+def describe_arena_session_token(token: str) -> dict:
+    """Classify one candidate cookie without exposing its value."""
+    token = str(token or "").strip()
+    if not token:
+        return {
+            "present": False,
+            "plausible": False,
+            "logged_in": False,
+            "decodable": False,
+            "refreshable": False,
+            "expired": False,
+            "expires_at": None,
+            "expires_in": None,
+        }
+
+    try:
+        expiry = get_arena_auth_token_expiry_epoch(token)
+    except Exception:
+        expiry = None
+    try:
+        plausible = is_probably_valid_arena_auth_token(token)
+    except Exception:
+        plausible = False
+    try:
+        logged_in = plausible and is_logged_in_arena_auth_token(token)
+    except Exception:
+        logged_in = False
+    refreshable = token.startswith("base64-")
+    try:
+        decodable = bool(_decode_arena_auth_session_token(token)) if refreshable else False
+    except Exception:
+        decodable = False
+
+    now = time.time()
+    return {
+        "present": True,
+        "plausible": bool(plausible),
+        "logged_in": bool(logged_in),
+        "decodable": decodable,
+        "refreshable": refreshable,
+        "expired": bool(expiry is not None and now >= float(expiry)),
+        "expires_at": int(expiry) if expiry is not None else None,
+        "expires_in": int(float(expiry) - now) if expiry is not None else None,
+    }
+
+
+def _arena_session_candidates_with_source(config: Optional[dict]) -> list[tuple[str, str]]:
+    """Every place an Arena session can live, in no particular order."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(value: object, source: str) -> None:
+        clean = str(value or "").strip()
+        if not clean or clean in seen:
+            return
+        seen.add(clean)
+        found.append((clean, source))
+
+    if isinstance(config, dict):
+        tokens = config.get("auth_tokens")
+        if isinstance(tokens, list):
+            for token in tokens:
+                add(token, "auth_tokens")
+        add(config.get("auth_token"), "auth_token")
+
+        cookie_store = config.get("browser_cookies")
+        if isinstance(cookie_store, dict):
+            add(cookie_store.get(ARENA_AUTH_COOKIE_NAME), "browser_cookies")
+            add(
+                _combine_split_arena_auth_cookies(
+                    [
+                        {"name": name, "value": cookie_store.get(name)}
+                        for name in (
+                            f"{ARENA_AUTH_COOKIE_NAME}.0",
+                            f"{ARENA_AUTH_COOKIE_NAME}.1",
+                        )
+                    ]
+                ),
+                "browser_cookies_split",
+            )
+
+    try:
+        add(_m().EPHEMERAL_ARENA_AUTH_TOKEN, "ephemeral")
+    except Exception:
+        pass
+
+    return found
+
+
+def _arena_session_rank(info: dict) -> tuple:
+    """Sort key: best session first, then the one that lives longest."""
+    if info["logged_in"] and not info["expired"]:
+        tier = 0
+    elif info["plausible"] and not info["expired"]:
+        tier = 1  # usable but anonymous
+    elif info["decodable"]:
+        tier = 2  # expired session cookie, refreshable via Set-Cookie/Supabase
+    elif info["present"]:
+        tier = 3
+    else:
+        tier = 4
+    return (tier, -(info["expires_at"] or 0))
+
+
+def resolve_arena_session(config: Optional[dict] = None) -> dict:
+    """Pick the best Arena session across every storage location.
+
+    Returns a value-free summary so callers (and the status command) can report
+    *why* a request failed without ever touching the cookie itself.
+    """
+    try:
+        cfg = config if isinstance(config, dict) else _m().get_config()
+    except Exception:
+        cfg = config if isinstance(config, dict) else {}
+
+    ranked: list[dict] = []
+    for token, source in _arena_session_candidates_with_source(cfg):
+        info = describe_arena_session_token(token)
+        info["source"] = source
+        info["token"] = token
+        ranked.append(info)
+    ranked.sort(key=_arena_session_rank)
+
+    best = ranked[0] if ranked else None
+    usable = bool(best and best["plausible"] and not best["expired"])
+    return {
+        "token": best["token"] if best else "",
+        "source": best["source"] if best else "",
+        "usable": usable,
+        "logged_in": bool(best and best["logged_in"] and not best["expired"]),
+        "anonymous": bool(usable and not best["logged_in"]),
+        "expires_at": best["expires_at"] if best else None,
+        "expires_in": best["expires_in"] if best else None,
+        "refreshable": bool(best and best["decodable"] and not usable),
+        "candidates": len(ranked),
+        "expired_candidates": sum(1 for item in ranked if item["expired"]),
+        "usable_candidates": sum(
+            1 for item in ranked if item["plausible"] and not item["expired"]
+        ),
+    }
+
+
+def has_usable_arena_session(config: Optional[dict] = None) -> bool:
+    """True when some stored cookie is a non-expired Arena session.
+
+    Never raises: it is called from error handlers that decide whether to tell
+    the operator their login died.
+    """
+    try:
+        return bool(resolve_arena_session(config)["usable"])
+    except Exception:
+        return False
+
+
+def has_logged_in_arena_session(config: Optional[dict] = None) -> bool:
+    """True when a non-expired, non-anonymous Arena session is available."""
+    try:
+        return bool(resolve_arena_session(config)["logged_in"])
+    except Exception:
+        return False
 
 
 ARENA_AUTH_REFRESH_LOCK: asyncio.Lock = asyncio.Lock()
@@ -985,14 +1189,34 @@ def get_next_auth_token(exclude_tokens: set = None, *, allow_ephemeral_fallback:
                 # authoritative session.  Prefer it before legacy round-robin
                 # entries; otherwise a stale token saved earlier can remain at
                 # index 0 and make every other request fail with 401/503.
-                if configured_pool_was_empty:
-                    config["auth_tokens"] = [browser_token]
+                pool_has_usable = False
+                for candidate in auth_tokens:
                     try:
-                        _m().save_config(config, preserve_auth_tokens=False)
+                        if is_probably_valid_arena_auth_token(candidate):
+                            pool_has_usable = True
+                            break
                     except Exception:
-                        # Selecting a browser cookie remains useful even when
-                        # persistence is temporarily unavailable.
-                        pass
+                        continue
+                # Self-heal the persisted pool.  Without this the pool keeps
+                # whatever was written first: `get_next_auth_token` still works
+                # (it prefers this cookie), but everything that reads
+                # `auth_tokens` -- above all the reCAPTCHA action decision --
+                # keeps seeing a session that died hours ago.
+                if configured_pool_was_empty or (
+                    not pool_has_usable and bool(config.get("persist_arena_auth_cookie"))
+                ):
+                    if config.get("auth_tokens") != [browser_token]:
+                        config["auth_tokens"] = [browser_token]
+                        try:
+                            _m().save_config(config, preserve_auth_tokens=False)
+                        except Exception:
+                            # Selecting a browser cookie remains useful even when
+                            # persistence is temporarily unavailable.
+                            pass
+                        else:
+                            _m().debug_print(
+                                "🔑 Replaced the stale auth-token pool with the live browser session."
+                            )
                 _m().debug_print(
                     "🔑 Preferring live arena-auth cookie from browser session."
                 )

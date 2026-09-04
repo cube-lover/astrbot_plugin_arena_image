@@ -229,5 +229,96 @@ class TestThePluginListsTheNewestFirst(unittest.TestCase):
         self.assertEqual(selected["id"], "newest")
 
 
+class TestThePluginSplitsTheModelList(unittest.TestCase):
+    """Arena exposes 170+ image models, too many for one chat message.
+
+    `/竞技场画图模型` keeps the branded rows and `/竞技场灰测模型` takes the
+    gray-test ones, but both must keep printing the row's position in the full
+    list -- otherwise `/竞技场切换模型 <number>` would resolve a different model
+    than the one the number was printed next to.
+    """
+
+    @staticmethod
+    def _entry(model_id: str, owner: str, created_at: int) -> dict:
+        return {
+            "id": model_id,
+            "owned_by": owner,
+            "created_at": created_at,
+            "output_image": True,
+            "input_image": True,
+        }
+
+    def _plugin(self):
+        base = 1_770_000_000
+        entries = [
+            self._entry("stealth-newest", "lmarena", base),
+            self._entry("gpt-image-2 (medium)", "openai", base - 86400),
+            self._entry("luna-lisa-alpha", "", base - 2 * 86400),
+            self._entry("nano-banana", "google", base - 3 * 86400),
+        ]
+        main, plugin = _make_plugin(self, {"model_cache_seconds": 0})
+
+        class FakeClient:
+            async def list_models(_self) -> list[dict]:
+                return entries
+
+            async def model_health(_self) -> dict:
+                return {"models": []}
+
+        plugin._client = lambda: FakeClient()
+        return main, plugin
+
+    def _text(self, plugin, command: str) -> str:
+        from tests.test_arena_image_hardening import FakeEvent, _collect
+
+        results = _collect(getattr(plugin, command)(FakeEvent()))
+        self.assertEqual(len(results), 1)
+        return results[0].text
+
+    def test_the_branded_list_leaves_out_the_gray_test_rows(self) -> None:
+        _, plugin = self._plugin()
+
+        text = self._text(plugin, "list_models")
+
+        self.assertIn("2. gpt-image-2 (medium)", text)
+        self.assertIn("4. nano-banana", text)
+        self.assertNotIn("stealth-newest", text)
+        self.assertNotIn("luna-lisa-alpha", text)
+        self.assertIn("竞技场画图模型（2 个，画图模型共 4 个）", text)
+
+    def test_the_gray_test_list_keeps_the_positions_of_the_full_list(self) -> None:
+        _, plugin = self._plugin()
+
+        text = self._text(plugin, "list_stealth_models")
+
+        # Position 1 and 3 of the full list: skipped numbers are intentional.
+        self.assertIn("1. stealth-newest", text)
+        self.assertIn("3. luna-lisa-alpha", text)
+        self.assertNotIn("gpt-image-2", text)
+        self.assertNotIn("nano-banana", text)
+
+    def test_a_number_from_either_list_resolves_that_row(self) -> None:
+        _, plugin = self._plugin()
+
+        self._text(plugin, "list_stealth_models")
+        selected, _ = asyncio.run(plugin._resolve_model(object(), "3"))
+
+        self.assertEqual(selected["id"], "luna-lisa-alpha")
+
+    def test_a_blank_owner_counts_as_gray_test(self) -> None:
+        _, plugin = self._plugin()
+
+        self.assertTrue(plugin._model_is_stealth({"owned_by": "lmarena"}))
+        self.assertTrue(plugin._model_is_stealth({"owned_by": ""}))
+        self.assertTrue(plugin._model_is_stealth({}))
+        self.assertFalse(plugin._model_is_stealth({"owned_by": "openai"}))
+
+    def test_each_list_points_at_the_other_one(self) -> None:
+        _, plugin = self._plugin()
+
+        self.assertIn("/竞技场灰测模型", self._text(plugin, "list_models"))
+        self.assertIn("/竞技场画图模型", self._text(plugin, "list_stealth_models"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@ display_name: 免费gpt灰测画图模型，逆向竞技场臭gaygay插件
 desc: 逆向 LMArena 竞技场的白嫖画图插件，支持 Arena 灰测模型「蒙娜丽莎 / GPT-Image-2.5」，文生图、图生图、按会话切换模型
 short_desc: 免费白嫖竞技场灰测画图模型，文生图 + 图生图
 author: cube-lover
-version: 0.4.5
+version: 0.4.6
 repo: https://github.com/cube-lover/astrbot_plugin_arena_image
 cover: cover.png
 tags:

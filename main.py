@@ -155,7 +155,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.4.5",
+    "0.4.6",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -253,7 +253,7 @@ class ArenaImagePlugin(Star):
         return (
             "竞技场上游正在限流（已自动重试仍未通过）。\n"
             f"请等待约 {cooldown} 后再试，连续重试只会继续触发限流。\n"
-            "如果一直限流，可用 /竞技场画图模型 换一个模型。"
+            "如果一直限流，可用 /竞技场画图模型 或 /竞技场灰测模型 换一个模型。"
         )
 
     @staticmethod
@@ -547,31 +547,80 @@ class ArenaImagePlugin(Star):
         age = cls._health_age_text(checked_at)
         return f" ⚠{status} {age}" if age else f" ⚠{status}"
 
-    @filter.command("竞技场画图模型", alias={"arena画图模型", "竞技场模型列表", "arena模型列表"})
-    async def list_models(self, event: AstrMessageEvent):
-        try:
-            models = await self._fetch_models(force=True)
-            current, _ = await self._resolve_model(event)
-            health_map = await self._fetch_model_health()
-        except Exception as exc:
-            yield event.plain_result(f"读取模型列表失败：{_display_error(exc)}")
-            return
+    @staticmethod
+    def _model_is_stealth(model: dict[str, Any]) -> bool:
+        """Whether Arena is hiding this row's vendor.
 
+        Gray-test checkpoints ship with no `organization`, which the Bridge
+        renders as `owned_by: lmarena`; every branded model carries its real
+        vendor there.
+        """
+        owner = str(model.get("owned_by") or "").strip().casefold()
+        return owner in {"", "lmarena", "unknown"}
+
+    async def _model_list_text(self, event: AstrMessageEvent, *, stealth: bool) -> str:
+        """Render one half of the model list.
+
+        Arena exposes well over a hundred image models once the gray-test rows
+        are allowed, which is far too many for a single chat message, so the
+        gray-test half and the branded half get a command each.  Numbers stay
+        the row's position in the *full* list, so `/竞技场切换模型 编号`
+        resolves the same model whichever half you read it from -- at the cost
+        of each half skipping numbers.
+        """
+        models = await self._fetch_models(force=True)
+        current, _ = await self._resolve_model(event)
+        health_map = await self._fetch_model_health()
+        current_id = self._model_id(current)
+        chosen = [
+            (position, model)
+            for position, model in enumerate(models, start=1)
+            if self._model_is_stealth(model) is stealth
+        ]
+        title = "竞技场灰测模型" if stealth else "竞技场画图模型"
+        lines = [f"{title}（{len(chosen)} 个，画图模型共 {len(models)} 个）："]
         limit = _as_int(self.config.get("model_list_limit"), 50, 1, 200)
-        lines = [f"Bridge 可用模型（共 {len(models)} 个）："]
-        for index, model in enumerate(models[:limit], start=1):
+        for position, model in chosen[:limit]:
             model_id = self._model_id(model)
-            marker = " ← 当前" if model_id == self._model_id(current) else ""
+            marker = " ← 当前" if model_id == current_id else ""
             status_text = self._model_health_text(health_map.get(model_id))
             created_text = self._model_created_text(model)
             lines.append(
-                f"{index}. {model_id} [{self._model_kind(model)}]"
+                f"{position}. {model_id} [{self._model_kind(model)}]"
                 f"{created_text}{status_text}{marker}"
             )
-        if len(models) > limit:
-            lines.append(f"……其余 {len(models) - limit} 个已省略，可调整 model_list_limit。")
-        lines.append("用法：/竞技场切换模型 编号或完整模型名（列表只含画图模型）")
-        yield event.plain_result("\n".join(lines))
+        if len(chosen) > limit:
+            lines.append(f"……其余 {len(chosen) - limit} 个已省略，可调整 model_list_limit。")
+        lines.append("用法：/竞技场切换模型 编号或完整模型名（编号两个列表通用，所以不连号）")
+        lines.append(
+            "另一半：/竞技场画图模型（正式模型）"
+            if stealth
+            else "另一半：/竞技场灰测模型（含蒙娜丽莎）"
+        )
+        return "\n".join(lines)
+
+    @filter.command("竞技场画图模型", alias={"arena画图模型", "竞技场模型列表", "arena模型列表"})
+    async def list_models(self, event: AstrMessageEvent):
+        """Branded image models: every row where Arena names the vendor."""
+        try:
+            text = await self._model_list_text(event, stealth=False)
+        except Exception as exc:
+            yield event.plain_result(f"读取模型列表失败：{_display_error(exc)}")
+            return
+        yield event.plain_result(text)
+
+    @filter.command(
+        "竞技场灰测模型",
+        alias={"arena灰测模型", "竞技场隐身模型", "arena隐身模型", "竞技场灰测"},
+    )
+    async def list_stealth_models(self, event: AstrMessageEvent):
+        """Gray-test checkpoints: the rows Arena ships without a vendor."""
+        try:
+            text = await self._model_list_text(event, stealth=True)
+        except Exception as exc:
+            yield event.plain_result(f"读取灰测模型列表失败：{_display_error(exc)}")
+            return
+        yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("竞技场切换模型", alias={"arena切换模型"})

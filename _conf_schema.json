@@ -27,7 +27,7 @@
   },
   "model_list_limit": {
     "type": "int",
-    "description": "模型列表最多展示数量",
+    "description": "每个模型列表最多展示数量（画图/灰测各自计算）",
     "default": 50
   },
   "model_health_cache_seconds": {

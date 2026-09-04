@@ -270,7 +270,7 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 | `transport_mode` | `direct` |
 | `browser_cdp_url` | `http://arena-browser:9223`（AstrBot 与浏览器同网络时不用改） |
 | `browser_gateway_url` | 和 `docker/.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致，例如 `http://服务器IP:6081` |
-| `interactive_link_secret` | `docker/.interactive-link-secret` 的内容（32 字节随机十六进制，由 `setup.sh` 生成） |
+| `interactive_link_secret` | `.interactive-link-secret` 的内容（32 字节随机十六进制，由 `setup.sh` 生成，文件在 compose 同级目录） |
 | `interactive_link_ttl` | 验证链接有效期，默认 `900` 秒 |
 | `browser_vnc_url` | 可选兜底链接；填了网关地址和密钥就不用管 |
 | `allow_stealth_models` | 放行灰测模型，默认开启（bridge 模式下由 `.env` 控制） |
@@ -278,8 +278,13 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 签名密钥必须和 `arena-browser` 里的网关一致，否则验证链接打不开：
 
 ```bash
-# 在服务器上查看（只在需要时看，不要贴到聊天里）
-cat /opt/lmarenabridge/docker/.interactive-link-secret
+# 密钥文件和 docker-compose.arena.yml 在同一个目录：
+#   本仓库部署 -> <仓库>/docker/.interactive-link-secret
+#   早期部署   -> /opt/lmarenabridge/.interactive-link-secret
+find /opt -maxdepth 3 -name '.interactive-link-secret' 2>/dev/null
+
+# 只在需要填配置时查看内容，不要贴到聊天/工单里
+cat "$(find /opt -maxdepth 3 -name '.interactive-link-secret' 2>/dev/null | head -1)"
 ```
 
 如果 AstrBot 不在同一个 Docker 网络，把 `browser_cdp_url` 改成能通的地址，
@@ -597,8 +602,9 @@ docker compose -f docker-compose.arena.yml --env-file .env up -d
 按报错分两种：
 
 - “没有配置服务器浏览器验证链接”“验证链接打不开”：`browser_gateway_url` 和
-  `interactive_link_secret` 有一个没填对。密钥要和 `docker/.interactive-link-secret`
-  完全一致（末尾不要多空行），网关地址要和 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致。
+  `interactive_link_secret` 有一个没填对。密钥要和 compose 同级目录的
+  `.interactive-link-secret` 完全一致（末尾不要多空行），网关地址要和 `.env` 里的
+  `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致。
 - “连不上服务器浏览器”“服务器浏览器响应超时”：`arena-browser` 没起来或 `browser_cdp_url` 不通。
 
 ```bash

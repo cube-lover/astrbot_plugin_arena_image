@@ -155,7 +155,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.4.6",
+    "0.4.7",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -420,6 +420,15 @@ class ArenaImagePlugin(Star):
             # freshest; rows whose id carries no timestamp (Arena's pre-UUIDv7
             # models) keep Arena's ordering at the tail.
             models.sort(key=lambda item: model_created_at(item) or 0, reverse=True)
+            # Arena keeps several rows per model name (`gpt-image-2 (medium)` has
+            # five).  Every row collapses to the same name in a request, so the
+            # extras only padded the list with duplicate lines under different
+            # numbers.  Keep the newest row of each name -- the list is already
+            # newest-first -- and let the Bridge pick the healthiest variant.
+            deduped: dict[str, dict[str, Any]] = {}
+            for item in models:
+                deduped.setdefault(self._model_id(item).casefold(), item)
+            models = list(deduped.values())
             self._models_cache = models
             self._models_cached_at = time.monotonic()
             return list(models)

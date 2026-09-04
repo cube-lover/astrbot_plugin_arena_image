@@ -229,6 +229,27 @@ class TestThePluginListsTheNewestFirst(unittest.TestCase):
         self.assertEqual(selected["id"], "newest")
 
 
+    def test_a_duplicated_name_shows_up_once_as_its_newest_row(self) -> None:
+        """Arena ships five `gpt-image-2 (medium)` rows; one line is enough.
+
+        Each row collapses to the same name in a request, so the duplicates only
+        padded the list with identical lines under different numbers.
+        """
+        base = 1_770_000_000
+        plugin = self._plugin(
+            [
+                self._entry("dup", base - 86400),
+                self._entry("solo", base - 2 * 86400),
+                self._entry("dup", base),
+            ]
+        )
+
+        models = asyncio.run(plugin._fetch_models(force=True))
+
+        self.assertEqual([model["id"] for model in models], ["dup", "solo"])
+        self.assertEqual(models[0]["created_at"], base)
+
+
 class TestThePluginSplitsTheModelList(unittest.TestCase):
     """Arena exposes 170+ image models, too many for one chat message.
 

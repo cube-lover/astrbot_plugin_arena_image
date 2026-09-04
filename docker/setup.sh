@@ -127,7 +127,8 @@ else
 fi
 
 # ---------- 4.0 配置的网络和 AstrBot 实际所在网络一致吗 ----------
-# 不一致时插件连不上 arena-browser，画图会直接失败，所以宁可现在啰嗦一句。
+# 不一致 = 插件连不上 arena-browser，而且是填任何地址都救不回来的那种不通
+# （Docker 默认丢弃跨网络流量），所以这里直接改成 AstrBot 实际所在的网络。
 CONFIGURED_NET="$(sed -n 's/^ASTRBOT_NETWORK=//p' .env | tail -1 | tr -d '\r')"
 ASTRBOT_C="$(astrbot_container)"
 if [[ -n "$CONFIGURED_NET" && -n "$ASTRBOT_C" ]]; then
@@ -135,6 +136,14 @@ if [[ -n "$CONFIGURED_NET" && -n "$ASTRBOT_C" ]]; then
        --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}
 {{end}}' 2>/dev/null | grep -qx "$CONFIGURED_NET"; then
     info "AstrBot（${ASTRBOT_C}）确认在 ${CONFIGURED_NET} 网络上"
+  elif ACTUAL_NET=$(detect_network) && [[ -n "$ACTUAL_NET" ]]; then
+    sed -i "s|^ASTRBOT_NETWORK=.*|ASTRBOT_NETWORK=${ACTUAL_NET}|" .env
+    warn "AstrBot（${ASTRBOT_C}）其实在 ${ACTUAL_NET}，不是 ${CONFIGURED_NET}，已改好 .env"
+    echo "两个办法任选一个："
+    echo "  1) 重新启动容器，让它们加入 ${ACTUAL_NET}（推荐，一次到位）："
+    echo "     docker compose -f docker-compose.arena.yml --env-file .env up -d"
+    echo "  2) 不想重启容器，就把 AstrBot 接进旧网络（立即生效，不动任何容器）："
+    echo "     docker network connect ${CONFIGURED_NET} ${ASTRBOT_C}"
   else
     warn "AstrBot（${ASTRBOT_C}）不在 ${CONFIGURED_NET} 网络上，插件会连不上 arena-browser"
     echo "启动容器后跑这一行接进去即可，不用重启任何容器："

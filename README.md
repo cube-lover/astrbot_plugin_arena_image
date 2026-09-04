@@ -321,9 +321,14 @@ docker inspect arena-bridge --format '{{json .NetworkSettings.Networks}}'
 http://arena-bridge:8000
 ```
 
-不在同一个网络时，把 AstrBot 接进去就行，跑完不用重启任何容器（NapCat 登录态不受影响）：
+不在同一个网络时,**填地址是没用的** —— Docker 默认把跨网络的包丢掉,填容器 IP、填宿主机网关都超时。
+两个办法任选一个:
 
 ```bash
+# 办法一（推荐）：重跑 setup.sh，它会自动改好 .env 里的网络名，再重启 arena 容器
+./setup.sh && docker compose -f docker-compose.arena.yml --env-file .env up -d
+
+# 办法二：把 AstrBot 接进 arena 容器的网络，立即生效，不重启任何容器
 docker network connect $(docker inspect arena-browser \
   --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
   | awk '{print $1}') astrbot
@@ -331,7 +336,7 @@ docker network connect $(docker inspect arena-browser \
 
 direct 模式连不上 `arena-browser` 时插件会自己试 `host.docker.internal`、`172.17.0.1`、
 `127.0.0.1`（`9223` 已绑定宿主机 `127.0.0.1`，所以 AstrBot 装在宿主机上也能用），
-全试不通才报错，并把上面那行命令一起给出来。
+全试不通才报错，并把上面办法二那行命令一起给出来。
 
 ### 提示 Cookie 失效
 

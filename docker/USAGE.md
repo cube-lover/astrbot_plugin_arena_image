@@ -632,8 +632,29 @@ docker exec astrbot python3 -c "import urllib.request,json;print(json.load(urlli
 `127.0.0.1`（端口和路径沿用你填的），试通了就记住 10 分钟。所以 **AstrBot 装在宿主机**
 的情况不用管，`9223` 已经绑了 `127.0.0.1`。
 
-**AstrBot 在另一个 Docker 网络**里则跨不过去（Docker 默认禁止不同网络互通），报错会直接
-给出这一行，跑完不用重启任何容器，NapCat 登录态也不受影响：
+**AstrBot 在另一个 Docker 网络**里则跨不过去，而且**填任何地址都跨不过去**。在本项目的服务器上
+实测过（临时建一个网络、一个容器，测完删掉）：
+
+```text
+容器名 arena-browser:9223        名字解析不出来
+直接填容器 IP 172.20.0.5:9223     解析到了，连不上（超时）
+填自己网关 172.24.0.1:9223        连不上（超时）
+host.docker.internal:9223       Linux 上这个名字不存在
+接进同一个网络后 arena-browser:9223  连上了，Chrome/131
+```
+
+Docker 默认把跨网络的包直接丢掉，所以这不是配置问题，填地址救不回来。两个办法任选一个：
+
+**办法一（推荐，一次到位）**：重跑 `./setup.sh`。它会发现 `.env` 里的 `ASTRBOT_NETWORK` 和
+AstrBot 实际所在网络不一致、自动改好，然后按提示重启 arena 容器：
+
+```bash
+./setup.sh
+docker compose -f docker-compose.arena.yml --env-file .env up -d
+```
+
+**办法二（不想重启容器）**：把 AstrBot 接进 arena 容器所在的网络，立即生效，不动任何容器，
+NapCat 登录态也不受影响：
 
 ```bash
 docker network connect $(docker inspect arena-browser \
@@ -641,15 +662,14 @@ docker network connect $(docker inspect arena-browser \
   | awk '{print $1}') astrbot
 ```
 
-想一劳永逸就改 `.env` 里的 `ASTRBOT_NETWORK` 成 AstrBot 实际所在的网络，再 `up -d`。
-查实际网络：
+查 AstrBot 实际在哪个网络：
 
 ```bash
 docker inspect astrbot --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}'
 ```
 
-`setup.sh` 现在直接问 AstrBot 容器自己在哪个网络（以前是按网络名猜），并在两者不一致时
-把上面那行命令打出来。
+`setup.sh` 现在直接问 AstrBot 容器自己在哪个网络（以前是按网络名猜），所以新装的人基本碰不到
+这一节；会碰到的多是「先装了 arena 容器，后来才装／重建 AstrBot」的情况。
 
 ---
 

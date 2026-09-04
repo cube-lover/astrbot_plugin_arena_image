@@ -250,6 +250,45 @@ bridge_url = http://服务器IP:8000
 
 注意：默认 `8000` 只绑定服务器本机 `127.0.0.1`。如果 AstrBot 不在同一台机器，需要改端口映射或通过反向代理访问。
 
+### 通道模式：bridge / direct（可省掉 arena-bridge 容器）
+
+插件配置里的 `transport_mode` 决定画图请求走哪条路：
+
+| 模式 | 说明 | 需要的容器 |
+| --- | --- | --- |
+| `bridge`（默认） | 插件 → `arena-bridge` → `arena-browser`，和以前完全一样 | arena-bridge + arena-browser |
+| `direct` | 插件直接连 `arena-browser` 的 CDP，在已登录的页面里发请求 | 只要 arena-browser |
+
+direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、图生图上传、验证链接签名）挪进插件，
+少一个容器、少一层转发；Cookie 不再被复制到任何配置文件里，而是每次都用浏览器页面自己的会话
+（`credentials: 'include'`），所以 `__cf_bm`、`arena-auth-prod-v1` 轮换时不会出现“Cookie 失效”。
+
+切到 direct 只改插件配置，不用改 Docker：
+
+| 配置项 | 填什么 |
+| --- | --- |
+| `transport_mode` | `direct` |
+| `browser_cdp_url` | `http://arena-browser:9223`（AstrBot 与浏览器同网络时不用改） |
+| `browser_gateway_url` | 和 `docker/.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致，例如 `http://服务器IP:6081` |
+| `interactive_link_secret` | `docker/.interactive-link-secret` 的内容（32 字节随机十六进制，由 `setup.sh` 生成） |
+| `interactive_link_ttl` | 验证链接有效期，默认 `900` 秒 |
+| `browser_vnc_url` | 可选兜底链接；填了网关地址和密钥就不用管 |
+| `allow_stealth_models` | 放行灰测模型，默认开启（bridge 模式下由 `.env` 控制） |
+
+签名密钥必须和 `arena-browser` 里的网关一致，否则验证链接打不开：
+
+```bash
+# 在服务器上查看（只在需要时看，不要贴到聊天里）
+cat /opt/lmarenabridge/docker/.interactive-link-secret
+```
+
+如果 AstrBot 不在同一个 Docker 网络，把 `browser_cdp_url` 改成能通的地址，
+并注意 `9223` 默认只绑定服务器本机。
+
+**回退：** 把 `transport_mode` 改回 `bridge` 保存即可，不需要动容器；
+`arena-bridge` 一直留着，direct 模式只是不用它。要退回旧版本插件用
+`git checkout v0.5.0 && scripts/deploy-plugin.sh`（只重启 astrbot，不动 NapCat）。
+
 ---
 
 ## 六、首次登录 Arena
@@ -552,6 +591,22 @@ LM_BRIDGE_PROXY_URL=http://你的代理地址:端口
 ```bash
 docker compose -f docker-compose.arena.yml --env-file .env up -d
 ```
+
+### 10. direct 模式：验证链接打不开 / 提示连不上浏览器
+
+按报错分两种：
+
+- “没有配置服务器浏览器验证链接”“验证链接打不开”：`browser_gateway_url` 和
+  `interactive_link_secret` 有一个没填对。密钥要和 `docker/.interactive-link-secret`
+  完全一致（末尾不要多空行），网关地址要和 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致。
+- “连不上服务器浏览器”“服务器浏览器响应超时”：`arena-browser` 没起来或 `browser_cdp_url` 不通。
+
+```bash
+docker compose -f docker-compose.arena.yml ps arena-browser
+docker exec astrbot python3 -c "import urllib.request,json;print(json.load(urllib.request.urlopen('http://arena-browser:9223/json/version'))['Browser'])"
+```
+
+任何时候都可以把 `transport_mode` 改回 `bridge` 恢复原来的链路。
 
 ---
 

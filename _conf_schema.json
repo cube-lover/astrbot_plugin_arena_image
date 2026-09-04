@@ -1,7 +1,13 @@
 {
+  "transport_mode": {
+    "type": "string",
+    "description": "通道模式：bridge = 走 arena-bridge 容器（默认，和以前完全一样）；direct = 插件直连 arena-browser，不需要 bridge 容器",
+    "options": ["bridge", "direct"],
+    "default": "bridge"
+  },
   "bridge_url": {
     "type": "string",
-    "description": "LMArenaBridge 根地址或 /api/v1 地址",
+    "description": "LMArenaBridge 根地址或 /api/v1 地址（仅 bridge 模式使用）",
     "default": "http://arena-bridge:8000"
   },
   "bridge_api_key": {
@@ -9,6 +15,37 @@
     "description": "LMArenaBridge API Key（默认零配置，留空即可）",
     "secret": true,
     "default": ""
+  },
+  "browser_cdp_url": {
+    "type": "string",
+    "description": "arena-browser 的 CDP 地址（仅 direct 模式使用）",
+    "default": "http://arena-browser:9223"
+  },
+  "browser_gateway_url": {
+    "type": "string",
+    "description": "验证链接网关地址（仅 direct 模式使用），对应 .env 里的 LM_BRIDGE_BROWSER_GATEWAY_URL，例如 http://服务器IP:6081",
+    "default": ""
+  },
+  "browser_vnc_url": {
+    "type": "string",
+    "description": "noVNC 直连地址（可选，仅 direct 模式在没有网关签名密钥时作为兜底链接）",
+    "default": ""
+  },
+  "interactive_link_secret": {
+    "type": "string",
+    "description": "验证链接签名密钥（仅 direct 模式使用），内容取自 docker/.interactive-link-secret",
+    "secret": true,
+    "default": ""
+  },
+  "interactive_link_ttl": {
+    "type": "int",
+    "description": "验证链接有效期（秒，仅 direct 模式使用）",
+    "default": 900
+  },
+  "allow_stealth_models": {
+    "type": "bool",
+    "description": "放行灰测（隐身）模型，蒙娜丽莎在这一类里（仅 direct 模式使用；bridge 模式由 .env 控制）",
+    "default": true
   },
   "default_model": {
     "type": "string",

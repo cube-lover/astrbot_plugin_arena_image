@@ -30,6 +30,7 @@ try:
 except ImportError:  # AstrBot versions before the shared quoted-message helper.
     extract_quoted_message_images = None
 
+from .arena_direct import ArenaDirectClient
 from .bridge_client import (
     ArenaBridgeClient,
     BridgeError,
@@ -177,8 +178,8 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
 @register(
     PLUGIN_NAME,
     "cube-lover",
-    "通过 LMArenaBridge 提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.5.0",
+    "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
+    "0.6.0",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -208,7 +209,13 @@ class ArenaImagePlugin(Star):
         self._interactive_auth_session_id = ""
 
     async def initialize(self):
-        logger.info("[arena_image] 插件已加载，Bridge 地址：%s", self._bridge_url())
+        if self._transport_mode() == "direct":
+            logger.info(
+                "[arena_image] 插件已加载，直连服务器浏览器：%s",
+                str(self.config.get("browser_cdp_url") or "http://arena-browser:9223"),
+            )
+        else:
+            logger.info("[arena_image] 插件已加载，Bridge 地址：%s", self._bridge_url())
 
     async def terminate(self):
         return None
@@ -216,23 +223,38 @@ class ArenaImagePlugin(Star):
     def _bridge_url(self) -> str:
         return str(self.config.get("bridge_url") or "http://arena-bridge:8000").strip()
 
-    def _client(self) -> ArenaBridgeClient:
+    def _transport_mode(self) -> str:
+        """``bridge`` keeps today's behaviour; ``direct`` drops the container."""
+        mode = str(self.config.get("transport_mode") or "bridge").strip().casefold()
+        return "direct" if mode == "direct" else "bridge"
+
+    def _client(self) -> ArenaBridgeClient | ArenaDirectClient:
+        timeout = _as_float(self.config.get("request_timeout"), 300.0, 10.0, 1800.0)
+        retries = _as_int(self.config.get("rate_limit_retries"), 2, 0, 5)
+        max_wait = _as_float(self.config.get("rate_limit_max_wait"), 30.0, 1.0, 300.0)
+        if self._transport_mode() == "direct":
+            return ArenaDirectClient(
+                str(self.config.get("browser_cdp_url") or "http://arena-browser:9223"),
+                gateway_url=str(self.config.get("browser_gateway_url") or ""),
+                vnc_url=str(self.config.get("browser_vnc_url") or ""),
+                link_secret=str(self.config.get("interactive_link_secret") or ""),
+                link_ttl=_as_float(
+                    self.config.get("interactive_link_ttl"), 900.0, 120.0, 1800.0
+                ),
+                timeout=timeout,
+                rate_limit_retries=retries,
+                rate_limit_max_wait=max_wait,
+                allow_stealth_models=bool(
+                    self.config.get("allow_stealth_models", True)
+                ),
+                data_dir=self.data_dir,
+            )
         return ArenaBridgeClient(
             self._bridge_url(),
             str(self.config.get("bridge_api_key") or ""),
-            timeout=_as_float(
-                self.config.get("request_timeout"),
-                300.0,
-                10.0,
-                1800.0,
-            ),
-            rate_limit_retries=_as_int(self.config.get("rate_limit_retries"), 2, 0, 5),
-            rate_limit_max_wait=_as_float(
-                self.config.get("rate_limit_max_wait"),
-                30.0,
-                1.0,
-                300.0,
-            ),
+            timeout=timeout,
+            rate_limit_retries=retries,
+            rate_limit_max_wait=max_wait,
         )
 
     def _input_max_bytes(self) -> int:

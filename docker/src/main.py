@@ -905,7 +905,12 @@ api_key_usage = defaultdict(list)
 model_usage_stats = defaultdict(int)
 MODEL_HEALTH: Dict[str, Dict[str, Any]] = {}
 MODEL_VARIANT_HEALTH: Dict[str, Dict[str, Any]] = {}
-MODEL_HEALTH_TTL_SECONDS = 15 * 60
+# How long a model's last upstream result is worth showing.  This used to be 15
+# minutes of process memory, which meant the annotation was gone before anyone
+# ran `/竞技场画图模型` again -- and every bridge update wiped it entirely.
+MODEL_HEALTH_TTL_SECONDS = 6 * 60 * 60
+# Variant avoidance stays short on purpose: it steers traffic away from a
+# backend node, so a node must get another chance quickly.
 MODEL_VARIANT_FAILURE_TTL_SECONDS = 10 * 60
 ALLOWED_STEALTH_IMAGE_MODELS = {"luna-lisa-alpha"}
 # Token cycling: current index for round-robin selection
@@ -970,6 +975,7 @@ def _record_model_health(
         "source": str(source or "completion"),
     }
     if not clean_variant:
+        _save_model_health()
         return
     if code == HTTPStatus.OK or _is_moderation_blocked_message(message):
         MODEL_VARIANT_HEALTH.pop(clean_variant, None)
@@ -980,6 +986,69 @@ def _record_model_health(
             "message": str(message or "")[:500],
             "source": str(source or "completion"),
         }
+    _save_model_health()
+
+
+def _model_health_file() -> str:
+    return getattr(constants, "MODEL_HEALTH_FILE", "") or str(
+        Path(constants.MODELS_FILE).with_name("model_health.json")
+    )
+
+
+def _save_model_health() -> None:
+    """Persist the health tables so a bridge restart does not forget every 500."""
+    path = _model_health_file()
+    payload = {
+        "models": MODEL_HEALTH,
+        "variants": MODEL_VARIANT_HEALTH,
+        "saved_at": time.time(),
+    }
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        debug_print(f"⚠️ Could not persist model health: {exc}")
+
+
+def _load_model_health() -> None:
+    """Restore persisted health, dropping anything already past its TTL."""
+    path = _model_health_file()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    if not isinstance(payload, dict):
+        return
+
+    now = time.time()
+    for key, ttl, target in (
+        ("models", MODEL_HEALTH_TTL_SECONDS, MODEL_HEALTH),
+        ("variants", MODEL_VARIANT_FAILURE_TTL_SECONDS, MODEL_VARIANT_HEALTH),
+    ):
+        entries = payload.get(key)
+        if not isinstance(entries, dict):
+            continue
+        target.clear()
+        for name, item in entries.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                checked_at = float(item.get("checked_at") or 0)
+                code = int(item.get("status_code") or 0)
+            except (TypeError, ValueError):
+                continue
+            if code <= 0 or checked_at <= 0 or now - checked_at > ttl:
+                continue
+            target[str(name)] = {
+                "status_code": code,
+                "checked_at": checked_at,
+                "message": str(item.get("message") or "")[:500],
+                "source": str(item.get("source") or "restored"),
+            }
 
 
 def _model_health_snapshot() -> dict[str, Any]:
@@ -993,6 +1062,7 @@ def _model_health_snapshot() -> dict[str, Any]:
             "status_code": int(item.get("status_code") or 0),
             "checked_at": item.get("checked_at"),
             "message": item.get("message") or "",
+            "source": item.get("source") or "",
         })
     variants = []
     for variant_id, item in MODEL_VARIANT_HEALTH.items():
@@ -1003,16 +1073,41 @@ def _model_health_snapshot() -> dict[str, Any]:
             "status_code": int(item.get("status_code") or 0),
             "checked_at": item.get("checked_at"),
             "message": item.get("message") or "",
+            "source": item.get("source") or "",
         })
     return {"models": models, "variants": variants}
 
 
-def _uuid7_timestamp(value: str) -> float:
+# Sanity window for decoded model ids: Arena's oldest row is from 2025-10, so
+# anything before 2020 is a misread and anything past tomorrow is random bytes.
+_MODEL_ID_MIN_MS = 1_577_836_800_000  # 2020-01-01T00:00:00Z
+_MODEL_ID_SKEW_MS = 86_400_000
+
+
+def _uuid7_millis(value: str) -> Optional[int]:
+    """Decode a UUIDv7's 48-bit millisecond prefix, or ``None`` when it has none.
+
+    Arena writes UUIDv7 ids, whose leading bytes are the row's creation time --
+    the only timestamp the model table carries.  Its older rows are UUIDv4, i.e.
+    random bytes that decode to years like 7220, so the version nibble has to be
+    checked before the prefix is trusted.
+    """
+    compact = str(value or "").replace("-", "").strip().lower()
+    if len(compact) < 13 or compact[12] != "7":
+        return None
     try:
-        compact = str(value or "").replace("-", "")
-        return int(compact[:12], 16) / 1000.0
-    except (TypeError, ValueError):
-        return 0.0
+        millis = int(compact[:12], 16)
+    except ValueError:
+        return None
+    if millis < _MODEL_ID_MIN_MS or millis > int(time.time() * 1000) + _MODEL_ID_SKEW_MS:
+        return None
+    return millis
+
+
+def _uuid7_timestamp(value: str) -> float:
+    """Seconds for ordering; 0.0 for ids that carry no timestamp at all."""
+    millis = _uuid7_millis(value)
+    return millis / 1000.0 if millis else 0.0
 
 
 def _select_healthy_model_variant(
@@ -1552,6 +1647,10 @@ async def startup_event():
     # and running slow browser/network startup routines.
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
+
+    # Restore the per-model upstream results captured before the last restart,
+    # so a model that answered 500 an hour ago is still annotated.
+    _load_model_health()
 
     try:
         # Ensure config and models files exist
@@ -2778,6 +2877,39 @@ def _model_has_supported_output(model: dict) -> bool:
     )
 
 
+def model_created_timestamp(model: dict) -> Optional[int]:
+    """When Arena created this model row, as Unix seconds (``None`` if unknown)."""
+    millis = _uuid7_millis(str(model.get("id") or ""))
+    return millis // 1000 if millis else None
+
+
+def _model_created_iso(model: dict) -> Optional[str]:
+    created = model_created_timestamp(model)
+    if not created:
+        return None
+    return datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _public_model_entry(model: dict) -> dict:
+    """Shape one model for the OpenAI-compatible list."""
+    created = model_created_timestamp(model)
+    return {
+        "id": model.get("publicName"),
+        "object": "model",
+        # `created` must stay an int for OpenAI clients; `created_at` is the
+        # honest value (None when the id carries no timestamp) so callers can
+        # tell "created today" apart from "unknown".
+        "created": created or int(time.time()),
+        "created_at": created,
+        "owned_by": model.get("organization", "lmarena"),
+        "capabilities": (
+            model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
+        ),
+        "output_image": _model_capability(model, "outputCapabilities", "image"),
+        "input_image": _model_capability(model, "inputCapabilities", "image"),
+    }
+
+
 @app.get("/api/v1/api/tags")
 async def ollama_tags(api_key: dict = Depends(rate_limit_api_key)):
     models = get_models()
@@ -2794,7 +2926,7 @@ async def ollama_tags(api_key: dict = Depends(rate_limit_api_key)):
         {
             "name": model.get("publicName", ""),
             "model": model.get("publicName", ""),
-            "modified_at": "2024-01-01T00:00:00Z",
+            "modified_at": _model_created_iso(model) or "2024-01-01T00:00:00Z",
             "size": 0
         }
         for model in valid_models if model.get("publicName")
@@ -2833,28 +2965,10 @@ async def list_models(api_key: dict = Depends(rate_limit_api_key)):
         return {
             "object": "list",
             "data": [
-                {
-                    "id": model.get("publicName"),
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": model.get("organization", "lmarena"),
-                    "capabilities": (
-                        model.get("capabilities")
-                        if isinstance(model.get("capabilities"), dict)
-                        else {}
-                    ),
-                    "output_image": _model_capability(
-                        model,
-                        "outputCapabilities",
-                        "image",
-                    ),
-                    "input_image": _model_capability(
-                        model,
-                        "inputCapabilities",
-                        "image",
-                    ),
-                } for model in valid_models if model.get("publicName")
-            ]
+                _public_model_entry(model)
+                for model in valid_models
+                if model.get("publicName")
+            ],
         }
     except Exception as e:
         debug_print(f"❌ Error listing models: {e}")

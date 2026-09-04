@@ -166,6 +166,8 @@ docker build -t lmarenabridge:local .
 - 仓库根目录：AstrBot 插件本体（`main.py`、`bridge_client.py`、`metadata.yaml` 等）。
 - `Dockerfile`、`docker-compose.arena.yml`：Bridge 容器化配置。
 - `docker-entrypoint.py`：初始化 `/data/config.json`、`/data/models.json` 和 API Key 文件。
+- `/data/model_health.json`：每个模型最近一次上游结果（500/403/超时/成功），由 Bridge 自动
+  写入并在启动时读回，保留 6 小时，用于 `/api/v1/model-health` 和插件的模型列表标注。
 - `tests/test_arena_image_plugin.py`：Bridge 客户端、入口初始化和插件清单测试。
 
 ## 运行边界

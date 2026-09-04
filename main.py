@@ -35,6 +35,7 @@ from .bridge_client import (
     data_uri_from_base64,
     decode_image_value,
     image_urls,
+    model_created_at,
     model_is_image_capable,
     response_text,
 )
@@ -154,7 +155,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.4.3",
+    "0.4.4",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -171,7 +172,7 @@ class ArenaImagePlugin(Star):
         self._models_cache: list[dict[str, Any]] = []
         self._models_cached_at = 0.0
         self._models_lock = asyncio.Lock()
-        self._model_health_cache: dict[str, int] = {}
+        self._model_health_cache: dict[str, dict[str, float]] = {}
         self._model_health_cached_at = 0.0
         self._model_health_lock = asyncio.Lock()
         self._selection_lock = asyncio.Lock()
@@ -418,7 +419,7 @@ class ArenaImagePlugin(Star):
             self._models_cached_at = time.monotonic()
             return list(models)
 
-    async def _fetch_model_health(self, *, force: bool = False) -> dict[str, int]:
+    async def _fetch_model_health(self, *, force: bool = False) -> dict[str, dict[str, float]]:
         """Read recent Bridge health statuses; missing models have not been tested."""
         ttl = max(0, _as_int(self.config.get("model_health_cache_seconds"), 30, 0, 3600))
         if not force and self._model_health_cache and time.monotonic() - self._model_health_cached_at < ttl:
@@ -427,7 +428,7 @@ class ArenaImagePlugin(Star):
             if not force and self._model_health_cache and time.monotonic() - self._model_health_cached_at < ttl:
                 return dict(self._model_health_cache)
             payload = await self._client().model_health()
-            health: dict[str, int] = {}
+            health: dict[str, dict[str, float]] = {}
             for item in payload.get("models", []) if isinstance(payload, dict) else []:
                 if not isinstance(item, dict):
                     continue
@@ -436,8 +437,12 @@ class ArenaImagePlugin(Star):
                     status_code = int(item.get("status_code") or 0)
                 except (TypeError, ValueError):
                     continue
+                try:
+                    checked_at = float(item.get("checked_at") or 0)
+                except (TypeError, ValueError):
+                    checked_at = 0.0
                 if model_id and status_code > 0:
-                    health[model_id] = status_code
+                    health[model_id] = {"status_code": status_code, "checked_at": checked_at}
             self._model_health_cache = health
             self._model_health_cached_at = time.monotonic()
             return dict(health)
@@ -486,6 +491,57 @@ class ArenaImagePlugin(Star):
             return "图片输入"
         return "其他"
 
+    @staticmethod
+    def _model_created_text(model: dict[str, Any]) -> str:
+        """Render Arena's row creation date; empty when the Bridge cannot tell."""
+        created = model_created_at(model)
+        if not created:
+            return ""
+        try:
+            stamp = time.strftime("%Y-%m-%d", time.localtime(created))
+        except (OSError, OverflowError, ValueError):
+            return ""
+        return f" 创建 {stamp}"
+
+    @staticmethod
+    def _health_age_text(checked_at: float) -> str:
+        """How long ago the Bridge saw this result; empty when it did not say."""
+        try:
+            age = time.time() - float(checked_at or 0)
+        except (TypeError, ValueError):
+            return ""
+        if checked_at <= 0 or age < 0:
+            return ""
+        if age < 60:
+            return "刚刚"
+        if age < 3600:
+            return f"{int(age // 60)}分钟前"
+        if age < 86400:
+            return f"{int(age // 3600)}小时前"
+        return f"{int(age // 86400)}天前"
+
+    @classmethod
+    def _model_health_text(cls, entry: Any) -> str:
+        """Annotate the last upstream result: the failing code, or a bare ✅."""
+        if isinstance(entry, dict):
+            try:
+                status = int(entry.get("status_code") or 0)
+            except (TypeError, ValueError):
+                return ""
+            checked_at = entry.get("checked_at") or 0
+        else:
+            try:
+                status = int(entry or 0)
+            except (TypeError, ValueError):
+                return ""
+            checked_at = 0
+        if status <= 0:
+            return ""
+        if 200 <= status < 300:
+            return " ✅"
+        age = cls._health_age_text(checked_at)
+        return f" ⚠{status} {age}" if age else f" ⚠{status}"
+
     @filter.command("竞技场画图模型", alias={"arena画图模型", "竞技场模型列表", "arena模型列表"})
     async def list_models(self, event: AstrMessageEvent):
         try:
@@ -501,9 +557,12 @@ class ArenaImagePlugin(Star):
         for index, model in enumerate(models[:limit], start=1):
             model_id = self._model_id(model)
             marker = " ← 当前" if model_id == self._model_id(current) else ""
-            status = health_map.get(model_id)
-            status_text = f" ({status})" if status else ""
-            lines.append(f"{index}. {model_id} [{self._model_kind(model)}]{status_text}{marker}")
+            status_text = self._model_health_text(health_map.get(model_id))
+            created_text = self._model_created_text(model)
+            lines.append(
+                f"{index}. {model_id} [{self._model_kind(model)}]"
+                f"{created_text}{status_text}{marker}"
+            )
         if len(models) > limit:
             lines.append(f"……其余 {len(models) - limit} 个已省略，可调整 model_list_limit。")
         lines.append("用法：/竞技场切换模型 编号或完整模型名（列表只含画图模型）")

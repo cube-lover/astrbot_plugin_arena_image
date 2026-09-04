@@ -656,6 +656,26 @@ def model_is_image_capable(model: dict[str, Any]) -> tuple[bool, bool]:
     return output_image, input_image
 
 
+def model_created_at(model: dict[str, Any]) -> int | None:
+    """Unix seconds when Arena created the model row, or ``None`` if unknown.
+
+    Only ``created_at`` is trusted.  The OpenAI-compatible ``created`` field is
+    ``now`` on bridges older than 0.4.4, so reading it would label every model
+    as created today.
+    """
+    for key in ("created_at", "createdAt"):
+        value = model.get(key)
+        if value in (None, "", False):
+            continue
+        try:
+            seconds = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return seconds
+    return None
+
+
 class ArenaBridgeClient:
     """Async client used by the AstrBot plugin."""
 

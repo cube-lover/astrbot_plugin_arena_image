@@ -27,6 +27,9 @@ PORT = int(os.environ.get("LM_BRIDGE_PORT", "8000"))
 DATA_DIR = Path(os.environ.get("LM_BRIDGE_DATA_DIR", ".")).expanduser()
 CONFIG_FILE = str(DATA_DIR / "config.json")
 MODELS_FILE = str(DATA_DIR / "models.json")
+# Last upstream result per model, so `/竞技场画图模型` can still annotate a 500
+# after the bridge has been restarted or updated.
+MODEL_HEALTH_FILE = str(DATA_DIR / "model_health.json")
 
 # ============================================================
 # HTTP STATUS CODES

@@ -179,6 +179,34 @@ def normalize_api_base(value: str) -> str:
     return f"{normalized}/api/v1"
 
 
+def _network_hint(exc: Exception, url: str) -> str:
+    """Turn a DNS failure into the one command that fixes it.
+
+    ``arena-bridge`` only resolves for containers sharing the compose network, so
+    the usual cause of a name error here is AstrBot living in a different Docker
+    network -- which reads as an unexplained English traceback unless the fix is
+    spelled out.  Attaching the running container needs no restart, so nothing
+    about NapCat's login is at risk.
+    """
+    host = (urlparse(url).hostname or "").strip()
+    if not host or host.replace(".", "").isdigit() or ":" in host:
+        return ""
+    text = str(exc).casefold()
+    dns_failed = any(
+        marker in text
+        for marker in ("name or service not known", "nodename", "getaddrinfo", "name does not resolve")
+    )
+    if not dns_failed:
+        return ""
+    return (
+        f"\n看起来 AstrBot 和 {host} 不在同一个 Docker 网络。"
+        "跑这一行接进去即可，不用重启任何容器：\n"
+        f"docker network connect $(docker inspect {host} "
+        "--format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "
+        "| awk '{print $1}') astrbot"
+    )
+
+
 def _error_object(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -732,7 +760,7 @@ class ArenaBridgeClient:
             ) as client:
                 response = await client.request(method, url, **kwargs)
         except httpx.HTTPError as exc:
-            raise BridgeError(f"连接 Bridge 失败：{exc}") from exc
+            raise BridgeError(f"连接 Bridge 失败：{exc}{_network_hint(exc, url)}") from exc
 
         try:
             payload = response.json()

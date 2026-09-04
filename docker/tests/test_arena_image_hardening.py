@@ -268,6 +268,42 @@ def _noisy_png(size: int = 900) -> bytes:
     return buffer.getvalue()
 
 
+class ForeignNetworkHintTest(unittest.TestCase):
+    """A DNS failure on a container name means "wrong Docker network", not "down".
+
+    Left as a bare httpx error it reads as an English traceback, and the operator
+    starts restarting containers -- which is how NapCat logins get lost.
+    """
+
+    DNS = "[Errno -2] Name or service not known"
+
+    def test_a_container_name_that_does_not_resolve_names_the_fix(self) -> None:
+        hint = bridge_client._network_hint(
+            RuntimeError(self.DNS), "http://arena-bridge:8000/api/v1/health"
+        )
+        self.assertIn("docker network connect", hint)
+        self.assertIn("arena-bridge", hint)
+        self.assertIn("astrbot", hint)
+        self.assertIn("不用重启任何容器", hint)
+
+    def test_other_failures_are_left_alone(self) -> None:
+        # A timeout or a refused connection is a different problem; adding network
+        # advice there would send people down the wrong path.
+        self.assertEqual(
+            bridge_client._network_hint(
+                RuntimeError("timed out"), "http://arena-bridge:8000/api/v1/health"
+            ),
+            "",
+        )
+        # An address the operator typed themselves is not a container name.
+        self.assertEqual(
+            bridge_client._network_hint(
+                RuntimeError(self.DNS), "http://10.0.0.9:8000/api/v1/health"
+            ),
+            "",
+        )
+
+
 class RateLimitRetryTest(unittest.TestCase):
     def test_detection_covers_status_code_error_code_and_chinese_text(self) -> None:
         self.assertTrue(

@@ -84,5 +84,16 @@
     "type": "int",
     "description": "限流重试的单次最长等待秒数（优先遵循 Retry-After）",
     "default": 30
+  },
+  "preset_prompts": {
+    "type": "list",
+    "description": "预设提示词，每行一条：名字=提示词。提示词里的 {} 是补充描述插入位置，不写就接在后面。聊天里 /竞技场预设添加 保存的同名预设优先。",
+    "default": [
+      "赛博=cyberpunk city at night, neon reflections, rain-slick streets, cinematic lighting, ultra detailed, {}",
+      "手绘=hand-drawn watercolor illustration, soft edges, warm paper texture, delicate linework, {}",
+      "写实=photorealistic, 85mm portrait lens, shallow depth of field, natural window light, skin texture detail, {}",
+      "动漫=anime key visual, clean cel shading, vibrant colors, expressive eyes, detailed background, {}",
+      "手办=1/7 scale figure, PVC statue on round base, studio product photo, glossy finish, {}"
+    ]
   }
 }

@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import mimetypes
+import re
 import time
 import uuid
 from pathlib import Path
@@ -52,6 +53,28 @@ DEFAULT_SEND_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 # Arena's attachment pipeline only accepts still pictures, so GIF uploads are
 # always flattened even when they hold a single frame.
 ALWAYS_FLATTEN_INPUT_MIMES = frozenset({"image/gif", "image/apng"})
+
+# A preset marks where the caller's own words go with one of these; without a
+# placeholder the words are appended, which is what a pure style preset wants.
+PRESET_PLACEHOLDERS = ("{}", "{prompt}", "{描述}", "{补充}")
+MAX_PRESET_NAME_LENGTH = 24
+MAX_PRESET_PROMPT_LENGTH = 2000
+MAX_PRESETS = 100
+PRESET_LIST_LIMIT = 40
+PRESET_MODEL_CLEAR_WORDS = frozenset({"无", "清除", "取消", "默认", "-", "none", "clear"})
+
+
+def _collapse_separators(text: str) -> str:
+    """Tidy a template once an empty placeholder has been removed from it."""
+    cleaned = re.sub(r"[，,、]\s*(?=[，,、])", "", str(text or ""))
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip(" \t，,、")
+
+
+def _preview(text: str, limit: int = 60) -> str:
+    value = str(text or "").strip()
+    return value if len(value) <= limit else value[:limit] + "…"
+
 
 
 def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -154,8 +177,8 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
 @register(
     PLUGIN_NAME,
     "cube-lover",
-    "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.4.7",
+    "通过 LMArenaBridge 提供模型列表、模型切换、预设提示词、文生图和图生图",
+    "0.5.0",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -167,8 +190,10 @@ class ArenaImagePlugin(Star):
         self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         self.output_dir = self.data_dir / "generated"
         self.selection_file = self.data_dir / "session_models.json"
+        self.presets_file = self.data_dir / "prompt_presets.json"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._selected_models: dict[str, str] = self._load_selection()
+        self._presets: dict[str, dict[str, Any]] = self._load_presets()
         self._models_cache: list[dict[str, Any]] = []
         self._models_cached_at = 0.0
         self._models_lock = asyncio.Lock()
@@ -176,6 +201,7 @@ class ArenaImagePlugin(Star):
         self._model_health_cached_at = 0.0
         self._model_health_lock = asyncio.Lock()
         self._selection_lock = asyncio.Lock()
+        self._presets_lock = asyncio.Lock()
         self._generation_lock = asyncio.Lock()
         self._active_generations = 0
         self._last_generation_seconds = 0.0
@@ -398,6 +424,97 @@ class ArenaImagePlugin(Star):
                 encoding="utf-8",
             )
             temporary.replace(self.selection_file)
+
+    # ---- prompt presets ---------------------------------------------------
+
+    @staticmethod
+    def _clean_preset(name: Any, entry: Any) -> tuple[str, dict[str, Any]] | None:
+        """Normalise one stored preset, dropping anything unusable."""
+        display = str(name or "").strip()
+        if not display or len(display) > MAX_PRESET_NAME_LENGTH:
+            return None
+        if isinstance(entry, str):
+            entry = {"prompt": entry}
+        if not isinstance(entry, dict):
+            return None
+        prompt = str(entry.get("prompt") or "").strip()[:MAX_PRESET_PROMPT_LENGTH]
+        if not prompt:
+            return None
+        return display, {
+            "prompt": prompt,
+            "model": str(entry.get("model") or "").strip(),
+            "source": "config" if entry.get("source") == "config" else "chat",
+        }
+
+    def _load_presets(self) -> dict[str, dict[str, Any]]:
+        """Saved presets first, then panel-configured ones as seeds.
+
+        A name saved from chat always wins: the config list is the starting
+        point an admin ships with the deployment, not an override that would
+        silently undo `/竞技场预设添加`.
+        """
+        stored: dict[str, dict[str, Any]] = {}
+        try:
+            raw = json.loads(self.presets_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            raw = {}
+        if isinstance(raw, dict):
+            for name, entry in raw.items():
+                cleaned = self._clean_preset(name, entry)
+                if cleaned:
+                    stored[cleaned[0]] = cleaned[1]
+        taken = {name.casefold() for name in stored}
+        configured = self.config.get("preset_prompts") or []
+        if isinstance(configured, str):
+            configured = configured.splitlines()
+        for line in configured:
+            name, separator, body = str(line).partition("=")
+            if not separator:
+                name, _, body = str(line).partition("：")
+            cleaned = self._clean_preset(name, {"prompt": body, "source": "config"})
+            if cleaned and cleaned[0].casefold() not in taken:
+                stored[cleaned[0]] = cleaned[1]
+                taken.add(cleaned[0].casefold())
+        return stored
+
+    async def _save_presets(self) -> None:
+        async with self._presets_lock:
+            self.presets_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.presets_file.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(self._presets, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self.presets_file)
+
+    def _find_preset(self, name: str) -> tuple[str, dict[str, Any]] | None:
+        wanted = str(name or "").strip().casefold()
+        if not wanted:
+            return None
+        for display, entry in self._presets.items():
+            if display.casefold() == wanted:
+                return display, entry
+        return None
+
+    @staticmethod
+    def _expand_preset(prompt: str, extra: str) -> str:
+        """Splice the caller's words into a stored prompt."""
+        extra = str(extra or "").strip()
+        template = str(prompt or "").strip()
+        for placeholder in PRESET_PLACEHOLDERS:
+            if placeholder in template:
+                filled = template.replace(placeholder, extra)
+                return filled.strip() if extra else _collapse_separators(filled)
+        if not extra:
+            return template
+        return f"{template}，{extra}"
+
+    def _preset_names_hint(self) -> str:
+        names = list(self._presets)
+        if not names:
+            return "（还没有预设，管理员可用 /竞技场预设添加 名字 提示词）"
+        shown = "、".join(names[:10])
+        return shown if len(names) <= 10 else f"{shown} 等 {len(names)} 条"
 
     async def _fetch_models(self, *, force: bool = False) -> list[dict[str, Any]]:
         ttl = _as_int(self.config.get("model_cache_seconds"), 30, 0, 3600)
@@ -657,6 +774,184 @@ class ArenaImagePlugin(Star):
             yield event.plain_result(f"所有群聊已切换到：{model_id}\n{capabilities}")
         except Exception as exc:
             yield event.plain_result(f"切换失败：{_display_error(exc)}")
+
+    @filter.command("竞技场预设", alias={"arena预设", "竞技场预设列表"})
+    async def list_presets(self, event: AstrMessageEvent):
+        """Show every stored preset.  Readable by anyone in the chat."""
+        if not self._presets:
+            yield event.plain_result(
+                "还没有预设提示词。\n"
+                "管理员添加：/竞技场预设添加 名字 提示词\n"
+                "提示词里写 {} 就是补充描述插进去的位置，不写就接在后面。"
+            )
+            return
+        lines = [f"预设提示词（{len(self._presets)} 条）："]
+        for name, entry in list(self._presets.items())[:PRESET_LIST_LIMIT]:
+            model = entry.get("model") or ""
+            suffix = f"（固定模型：{model}）" if model else ""
+            lines.append(f"· {name}{suffix}\n  {_preview(entry.get('prompt'), 60)}")
+        if len(self._presets) > PRESET_LIST_LIMIT:
+            lines.append(f"……其余 {len(self._presets) - PRESET_LIST_LIMIT} 条已省略。")
+        lines.append("用法：/jjcp 名字 补充描述（补充描述可省略，带图自动图生图）")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("竞技场预设添加", alias={"arena预设添加", "竞技场添加预设"})
+    async def add_preset(
+        self,
+        event: AstrMessageEvent,
+        text: GreedyStr = GreedyStr,
+    ):
+        """Store one preset.  Same name twice replaces the old prompt."""
+        parts = str(text or "").strip().split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.plain_result(
+                "用法：/竞技场预设添加 名字 提示词\n"
+                "例：/竞技场预设添加 赛博 cyberpunk city, neon, rain, {}\n"
+                "{} 是补充描述插入的位置，不写 {} 就接在提示词后面。"
+            )
+            return
+        cleaned = self._clean_preset(parts[0], {"prompt": parts[1]})
+        if not cleaned:
+            yield event.plain_result(
+                f"名字或提示词不合法：名字不能为空且不超过 {MAX_PRESET_NAME_LENGTH} 个字，提示词不能为空。"
+            )
+            return
+        name, entry = cleaned
+        existed = self._find_preset(name)
+        if existed:
+            # Keep the pinned model across a prompt rewrite; losing it silently
+            # would send the next call to whatever model happens to be current.
+            entry["model"] = existed[1].get("model") or ""
+            self._presets.pop(existed[0], None)
+        elif len(self._presets) >= MAX_PRESETS:
+            yield event.plain_result(f"预设数量已达上限 {MAX_PRESETS} 条，请先删除一些。")
+            return
+        self._presets[name] = entry
+        await self._save_presets()
+        action = "已更新" if existed else "已添加"
+        yield event.plain_result(
+            f"{action}预设「{name}」\n{entry['prompt']}\n用法：/jjcp {name} 补充描述"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("竞技场预设删除", alias={"arena预设删除", "竞技场删除预设"})
+    async def delete_preset(
+        self,
+        event: AstrMessageEvent,
+        name: GreedyStr = GreedyStr,
+    ):
+        """Drop one preset by name."""
+        requested = str(name or "").strip()
+        if not requested:
+            yield event.plain_result("用法：/竞技场预设删除 名字")
+            return
+        found = self._find_preset(requested)
+        if not found:
+            yield event.plain_result(
+                f"没有预设「{requested}」。\n现有：{self._preset_names_hint()}"
+            )
+            return
+        self._presets.pop(found[0], None)
+        await self._save_presets()
+        yield event.plain_result(f"已删除预设「{found[0]}」")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("竞技场预设模型", alias={"arena预设模型", "竞技场预设绑定模型"})
+    async def bind_preset_model(
+        self,
+        event: AstrMessageEvent,
+        text: GreedyStr = GreedyStr,
+    ):
+        """Pin a preset to one model so it ignores the current selection."""
+        parts = str(text or "").strip().split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.plain_result(
+                "用法：/竞技场预设模型 预设名 编号或模型名\n"
+                "解绑：/竞技场预设模型 预设名 无"
+            )
+            return
+        found = self._find_preset(parts[0])
+        if not found:
+            yield event.plain_result(
+                f"没有预设「{parts[0]}」。\n现有：{self._preset_names_hint()}"
+            )
+            return
+        name, entry = found
+        requested = parts[1].strip()
+        if requested.casefold() in PRESET_MODEL_CLEAR_WORDS:
+            entry["model"] = ""
+            await self._save_presets()
+            yield event.plain_result(f"预设「{name}」已解绑固定模型，改用当前模型。")
+            return
+        try:
+            selected, _ = await self._resolve_model(event, requested)
+        except Exception as exc:
+            yield event.plain_result(f"找不到这个模型：{_display_error(exc)}")
+            return
+        entry["model"] = self._model_id(selected)
+        await self._save_presets()
+        yield event.plain_result(f"预设「{name}」已固定到模型：{entry['model']}")
+
+    @filter.command("jjcp", alias={"竞技场预设画图", "预设画图", "jjc预设"})
+    async def preset_image(
+        self,
+        event: AstrMessageEvent,
+        text: GreedyStr = GreedyStr,
+    ):
+        """Draw with a stored preset: `/jjcp 名字 [补充描述]`."""
+        raw = str(text or "").strip()
+        if not raw:
+            yield event.plain_result(
+                "用法：/jjcp 预设名 补充描述（补充描述可省略）\n"
+                f"现有预设：{self._preset_names_hint()}\n查看全部：/竞技场预设"
+            )
+            return
+        parts = raw.split(maxsplit=1)
+        found = self._find_preset(parts[0])
+        if not found:
+            yield event.plain_result(
+                f"没有预设「{parts[0]}」。\n"
+                f"现有预设：{self._preset_names_hint()}\n查看全部：/竞技场预设"
+            )
+            return
+        name, entry = found
+        extra = parts[1].strip() if len(parts) > 1 else ""
+        prompt_text = self._expand_preset(entry.get("prompt"), extra)
+        if not prompt_text:
+            yield event.plain_result(f"预设「{name}」展开后是空的，请检查它的提示词。")
+            return
+        try:
+            images = await self._collect_input_images(event)
+        except Exception as exc:
+            yield event.plain_result(f"读取参考图失败：{_display_error(exc)}")
+            return
+        is_image_to_image = bool(images)
+        pinned = str(entry.get("model") or "").strip()
+        try:
+            if pinned:
+                model_id = pinned
+            else:
+                selected, _ = await self._resolve_model(event)
+                model_id = self._model_id(selected)
+        except Exception as exc:
+            yield event.plain_result(f"读取当前模型失败：{_display_error(exc)}")
+            return
+        mode_text = "图生图" if is_image_to_image else "文生图"
+        pinned_text = "（预设固定）" if pinned else ""
+        yield event.plain_result(
+            f"预设「{name}」，模型：{model_id}{pinned_text}\n"
+            f"开始{mode_text}：{_preview(prompt_text, 200)}\n"
+            "正在提交到竞技场画图模型，请稍候……"
+        )
+        async for result in self._generate(
+            event,
+            prompt_text,
+            include_input_images=is_image_to_image,
+            input_images=images if is_image_to_image else None,
+            model_id=model_id,
+        ):
+            yield result
 
     @filter.command("jjc", alias={"竞技场"})
     async def unified_image(

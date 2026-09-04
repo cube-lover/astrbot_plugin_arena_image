@@ -173,6 +173,9 @@ docker build -t lmarenabridge:local .
 ## 运行边界
 
 - 插件只使用 Bridge `/api/v1/models` 实际返回的模型，不内置伪造的模型列表。
+- 灰测（隐身）模型（Arena 不写 `organization` 的行）默认放行，可用
+  `LM_BRIDGE_ALLOW_STEALTH_MODELS=0` 退回上游只允许 `luna-lisa-alpha` 的行为；
+  `userSelectable: false` 的行始终不列出，Arena 上游会拒绝这类指定。
 - 只有 Bridge 返回图片输出能力的模型才适合 `/画图`；模型返回纯文本时，插件会把文本错误明确反馈。
 - 图生图参考图会转换为 Data URI，仅在插件到 Bridge 的请求中使用，不写入日志。
 - `docker-compose.arena.yml` 将宿主机端口限制为 `127.0.0.1:8000`，如需外部访问应使用 SSH 隧道或经过认证的反向代理。

@@ -155,7 +155,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 提供模型列表、模型切换、文生图和图生图",
-    "0.4.4",
+    "0.4.5",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -415,6 +415,11 @@ class ArenaImagePlugin(Star):
                 if image_only and not model_is_image_capable(model)[0]:
                     continue
                 models.append(model)
+            # Newest first.  Arena appends gray-test checkpoints at arbitrary
+            # positions in its own table, and the ones worth trying are always the
+            # freshest; rows whose id carries no timestamp (Arena's pre-UUIDv7
+            # models) keep Arena's ordering at the tail.
+            models.sort(key=lambda item: model_created_at(item) or 0, reverse=True)
             self._models_cache = models
             self._models_cached_at = time.monotonic()
             return list(models)

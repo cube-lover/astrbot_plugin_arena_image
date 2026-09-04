@@ -97,11 +97,28 @@ ASTRBOT_NETWORK=你的 AstrBot Docker 网络名
 LM_BRIDGE_ADMIN_PASSWORD=强管理密码
 LM_BRIDGE_API_KEY=
 LM_BRIDGE_RPM=30
+LM_BRIDGE_ALLOW_STEALTH_MODELS=1
 LM_BRIDGE_BROWSER_CDP_URL=http://arena-browser:9223
 LM_BRIDGE_BROWSER_GATEWAY_URL=http://你的服务器IP或域名:6081
 LM_BRIDGE_BROWSER_VNC_URL=http://你的服务器IP或域名:6082/vnc.html?autoconnect=true&resize=scale
 ARENA_NOVNC_PASSWORD=强VNC密码
 ```
+
+### 灰测（隐身）模型
+
+Arena 给还在灰度测试的模型不写 `organization`（厂商）字段，这样你在竞技场里只看到一个代号，
+猜不出是谁家的模型。本项目默认把这类模型全部放行：
+
+```dotenv
+LM_BRIDGE_ALLOW_STEALTH_MODELS=1
+```
+
+填 `0` 则退回上游 LMArenaBridge 的行为，只有 `luna-lisa-alpha`（蒙娜丽莎）能用，其余灰测
+模型返回 403。
+
+另一类模型是竞技场自己标了 `userSelectable: false` 的（只出现在盲测对战里），例如
+`gpt-image-2 (medium)` 的部分行、`nano-banana-pro`。它们不会出现在模型列表里，也不能指定，
+因为竞技场上游会直接拒绝 `Selected model is not available for user selection`，放开也没有用。
 
 ### 代理配置（可选）
 

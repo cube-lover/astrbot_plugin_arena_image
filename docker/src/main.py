@@ -912,6 +912,15 @@ MODEL_HEALTH_TTL_SECONDS = 6 * 60 * 60
 # Variant avoidance stays short on purpose: it steers traffic away from a
 # backend node, so a node must get another chance quickly.
 MODEL_VARIANT_FAILURE_TTL_SECONDS = 10 * 60
+# Arena hides a gray-test checkpoint by shipping its row with no `organization`,
+# and upstream LMArenaBridge refuses every such row with a 403.  But those rows
+# are ordinary selectable models -- `luna-lisa-alpha` and `lychee-v0` both
+# generate images on request -- so the refusal is policy, not capability, and
+# this bridge allows them.  Set LM_BRIDGE_ALLOW_STEALTH_MODELS=0 to restore
+# upstream's behaviour, in which case only the names below stay reachable.
+ALLOW_STEALTH_IMAGE_MODELS = os.environ.get(
+    "LM_BRIDGE_ALLOW_STEALTH_MODELS", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 ALLOWED_STEALTH_IMAGE_MODELS = {"luna-lisa-alpha"}
 # Token cycling: current index for round-robin selection
 current_token_index = 0
@@ -2877,6 +2886,13 @@ def _model_has_supported_output(model: dict) -> bool:
     )
 
 
+def _stealth_model_allowed(public_name: object) -> bool:
+    """Whether a row carrying no `organization` may be listed and requested."""
+    if ALLOW_STEALTH_IMAGE_MODELS:
+        return True
+    return str(public_name or "").strip() in ALLOWED_STEALTH_IMAGE_MODELS
+
+
 def model_created_timestamp(model: dict) -> Optional[int]:
     """When Arena created this model row, as Unix seconds (``None`` if unknown)."""
     millis = _uuid7_millis(str(model.get("id") or ""))
@@ -2901,7 +2917,7 @@ def _public_model_entry(model: dict) -> dict:
         # tell "created today" apart from "unknown".
         "created": created or int(time.time()),
         "created_at": created,
-        "owned_by": model.get("organization", "lmarena"),
+        "owned_by": model.get("organization") or "lmarena",
         "capabilities": (
             model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
         ),
@@ -2919,7 +2935,7 @@ async def ollama_tags(api_key: dict = Depends(rate_limit_api_key)):
         for m in models
         if isinstance(m, dict)
         and _model_has_supported_output(m)
-        and m.get("organization")
+        and (m.get("organization") or _stealth_model_allowed(m.get("publicName")))
     ]
     
     ollama_models = [
@@ -2948,8 +2964,10 @@ async def list_models(api_key: dict = Depends(rate_limit_api_key)):
     try:
         models = get_models()
         
-        # Filter for models with text OR search OR image output capability and an organization (exclude stealth models)
-        # Always include image models - no special key needed
+        # Keep every row whose output we can serve.  `userSelectable: false` rows
+        # are battle-only -- Arena itself rejects them with "not available for
+        # user selection" -- so they stay hidden.  Rows with no `organization`
+        # are gray-test checkpoints and are listed unless disabled by env.
         valid_models = [
             m
             for m in models
@@ -2958,7 +2976,7 @@ async def list_models(api_key: dict = Depends(rate_limit_api_key)):
             and m.get("userSelectable") is not False
             and (
                 m.get("organization")
-                or m.get("publicName") in ALLOWED_STEALTH_IMAGE_MODELS
+                or _stealth_model_allowed(m.get("publicName"))
             )
         ]
         
@@ -3095,9 +3113,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 detail=f"Model '{model_public_name}' not found. Use /api/v1/models to see available models."
             )
         
-        # Check if model is a stealth model (no organization), except for
-        # Arena experimental image checkpoints explicitly enabled by config.
-        if not model_org and model_public_name not in ALLOWED_STEALTH_IMAGE_MODELS:
+        # Gray-test rows ship without an `organization`.  They generate fine, so
+        # they pass unless the deployment turned LM_BRIDGE_ALLOW_STEALTH_MODELS off.
+        if not model_org and not _stealth_model_allowed(model_public_name):
             debug_print(f"❌ Model '{model_public_name}' is a stealth model (no organization)")
             raise HTTPException(
                 status_code=403,

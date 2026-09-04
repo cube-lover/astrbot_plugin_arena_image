@@ -64,6 +64,11 @@ services:
     ports:
       - "6081:6081"
       - "127.0.0.1:6082:6080"
+      # Loopback only, never 0.0.0.0: CDP is unauthenticated remote control of a
+      # logged-in browser.  Published so an AstrBot installed on the host (not in
+      # Docker) can still use direct mode; containers on another network should
+      # be attached with `docker network connect` instead.
+      - "127.0.0.1:9223:9223"
     networks:
       - astrbot-network
     shm_size: "1gb"

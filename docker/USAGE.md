@@ -270,7 +270,7 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 | `transport_mode` | `direct` ← 只有这一项是必填 |
 | `browser_gateway_url` | 一般不用填。`setup.sh` 会把 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 写进 `arena-browser-data/gateway-url.txt`，插件自己读；老部署没有这个文件时才填 `http://服务器IP:6081` |
 | `interactive_link_secret` | 不用填。插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关用的是同一个文件，永远不会不一致 |
-| `browser_cdp_url` | 不用填，默认 `http://arena-browser:9223`；AstrBot 不在同一个 Docker 网络时才改 |
+| `browser_cdp_url` | 不用填，默认 `http://arena-browser:9223`。连不上时插件会自己试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`；AstrBot 在另一个 Docker 网络时按下面第十一节接一下网络，也可以在这里填一个能通的地址 |
 | `browser_vnc_url` | 可选。填了它也能推出 `:6081` 网关地址，并在拿不到密钥时作为兜底链接 |
 | `interactive_link_ttl` | 验证链接有效期，默认 `900` 秒 |
 | `allow_stealth_models` | 放行灰测模型，默认开启（bridge 模式下由 `.env` 控制） |
@@ -420,11 +420,14 @@ Cookie 会自动保存。后续 Cookie 失效时执行：
 | 8000 | `127.0.0.1` | Bridge API |
 | 6081 | `0.0.0.0` | 短时验证链接网关，同时代理 noVNC 页面和 WebSocket |
 | 6082 | `127.0.0.1` | noVNC |
-| 9223 | Docker 内网 | CDP 代理 |
+| 9223 | Docker 内网 + `127.0.0.1` | CDP 代理（direct 模式用） |
 
 安全建议：
 
 - 不要把 `8000` 直接暴露公网
+- **`9223` 绝对不要绑到 `0.0.0.0`**：CDP 是对一个已登录 Arena 的浏览器的无认证远程控制，
+  拿到它等于拿到账号。默认只绑 `127.0.0.1`，是给「AstrBot 直接装在宿主机、不在 Docker 里」
+  的情况用的；容器之间请用 `docker network connect`，不要靠开放端口
 - 正常情况下只需要开放 `6081`；验证链接会在同端口加载 noVNC 静态资源并代理 WebSocket，不需要开放 `6082`
 - 如需远程访问管理页面，用 SSH 隧道：
 
@@ -619,6 +622,34 @@ docker exec astrbot python3 -c "import urllib.request,json;print(json.load(urlli
 ```
 
 任何时候都可以把 `transport_mode` 改回 `bridge` 恢复原来的链路。
+
+### 11. AstrBot 和 arena-browser 不在同一个 Docker 网络
+
+`arena-browser` 这个名字只在同网络的容器里能解析。AstrBot 是另一个 compose 项目、
+后装的、或者干脆装在宿主机上时，名字就解析不出来。
+
+插件会自己兜一层：配置地址连不上时，它会依次试 `host.docker.internal`、`172.17.0.1`、
+`127.0.0.1`（端口和路径沿用你填的），试通了就记住 10 分钟。所以 **AstrBot 装在宿主机**
+的情况不用管，`9223` 已经绑了 `127.0.0.1`。
+
+**AstrBot 在另一个 Docker 网络**里则跨不过去（Docker 默认禁止不同网络互通），报错会直接
+给出这一行，跑完不用重启任何容器，NapCat 登录态也不受影响：
+
+```bash
+docker network connect $(docker inspect arena-browser \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+  | awk '{print $1}') astrbot
+```
+
+想一劳永逸就改 `.env` 里的 `ASTRBOT_NETWORK` 成 AstrBot 实际所在的网络，再 `up -d`。
+查实际网络：
+
+```bash
+docker inspect astrbot --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}'
+```
+
+`setup.sh` 现在直接问 AstrBot 容器自己在哪个网络（以前是按网络名猜），并在两者不一致时
+把上面那行命令打出来。
 
 ---
 

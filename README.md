@@ -197,7 +197,7 @@ bridge_api_key = 留空
 | `transport_mode` | `bridge` | `bridge` = 走 arena-bridge 容器；`direct` = 插件直连 arena-browser，不需要 bridge |
 | `bridge_url` | `http://arena-bridge:8000` | Bridge 根地址或 `/api/v1` 地址（bridge 模式） |
 | `bridge_api_key` | 空 | Bridge API Key，零配置部署留空 |
-| `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改） |
+| `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改；连不上时自动改试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`） |
 | `browser_gateway_url` | 空 | 验证链接网关；留空时插件读 `arena-browser-data/gateway-url.txt`（`setup.sh` 写入），老部署才需要手填 `http://服务器IP:6081` |
 | `interactive_link_secret` | 空 | 留空即可：插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关校验用的是同一个文件 |
 | `interactive_link_ttl` | 900 | 验证链接有效期（秒，direct 模式） |
@@ -320,6 +320,18 @@ docker inspect arena-bridge --format '{{json .NetworkSettings.Networks}}'
 ```text
 http://arena-bridge:8000
 ```
+
+不在同一个网络时，把 AstrBot 接进去就行，跑完不用重启任何容器（NapCat 登录态不受影响）：
+
+```bash
+docker network connect $(docker inspect arena-browser \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+  | awk '{print $1}') astrbot
+```
+
+direct 模式连不上 `arena-browser` 时插件会自己试 `host.docker.internal`、`172.17.0.1`、
+`127.0.0.1`（`9223` 已绑定宿主机 `127.0.0.1`，所以 AstrBot 装在宿主机上也能用），
+全试不通才报错，并把上面那行命令一起给出来。
 
 ### 提示 Cookie 失效
 

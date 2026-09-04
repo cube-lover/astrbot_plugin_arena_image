@@ -28,12 +28,39 @@ detect_public_ip() {
   return 1
 }
 
+astrbot_container() {
+  # Exact name first; a NapCat container also matches "astrbot" on some setups.
+  if docker inspect astrbot >/dev/null 2>&1; then
+    echo astrbot
+    return 0
+  fi
+  local name
+  name=$(docker ps --format '{{.Names}}' 2>/dev/null \
+    | grep -i astrbot | grep -viE 'napcat|arena' | head -1)
+  [[ -n "$name" ]] && echo "$name"
+}
+
 detect_network() {
+  # Ask the AstrBot container which networks it is on.  Guessing by network name
+  # picks the wrong one whenever an unrelated astrbot_default network exists.
+  local container nets
+  container=$(astrbot_container)
+  if [[ -n "$container" ]]; then
+    nets=$(docker inspect "$container" \
+      --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}
+{{end}}' 2>/dev/null | grep -vE '^(bridge|host|none)$' | grep -c . || true)
+    if [[ "$nets" -ge 1 ]]; then
+      docker inspect "$container" \
+        --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}
+{{end}}' 2>/dev/null | grep -vE '^(bridge|host|none)$' | head -1
+      return 0
+    fi
+  fi
   if docker network inspect astrbot_default >/dev/null 2>&1; then
     echo "astrbot_default"
     return 0
   fi
-  local nets count
+  local count
   nets=$(docker network ls --filter type=custom --format '{{.Name}}' 2>/dev/null \
     | grep -vE '^(bridge|host|none)$' || true)
   count=$(printf '%s' "$nets" | grep -c . || true)
@@ -97,6 +124,24 @@ if grep -qE '^ASTRBOT_NETWORK=astrbot_default$' .env; then
   fi
 else
   info "Docker 网络已配置，跳过检测"
+fi
+
+# ---------- 4.0 配置的网络和 AstrBot 实际所在网络一致吗 ----------
+# 不一致时插件连不上 arena-browser，画图会直接失败，所以宁可现在啰嗦一句。
+CONFIGURED_NET="$(sed -n 's/^ASTRBOT_NETWORK=//p' .env | tail -1 | tr -d '\r')"
+ASTRBOT_C="$(astrbot_container)"
+if [[ -n "$CONFIGURED_NET" && -n "$ASTRBOT_C" ]]; then
+  if docker inspect "$ASTRBOT_C" \
+       --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}
+{{end}}' 2>/dev/null | grep -qx "$CONFIGURED_NET"; then
+    info "AstrBot（${ASTRBOT_C}）确认在 ${CONFIGURED_NET} 网络上"
+  else
+    warn "AstrBot（${ASTRBOT_C}）不在 ${CONFIGURED_NET} 网络上，插件会连不上 arena-browser"
+    echo "启动容器后跑这一行接进去即可，不用重启任何容器："
+    echo "  docker network connect ${CONFIGURED_NET} ${ASTRBOT_C}"
+  fi
+elif [[ -z "$ASTRBOT_C" ]]; then
+  info "没找到运行中的 AstrBot 容器（还没装或不在 Docker 里都正常），跳过网络核对"
 fi
 
 # ---------- 4.1 兼容旧版 .env ----------

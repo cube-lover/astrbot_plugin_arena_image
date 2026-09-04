@@ -165,6 +165,9 @@ class DirectTransportCase(unittest.TestCase):
         arena_direct._SESSIONS.clear()
         arena_direct._HEALTH = {"models": {}, "variants": {}}
         arena_direct._HEALTH_PATH = None
+        arena_direct._LINK_SECRETS.clear()
+        arena_direct._GATEWAY_URLS.clear()
+        arena_direct._CDP_ENDPOINTS.clear()
 
     def run_async(self, coro):
         return asyncio.run(coro)
@@ -991,6 +994,103 @@ class ZeroConfigDirectTests(DirectTransportCase):
         self.run_async(client.start_interactive_auth())
         self.run_async(client.start_interactive_auth())
         self.assertEqual(fake.created.count(self.GATEWAY_FILE), 1)
+
+
+class ForeignNetworkTests(DirectTransportCase):
+    """AstrBot deployed outside the compose project, so `arena-browser` is unknown.
+
+    The container name only resolves for containers sharing the network.  Rather
+    than turning that into a configuration question, an endpoint that does not
+    answer is retried against the addresses the same host answers on.
+    """
+
+    WS = "ws://127.0.0.1:9223/devtools/browser/abc"
+
+    def _reachable(self, *endpoints: str) -> list[str]:
+        """Patch the probe so only `endpoints` answer; returns the probe log."""
+        seen: list[str] = []
+        allowed = set(endpoints)
+
+        async def _probe(endpoint, *, timeout=arena_direct.CDP_PROBE_TIMEOUT):
+            seen.append(endpoint)
+            assert timeout > 0
+            if endpoint in allowed:
+                return {"webSocketDebuggerUrl": self.WS, "Browser": "Chrome/140"}
+            return {}
+
+        self._patch(arena_direct, "probe_cdp_endpoint", _probe)
+        return seen
+
+    def test_candidates_keep_the_scheme_port_and_path(self) -> None:
+        self.assertEqual(
+            arena_direct.cdp_fallback_endpoints("http://arena-browser:9223"),
+            [
+                "http://host.docker.internal:9223",
+                "http://172.17.0.1:9223",
+                "http://127.0.0.1:9223",
+            ],
+        )
+        self.assertEqual(
+            arena_direct.cdp_fallback_endpoints("https://arena-browser:9999/cdp"),
+            [
+                "https://host.docker.internal:9999/cdp",
+                "https://172.17.0.1:9999/cdp",
+                "https://127.0.0.1:9999/cdp",
+            ],
+        )
+
+    def test_an_address_the_operator_typed_is_never_second_guessed(self) -> None:
+        # A deliberate IP that is down means "that box is down", not "try another".
+        self.assertEqual(arena_direct.cdp_fallback_endpoints("http://10.0.0.9:9223"), [])
+        self.assertEqual(arena_direct.cdp_fallback_endpoints("http://127.0.0.1:9223"), [])
+        self.assertEqual(arena_direct.cdp_fallback_endpoints(""), [])
+
+    def test_a_working_address_is_never_slowed_down_by_probing_others(self) -> None:
+        seen = self._reachable("http://arena-browser:9223")
+        socket = arena_direct.CDPWebSocket("http://arena-browser:9223")
+        self.assertEqual(self.run_async(socket._websocket_url()), self.WS)
+        self.assertEqual(seen, ["http://arena-browser:9223"])
+
+    def test_loopback_is_found_when_the_container_name_does_not_resolve(self) -> None:
+        seen = self._reachable("http://127.0.0.1:9223")
+        socket = arena_direct.CDPWebSocket("http://arena-browser:9223")
+        self.assertEqual(self.run_async(socket._websocket_url()), self.WS)
+        # The reachable address replaces the configured one for this socket, so
+        # the loopback-host rewrite in `connect` points at something reachable.
+        self.assertEqual(socket.endpoint, "http://127.0.0.1:9223")
+        self.assertIn("http://host.docker.internal:9223", seen)
+
+    def test_the_discovery_is_cached_so_later_commands_go_straight_there(self) -> None:
+        seen = self._reachable("http://172.17.0.1:9223")
+        first = arena_direct.CDPWebSocket("http://arena-browser:9223")
+        self.run_async(first._websocket_url())
+        second = arena_direct.CDPWebSocket("http://arena-browser:9223")
+        seen.clear()
+        self.assertEqual(self.run_async(second._websocket_url()), self.WS)
+        self.assertEqual(seen, ["http://172.17.0.1:9223"])
+
+    def test_nothing_reachable_names_the_one_command_that_fixes_it(self) -> None:
+        self._reachable()
+        socket = arena_direct.CDPWebSocket("http://arena-browser:9223")
+        with self.assertRaises(bridge_client.BridgeError) as ctx:
+            self.run_async(socket._websocket_url())
+        message = str(ctx.exception)
+        self.assertIn("docker network connect", message)
+        self.assertIn("astrbot", message)
+        self.assertIn("docker ps", message)
+        # A stale cache entry must not survive a total outage.
+        self.assertEqual(arena_direct._CDP_ENDPOINTS, {})
+
+    def test_a_stale_cache_entry_falls_back_to_the_configured_address(self) -> None:
+        arena_direct._CDP_ENDPOINTS["http://arena-browser:9223"] = (
+            "http://127.0.0.1:9223",
+            time.time(),
+        )
+        seen = self._reachable("http://arena-browser:9223")
+        socket = arena_direct.CDPWebSocket("http://arena-browser:9223")
+        self.assertEqual(self.run_async(socket._websocket_url()), self.WS)
+        self.assertEqual(seen[0], "http://127.0.0.1:9223")
+        self.assertIn("http://arena-browser:9223", seen)
 
 
 if __name__ == "__main__":  # pragma: no cover

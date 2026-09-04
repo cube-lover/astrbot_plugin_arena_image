@@ -68,6 +68,28 @@ GATEWAY_DEFAULT_PORT = 6081
 LINK_SECRET_CACHE_SECONDS = 3600.0
 _LINK_SECRET_RE = re.compile(r"^[0-9A-Za-z._\-]{16,256}$")
 
+# ``arena-browser`` only resolves for containers sharing the compose network.
+# AstrBot is often installed separately -- another compose project, another
+# network, or straight onto the host -- and then the container name resolves to
+# nothing.  Rather than making that a configuration question, an unreachable
+# endpoint is retried against the addresses the same box would answer on.
+# Probed only after the configured address has already failed, so a normal
+# deployment never pays for this.
+CDP_FALLBACK_HOSTS = ("host.docker.internal", "172.17.0.1", "127.0.0.1")
+CDP_PROBE_TIMEOUT = 4.0
+CDP_ENDPOINT_CACHE_SECONDS = 600.0
+_CDP_ENDPOINTS: dict[str, tuple[str, float]] = {}
+
+# Printed instead of "is arena-browser running?" when nothing answers: it works
+# out the network name itself, attaches the running AstrBot container to it, and
+# needs no restart, so a beginner can paste it without reading anything first.
+CDP_NETWORK_HINT = (
+    "docker network connect "
+    "$(docker inspect arena-browser "
+    "--format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "
+    "| awk '{print $1}') astrbot"
+)
+
 # Chrome splits a cookie larger than ~4 KB into ``<name>.0``, ``<name>.1`` ...
 # The bare name is then *absent* from the browser, so any exact-name lookup
 # reports "not logged in", the request is signed with the ``sign_up`` reCAPTCHA
@@ -436,6 +458,45 @@ def looks_like_link_secret(value: str) -> bool:
     return bool(_LINK_SECRET_RE.fullmatch(text))
 
 
+def cdp_fallback_endpoints(endpoint: str) -> list[str]:
+    """Addresses to try when ``endpoint`` itself does not answer.
+
+    Keeps the configured scheme, port and path and only swaps the host, so a
+    deployment that moved the CDP proxy to another port still gets sensible
+    candidates.  Hosts that already look like an address rather than a container
+    name are left alone: if the operator typed an IP and it is down, guessing a
+    different machine would be wrong.
+    """
+    text = str(endpoint or "").strip().rstrip("/")
+    if not text:
+        return []
+    parts = urlsplit(text if "//" in text else f"http://{text}")
+    host = (parts.hostname or "").strip()
+    if not host or host in CDP_FALLBACK_HOSTS:
+        return []
+    # A dotted or bracketed address is a deliberate choice, not a container name.
+    if host.replace(".", "").isdigit() or ":" in host or host.startswith("["):
+        return []
+    port = f":{parts.port}" if parts.port else ""
+    tail = parts.path.rstrip("/")
+    scheme = parts.scheme or "http"
+    return [f"{scheme}://{candidate}{port}{tail}" for candidate in CDP_FALLBACK_HOSTS]
+
+
+async def probe_cdp_endpoint(endpoint: str, *, timeout: float = CDP_PROBE_TIMEOUT) -> dict[str, Any]:
+    """Return ``/json/version`` for ``endpoint``, or ``{}`` if it does not answer."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{endpoint}/json/version", headers={"Accept": "application/json"}
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 # --- CDP transport -----------------------------------------------------------
 
 
@@ -467,20 +528,43 @@ class CDPWebSocket:
             return self.endpoint
         if parts.scheme not in {"http", "https"}:
             raise _err("服务器浏览器 CDP 地址格式无效", code="browser_unavailable")
-        try:
-            async with httpx.AsyncClient(timeout=min(30.0, self.timeout)) as client:
-                response = await client.get(
-                    f"{self.endpoint}/json/version",
-                    headers={"Accept": "application/json"},
-                )
-                response.raise_for_status()
-                version = response.json()
-        except Exception as exc:
+
+        configured = self.endpoint
+        # A previous command already found which address answers on this box.
+        cached, found_at = _CDP_ENDPOINTS.get(configured, ("", 0.0))
+        if cached and time.time() - found_at < CDP_ENDPOINT_CACHE_SECONDS:
+            self.endpoint = cached
+
+        version = await probe_cdp_endpoint(self.endpoint, timeout=min(30.0, self.timeout))
+        if not version:
+            # The configured address goes first when a cached one was tried and
+            # has since gone stale: a container rename or a network change must
+            # not pin the plugin to an address that no longer answers.
+            candidates = [configured] if self.endpoint != configured else []
+            candidates += [
+                candidate
+                for candidate in cdp_fallback_endpoints(configured)
+                if candidate != self.endpoint
+            ]
+            for candidate in candidates:
+                version = await probe_cdp_endpoint(candidate)
+                if version:
+                    self.endpoint = candidate
+                    if candidate == configured:
+                        _CDP_ENDPOINTS.pop(configured, None)
+                    else:
+                        _CDP_ENDPOINTS[configured] = (candidate, time.time())
+                    break
+        if not version:
+            _CDP_ENDPOINTS.pop(configured, None)
             raise _err(
-                "服务器浏览器 CDP 接口不可用（arena-browser 未启动？）",
+                "连不上服务器浏览器（arena-browser 没启动，或者 AstrBot 和它不在同一个"
+                " Docker 网络）。先看容器在不在：docker ps | grep arena-browser；"
+                "在的话把 AstrBot 接进同一个网络，不用重启任何容器：\n"
+                f"{CDP_NETWORK_HINT}",
                 code="browser_unavailable",
-            ) from exc
-        url = str((version or {}).get("webSocketDebuggerUrl") or "").strip()
+            )
+        url = str(version.get("webSocketDebuggerUrl") or "").strip()
         if not url:
             raise _err("服务器浏览器未返回 CDP WebSocket 地址", code="browser_unavailable")
         return url

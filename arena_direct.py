@@ -114,6 +114,12 @@ UPLOAD_CACHE_LIMIT = 200
 MODEL_HEALTH_TTL_SECONDS = 6 * 60 * 60
 MODEL_VARIANT_FAILURE_TTL_SECONDS = 10 * 60
 
+# How long to let the page rotate a stale access token before giving up.  The
+# rotation is a single same-origin GET plus Supabase's own timer, so it lands in
+# well under a second when it lands at all; the budget only covers a slow page.
+SESSION_REFRESH_BUDGET_SECONDS = 8.0
+SESSION_REFRESH_POLL_SECONDS = 0.6
+
 _NEXT_ACTION_RE = (
     r'\(0,[a-zA-Z_$][\w$]*\.createServerReference\)\(["\']([\w\d]*?)["\'],'
     r'[a-zA-Z_$][\w$]*\.callServer,void 0,[a-zA-Z_$][\w$]*\.findSourceMapURL,'
@@ -317,6 +323,35 @@ def session_is_logged_in(token: str) -> bool:
         if str(item or "").strip():
             return True
     return False
+
+
+def session_can_refresh(token: str) -> bool:
+    """Whether an expired session is merely stale rather than logged out.
+
+    Arena's access token lives about an hour; the refresh token beside it lives
+    for weeks.  A browser left idle overnight therefore holds an *expired*
+    access token belonging to a *still valid* login, and the page rotates it by
+    itself on the next request.  Treating that as "Cookie 失效，请重新绑定" is
+    the single most annoying way this plugin can be wrong, so the recoverable
+    case is detected explicitly instead of being lumped in with a real logout.
+    """
+    envelope = _decode_session_envelope(token)
+    if not isinstance(envelope, dict):
+        return False
+    if not str(envelope.get("refresh_token") or "").strip():
+        return False
+    access = str(envelope.get("access_token") or "").strip()
+    if access.count(".") < 2:
+        return False
+    jwt = _decode_jwt_payload(access) or {}
+    user = envelope.get("user") if isinstance(envelope.get("user"), dict) else {}
+    if _flag_is_true(jwt.get("is_anonymous")) or _flag_is_true(user.get("is_anonymous")):
+        return False
+    # An anonymous Supabase session also carries a refresh token, so the login
+    # itself has to be evidenced: a role or an address, not just the shape.
+    if str(jwt.get("role") or "").strip().casefold() == "authenticated":
+        return True
+    return bool(str(jwt.get("email") or user.get("email") or "").strip())
 
 
 def combine_auth_cookie(cookies: Any) -> str:
@@ -882,6 +917,22 @@ _SITEKEY_JS = """
 })()
 """
 
+_SESSION_WAKE_JS = """
+(async () => {
+  const out = {visible: document.visibilityState, status: 0};
+  try {
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+  } catch (e) {}
+  try {
+    const r = await fetch('%(path)s', {credentials: 'include', cache: 'no-store'});
+    out.status = r.status;
+    await r.text();
+  } catch (e) { out.error = String(e); }
+  return out;
+})()
+"""
+
 _NEXT_ACTION_JS = """
 (async () => {
   const found = {};
@@ -1132,10 +1183,18 @@ def _health_snapshot() -> dict[str, Any]:
 class ArenaPage:
     """One attached Arena tab plus the handful of operations the plugin needs."""
 
-    def __init__(self, cdp: CDPWebSocket, session_id: str, url: str) -> None:
+    def __init__(
+        self,
+        cdp: CDPWebSocket,
+        session_id: str,
+        url: str,
+        *,
+        target_id: str = "",
+    ) -> None:
         self.cdp = cdp
         self.session_id = session_id
         self.url = url
+        self.target_id = target_id
         self._cookies: list[dict[str, Any]] | None = None
 
     async def evaluate(self, expression: str, *, timeout: float | None = None) -> Any:
@@ -1165,6 +1224,37 @@ class ArenaPage:
     async def auth_token(self, *, refresh: bool = False) -> str:
         """The live session token, reassembled from Chrome's cookie chunks."""
         return combine_auth_cookie(await self.cookies(refresh=refresh))
+
+    async def refresh_session(
+        self,
+        *,
+        budget: float = SESSION_REFRESH_BUDGET_SECONDS,
+    ) -> str:
+        """Let the page rotate a stale access token, then re-read the cookie.
+
+        Three nudges, cheapest first, because which one does the work depends on
+        the deploy: activating the tab restarts Supabase's own refresh timer
+        (it stops while the tab is hidden), the visibility/focus events make an
+        already-foreground tab recover immediately, and the same-origin GET goes
+        through Arena's SSR middleware, which rotates the cookie server-side.
+        None of them touches what the operator sees, and all of them are
+        idempotent -- the loop below is what decides whether they worked.
+        """
+        if self.target_id:
+            with contextlib.suppress(CDPError):
+                await self.cdp.command(
+                    "Target.activateTarget", {"targetId": self.target_id}, timeout=15.0
+                )
+        with contextlib.suppress(CDPError):
+            await self.evaluate(
+                _SESSION_WAKE_JS % {"path": ARENA_PAGE_PATH}, timeout=30.0
+            )
+        deadline = time.monotonic() + max(0.0, float(budget))
+        token = combine_auth_cookie(await self.cookies(refresh=True))
+        while session_is_expired(token) and time.monotonic() < deadline:
+            await asyncio.sleep(SESSION_REFRESH_POLL_SECONDS)
+            token = combine_auth_cookie(await self.cookies(refresh=True))
+        return token
 
     async def sitekey(self) -> str:
         try:
@@ -1277,7 +1367,12 @@ async def open_page(cdp_url: str, *, timeout: float = 30.0, browser_url: str = "
                 browser_url=browser_url,
             )
         try:
-            yield ArenaPage(cdp, session_id, str(chosen.get("url") or ""))
+            yield ArenaPage(
+                cdp,
+                session_id,
+                str(chosen.get("url") or ""),
+                target_id=str(chosen.get("targetId") or ""),
+            )
         except CDPError as exc:
             # Everything above this module speaks ``BridgeError``, so a CDP
             # transport failure is translated once, here, instead of leaking a
@@ -1447,6 +1542,20 @@ async def _live_state(page: ArenaPage) -> dict[str, Any]:
     """Classify the browser's *current* session without storing any cookie."""
     cookies = await page.cookies(refresh=True)
     token = combine_auth_cookie(cookies)
+    refreshed = False
+    # A token that expired while the tab sat idle is not a logout: the refresh
+    # token beside it is still good, and the page rotates it on the next
+    # request.  Rotate it here, before judging, so the first command after a
+    # quiet night does not answer "Cookie 失效，请重新绑定" about a login that
+    # is perfectly fine.
+    if token and session_is_expired(token) and session_can_refresh(token):
+        rotated = await page.refresh_session()
+        if rotated and not session_is_expired(rotated):
+            token = rotated
+            refreshed = True
+            cookies = await page.cookies()
+        elif rotated:
+            token = rotated
     plausible = session_is_plausible(token)
     expired = bool(token) and session_is_expired(token)
     logged_in = bool(token) and session_is_logged_in(token) and not expired
@@ -1458,6 +1567,8 @@ async def _live_state(page: ArenaPage) -> dict[str, Any]:
         "has_logged_in": logged_in,
         "session_logged_in": logged_in,
         "session_expired": expired,
+        "session_refreshed": refreshed,
+        "session_refreshable": bool(token) and expired and session_can_refresh(token),
         "session_source": "live-browser" if token else "",
         "session_expires_in": (
             max(0, int(expiry - time.time())) if isinstance(expiry, int) else None
@@ -1718,13 +1829,17 @@ class ArenaDirectClient:
                     "has_logged_in",
                     "session_source",
                     "session_expires_in",
+                    "session_refreshed",
+                    "session_refreshable",
                     "recaptcha_action",
                 )
             }
         )
         if not healthy:
             payload["message"] = (
-                "服务器浏览器可用，但 Arena 还是匿名会话，请私聊运行 /竞技场验证 后登录账号。"
+                "登录还在，但访问令牌过期了、这次没能自动续期，稍后再试一次即可。"
+                if state.get("session_refreshable")
+                else "服务器浏览器可用，但 Arena 还是匿名会话，请私聊运行 /竞技场验证 后登录账号。"
             )
         return payload
 
@@ -1802,6 +1917,8 @@ class ArenaDirectClient:
             return "服务器浏览器已登录 Arena，可以直接画图。"
         if status == "expired":
             return "验证链接已过期，请重新运行 /竞技场验证 获取新链接。"
+        if state.get("session_refreshable"):
+            return "登录还在，只是访问令牌过期了，稍等一会儿或再发一次命令就会自动续期。"
         if state.get("has_arena_auth") and not state.get("has_logged_in"):
             return "已拿到 Arena 会话，但仍是匿名状态，请在服务器浏览器里登录账号。"
         return "请打开验证链接，在服务器浏览器里完成 Cloudflare 验证并登录 Arena 账号。"
@@ -1830,7 +1947,14 @@ class ArenaDirectClient:
             state = None
             if session:
                 with contextlib.suppress(CDPError):
-                    state = await _live_state(ArenaPage(cdp, session, target["url"]))
+                    state = await _live_state(
+                        ArenaPage(
+                            cdp,
+                            session,
+                            target["url"],
+                            target_id=str(target.get("target_id") or ""),
+                        )
+                    )
         if not link:
             if self._mint_failure == "secret":
                 raise _err(
@@ -2076,6 +2200,13 @@ class ArenaDirectClient:
         that is sitting right there, merely stale.
         """
         if state.get("session_expired"):
+            if state.get("session_refreshable"):
+                raise _err(
+                    "登录还在，但访问令牌过期了，自动续期这次没成功。\n"
+                    "过十几秒再发一次命令通常就好了；一直这样再运行 /竞技场重新绑定。",
+                    code="arena_auth_stale",
+                    browser_url=browser_url,
+                )
             raise _err(
                 "服务器浏览器里的 Arena 会话已过期（arena-auth 已失效）。\n"
                 "请管理员私聊运行 /竞技场重新绑定 后重新登录。",

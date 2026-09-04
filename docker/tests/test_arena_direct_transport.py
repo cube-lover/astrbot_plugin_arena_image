@@ -35,7 +35,9 @@ def _jwt(payload: dict) -> str:
     return f"{_segment({'alg': 'HS256', 'typ': 'JWT'})}.{_segment(payload)}.{'s' * 43}"
 
 
-def _session_token(*, expires_in: int = 3600, anonymous: bool = False) -> str:
+def _session_token(
+    *, expires_in: int = 3600, anonymous: bool = False, refresh: bool = True
+) -> str:
     """A realistic ``base64-<json>`` Supabase envelope, signed-in or anonymous."""
     expiry = int(time.time()) + int(expires_in)
     claims: dict = {"exp": expiry, "is_anonymous": anonymous}
@@ -46,10 +48,11 @@ def _session_token(*, expires_in: int = 3600, anonymous: bool = False) -> str:
         user["email"] = "operator@example.com"
     envelope = {
         "access_token": _jwt(claims),
-        "refresh_token": "r" * 32,
         "expires_at": expiry,
         "user": user,
     }
+    if refresh:
+        envelope["refresh_token"] = "r" * 32
     body = base64.b64encode(
         json.dumps(envelope, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
@@ -105,19 +108,31 @@ class FakePage:
         models: list[dict] | None = None,
         response: dict | None = None,
         url: str = "https://arena.ai/text/direct",
+        refreshed_cookies: list[dict] | None = None,
     ) -> None:
         self.url = url
         self._cookies = list(cookies or [])
+        self._refreshed_cookies = (
+            None if refreshed_cookies is None else list(refreshed_cookies)
+        )
         self._models = list(models or [])
         self._response = response or {"status": 200, "headers": {}, "text": ""}
         self.actions: list[str] = []
         self.requests: list[dict] = []
         self.cookie_reads: list[bool] = []
         self.table_reads = 0
+        self.refresh_calls = 0
 
     async def cookies(self, *, refresh: bool = False) -> list[dict]:
         self.cookie_reads.append(bool(refresh))
         return list(self._cookies)
+
+    async def refresh_session(self, *, budget: float | None = None) -> str:
+        """Rotate to ``refreshed_cookies`` if the test supplied any."""
+        self.refresh_calls += 1
+        if self._refreshed_cookies is not None:
+            self._cookies = list(self._refreshed_cookies)
+        return arena_direct.combine_auth_cookie(self._cookies)
 
     async def auth_token(self, *, refresh: bool = False) -> str:
         self.cookie_reads.append(bool(refresh))
@@ -444,7 +459,8 @@ class SessionGateTests(DirectTransportCase):
     def test_expired_cookie_says_expired_not_missing(self) -> None:
         # An expired token is not "plausible", so the missing-cookie branch would
         # blame a cookie that is present -- the wording operators complained about.
-        cookies = _chunked_cookies(_session_token(expires_in=-600))
+        # No refresh token means the login really is gone, not merely stale.
+        cookies = _chunked_cookies(_session_token(expires_in=-600, refresh=False))
         self.assertEqual(self._code_for(cookies), "arena_auth_expired")
 
     def test_anonymous_session_says_login_required(self) -> None:
@@ -468,6 +484,245 @@ class SessionGateTests(DirectTransportCase):
         anonymous = _chunked_cookies(_session_token(anonymous=True))
         degraded = self.run_async(self.client(FakePage(cookies=anonymous)).health())
         self.assertEqual(degraded["status"], "degraded")
+
+
+class StaleSessionTests(DirectTransportCase):
+    """An hour-old access token is not a logout: the page rotates it itself.
+
+    This is the shape of the complaint that keeps coming back -- the browser is
+    still signed in, only the short-lived access token lapsed while the tab sat
+    idle, and reporting "Cookie 失效，请重新绑定" sends the operator to redo a
+    login that was never lost.
+    """
+
+    def test_a_stale_token_is_recognised_as_recoverable(self) -> None:
+        stale = _session_token(expires_in=-600)
+        self.assertTrue(arena_direct.session_is_expired(stale))
+        self.assertTrue(arena_direct.session_can_refresh(stale))
+
+    def test_a_logged_out_session_is_not_recoverable(self) -> None:
+        # No refresh token beside the expired one: nothing to rotate with.
+        self.assertFalse(
+            arena_direct.session_can_refresh(
+                _session_token(expires_in=-600, refresh=False)
+            )
+        )
+
+    def test_an_anonymous_session_is_not_recoverable(self) -> None:
+        # Anonymous Supabase sessions carry a refresh token too, so the shape
+        # alone must not be mistaken for a login.
+        self.assertFalse(
+            arena_direct.session_can_refresh(
+                _session_token(expires_in=-600, anonymous=True)
+            )
+        )
+
+    def test_a_missing_or_opaque_token_is_not_recoverable(self) -> None:
+        for value in ("", "not-a-token", "base64-###"):
+            self.assertFalse(arena_direct.session_can_refresh(value))
+
+    def test_live_state_rotates_a_stale_token_before_judging(self) -> None:
+        page = FakePage(
+            cookies=_chunked_cookies(_session_token(expires_in=-600)),
+            refreshed_cookies=_chunked_cookies(_session_token(expires_in=3600)),
+        )
+        state = self.run_async(arena_direct._live_state(page))
+        self.assertEqual(page.refresh_calls, 1)
+        self.assertTrue(state["has_logged_in"])
+        self.assertTrue(state["has_arena_auth"])
+        self.assertTrue(state["session_refreshed"])
+        self.assertFalse(state["session_expired"])
+        self.assertFalse(state["session_refreshable"])
+        self.assertEqual(state["recaptcha_action"], "chat_submit")
+
+    def test_a_fresh_token_is_never_rotated(self) -> None:
+        page = FakePage(cookies=_chunked_cookies(_session_token()))
+        state = self.run_async(arena_direct._live_state(page))
+        self.assertEqual(page.refresh_calls, 0)
+        self.assertFalse(state["session_refreshed"])
+
+    def test_a_logged_out_session_is_never_rotated(self) -> None:
+        page = FakePage(
+            cookies=_chunked_cookies(_session_token(expires_in=-600, refresh=False))
+        )
+        state = self.run_async(arena_direct._live_state(page))
+        self.assertEqual(page.refresh_calls, 0)
+        self.assertTrue(state["session_expired"])
+        self.assertFalse(state["session_refreshable"])
+
+    def test_a_failed_rotation_says_stale_not_logged_out(self) -> None:
+        cookies = _chunked_cookies(_session_token(expires_in=-600))
+        page = FakePage(cookies=cookies)  # refresh keeps returning the stale token
+        state = self.run_async(arena_direct._live_state(page))
+        self.assertEqual(page.refresh_calls, 1)
+        self.assertTrue(state["session_refreshable"])
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.client(page)._require_session(state, "http://HOST:6081/v/token")
+        self.assertEqual(caught.exception.code, "arena_auth_stale")
+        self.assertIn("登录还在", str(caught.exception))
+        self.assertNotIn("重新绑定 后重新登录", str(caught.exception))
+
+    def test_health_explains_a_stale_token_without_crying_logout(self) -> None:
+        cookies = _chunked_cookies(_session_token(expires_in=-600))
+        payload = self.run_async(self.client(FakePage(cookies=cookies)).health())
+        self.assertEqual(payload["status"], "degraded")
+        self.assertTrue(payload["session_refreshable"])
+        self.assertIn("登录还在", payload["message"])
+
+    def test_a_rotated_session_generates_without_a_detour(self) -> None:
+        page = FakePage(
+            cookies=_chunked_cookies(_session_token(expires_in=-600)),
+            refreshed_cookies=_chunked_cookies(_session_token(expires_in=3600)),
+            models=_filler_models()
+            + [_image_model("gpt-image-2 (medium)", _uuid7(time.time() - 60))],
+            response={
+                "status": 200,
+                "headers": {},
+                "text": (
+                    'a2:[{"type":"image","image":"https://cdn.arena.ai/x.png"}]\n'
+                    'ad:{"finishReason":"stop"}'
+                ),
+            },
+        )
+        payload = self.run_async(
+            self.client(page).complete(model="gpt-image-2 (medium)", prompt="cat")
+        )
+        self.assertEqual(bridge_client.image_urls(payload), ["https://cdn.arena.ai/x.png"])
+        # The rotated session must also fix the reCAPTCHA action: minting
+        # `sign_up` on a signed-in account is what Arena answers 403 to.
+        self.assertEqual(page.actions, ["chat_submit"])
+
+
+class StatusWordingTests(unittest.TestCase):
+    """What the operator actually reads in `/竞技场验证状态`."""
+
+    def test_a_stale_token_reads_as_still_logged_in(self) -> None:
+        _main, plugin = _make_plugin(self)
+        text = plugin._format_verification_status(
+            {
+                "status": "waiting",
+                "has_cf_clearance": True,
+                "has_arena_auth": False,
+                "has_logged_in": False,
+                "session_refreshable": True,
+                "session_source": "live-browser",
+            }
+        )
+        self.assertIn("登录还在", text)
+        self.assertIn("令牌待续期", text)
+        self.assertNotIn("匿名无法出图", text)
+
+    def test_a_real_logout_still_says_anonymous(self) -> None:
+        _main, plugin = _make_plugin(self)
+        text = plugin._format_verification_status(
+            {
+                "status": "waiting",
+                "has_cf_clearance": True,
+                "has_arena_auth": True,
+                "has_logged_in": False,
+            }
+        )
+        self.assertIn("匿名", text)
+        self.assertNotIn("登录还在", text)
+
+
+class RotatingCDP:
+    """Just enough CDP for `ArenaPage.refresh_session` to be observable.
+
+    ``reads_until_fresh`` models the real timing: the cookie is rewritten by
+    Chrome a moment *after* the request that triggered the rotation returns, so
+    the first read can still show the stale value.
+    """
+
+    def __init__(self, *, stale: list[dict], fresh: list[dict], reads_until_fresh: int = 1) -> None:
+        self.stale = list(stale)
+        self.fresh = list(fresh)
+        self.reads_until_fresh = int(reads_until_fresh)
+        self.activated: list[str] = []
+        self.expressions: list[str] = []
+        self.cookie_reads = 0
+        self.woken = False
+
+    async def command(self, method, params=None, *, session_id=None, timeout=None):
+        params = dict(params or {})
+        if method == "Target.activateTarget":
+            self.activated.append(str(params.get("targetId") or ""))
+            return {}
+        if method in {"Network.getAllCookies", "Storage.getCookies"}:
+            self.cookie_reads += 1
+            if self.woken and self.cookie_reads > self.reads_until_fresh:
+                return {"cookies": list(self.fresh)}
+            return {"cookies": list(self.stale)}
+        raise arena_direct.CDPError(f"unsupported in the fake: {method}")
+
+    async def evaluate(self, expression, *, session_id: str, timeout=None):
+        self.expressions.append(str(expression))
+        self.woken = True
+        return {"visible": "hidden", "status": 200}
+
+
+class SessionRotationTests(DirectTransportCase):
+    """How `ArenaPage.refresh_session` nudges the page, at the CDP level."""
+
+    def _page(self, cdp: RotatingCDP, *, target_id: str = "arena-1"):
+        return arena_direct.ArenaPage(
+            cdp, "session-1", "https://arena.ai/text/direct", target_id=target_id
+        )
+
+    def _cdp(self, **kwargs) -> RotatingCDP:
+        return RotatingCDP(
+            stale=_chunked_cookies(_session_token(expires_in=-600)),
+            fresh=_chunked_cookies(_session_token(expires_in=3600)),
+            **kwargs,
+        )
+
+    def test_it_activates_the_tab_and_asks_the_page_for_a_rotation(self) -> None:
+        self._patch(arena_direct, "SESSION_REFRESH_POLL_SECONDS", 0.01)
+        cdp = self._cdp()
+        token = self.run_async(self._page(cdp).refresh_session())
+        self.assertEqual(cdp.activated, ["arena-1"])
+        self.assertEqual(len(cdp.expressions), 1)
+        # Activating restarts Supabase's timer; the GET goes through Arena's SSR
+        # middleware.  Both matter, so both are locked.
+        self.assertIn(arena_direct.ARENA_PAGE_PATH, cdp.expressions[0])
+        self.assertIn("credentials", cdp.expressions[0])
+        self.assertIn("visibilitychange", cdp.expressions[0])
+        self.assertFalse(arena_direct.session_is_expired(token))
+
+    def test_it_keeps_polling_until_chrome_has_rewritten_the_cookie(self) -> None:
+        self._patch(arena_direct, "SESSION_REFRESH_POLL_SECONDS", 0.01)
+        cdp = self._cdp(reads_until_fresh=3)
+        token = self.run_async(self._page(cdp).refresh_session())
+        self.assertGreater(cdp.cookie_reads, 3)
+        self.assertFalse(arena_direct.session_is_expired(token))
+
+    def test_it_gives_up_inside_the_budget_instead_of_hanging(self) -> None:
+        self._patch(arena_direct, "SESSION_REFRESH_POLL_SECONDS", 0.01)
+        cdp = self._cdp(reads_until_fresh=10**6)  # never rotates
+        started = time.monotonic()
+        token = self.run_async(self._page(cdp).refresh_session(budget=0.1))
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertTrue(arena_direct.session_is_expired(token))
+
+    def test_a_tab_without_a_known_id_is_still_woken(self) -> None:
+        self._patch(arena_direct, "SESSION_REFRESH_POLL_SECONDS", 0.01)
+        cdp = self._cdp()
+        token = self.run_async(self._page(cdp, target_id="").refresh_session())
+        self.assertEqual(cdp.activated, [])
+        self.assertEqual(len(cdp.expressions), 1)
+        self.assertFalse(arena_direct.session_is_expired(token))
+
+    def test_open_page_hands_over_the_target_id(self) -> None:
+        # Without the id there is nothing to activate, and a hidden tab is
+        # exactly the case that needs activating.
+        cdp = FakeCDP()
+        self._patch(arena_direct, "CDPWebSocket", lambda *_a, **_k: cdp)
+
+        async def _run():
+            async with arena_direct.open_page("http://arena-browser:9223") as page:
+                return page.target_id
+
+        self.assertEqual(self.run_async(_run()), "arena-1")
 
 
 class GenerationTests(DirectTransportCase):

@@ -891,12 +891,12 @@ class SchemaAndMetadataTest(unittest.TestCase):
             self.assertIn(key, schema)
         self.assertIn("输入", schema["max_image_bytes"]["description"])
         metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 0.6.2", metadata)
+        self.assertIn("version: 0.6.3", metadata)
         self.assertIn("author: cube-lover", metadata)
         # The @register version used to drift behind metadata.yaml, which made the
         # AstrBot console show a stale plugin version after an upgrade.
         source = (root / "main.py").read_text(encoding="utf-8")
-        self.assertIn('    "0.6.2",\n)', source)
+        self.assertIn('    "0.6.3",\n)', source)
 
     def test_repository_root_is_the_installable_plugin_directory(self) -> None:
         """AstrBot installs the repo into ``data/plugins/<repo_name>`` and then

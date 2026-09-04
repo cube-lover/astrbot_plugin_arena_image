@@ -179,7 +179,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.6.2",
+    "0.6.3",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -363,6 +363,8 @@ class ArenaImagePlugin(Star):
         logged_in = bool(payload.get("has_logged_in"))
         if status == "verified" or bool(payload.get("verified")):
             headline = "服务器浏览器验证已完成，可以重试画图命令。"
+        elif payload.get("session_refreshable"):
+            headline = "登录还在，只是访问令牌过期了。稍等一会儿或再发一次命令就会自动续期，不用重新登录。"
         elif payload.get("has_cf_clearance") and payload.get("has_arena_auth") and not logged_in:
             headline = "CF 已通过，但仍是匿名会话。请在服务器浏览器里登录 Arena 账号后再查状态。"
         elif status in {"starting", "waiting"}:
@@ -375,8 +377,10 @@ class ArenaImagePlugin(Star):
             headline,
             f"CF Cookie：{'已获取' if payload.get('has_cf_clearance') else '未获取'}",
             f"Arena 会话：{'已获取' if payload.get('has_arena_auth') else '未获取'}",
-            f"账号登录：{'已登录' if logged_in else '未登录（匿名无法出图）'}",
+            f"账号登录：{'已登录' if logged_in else ('登录未失效，令牌待续期' if payload.get('session_refreshable') else '未登录（匿名无法出图）')}",
         ]
+        if payload.get("session_refreshed"):
+            details.append("访问令牌：刚刚自动续期成功")
         source = str(payload.get("session_source") or "").strip()
         if source:
             expires_in = payload.get("session_expires_in")

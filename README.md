@@ -197,9 +197,9 @@ bridge_api_key = 留空
 | `transport_mode` | `bridge` | `bridge` = 走 arena-bridge 容器；`direct` = 插件直连 arena-browser，不需要 bridge |
 | `bridge_url` | `http://arena-bridge:8000` | Bridge 根地址或 `/api/v1` 地址（bridge 模式） |
 | `bridge_api_key` | 空 | Bridge API Key，零配置部署留空 |
-| `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式） |
-| `browser_gateway_url` | 空 | 验证链接网关，同 `.env` 的 `LM_BRIDGE_BROWSER_GATEWAY_URL`（direct 模式） |
-| `interactive_link_secret` | 空 | 验证链接签名密钥，取自 `docker/.interactive-link-secret`（direct 模式） |
+| `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改） |
+| `browser_gateway_url` | 空 | 验证链接网关；留空时插件读 `arena-browser-data/gateway-url.txt`（`setup.sh` 写入），老部署才需要手填 `http://服务器IP:6081` |
+| `interactive_link_secret` | 空 | 留空即可：插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关校验用的是同一个文件 |
 | `interactive_link_ttl` | 900 | 验证链接有效期（秒，direct 模式） |
 | `allow_stealth_models` | 开启 | 放行灰测（隐身）模型（direct 模式；bridge 模式由 `.env` 控制） |
 | `default_model` | `gpt-image-2 (medium)` | 没有切换过模型时使用 |
@@ -225,7 +225,9 @@ Pillow 是 AstrBot 自带的，缺失时只会跳过压缩，不影响画图。
 `transport_mode = direct` 时插件自己完成模型列表、reCAPTCHA、出图、图生图上传和验证链接签名，
 只需要 `arena-browser` 一个容器；Cookie 不再复制到任何配置文件，而是直接用浏览器页面的会话，
 所以 `__cf_bm` / `arena-auth-prod-v1` 轮换时不会再出现「Cookie 失效」。
-想回到原来的链路，把 `transport_mode` 改回 `bridge` 即可，不需要动容器。
+切过去只要把 `transport_mode` 改成 `direct`：网关地址和签名密钥都由插件通过 CDP 从
+`arena-browser` 里读，不用手抄，也就不会抄错或过期。想回到原来的链路，把
+`transport_mode` 改回 `bridge` 即可，不需要动容器。
 详细步骤见 [docker/USAGE.md](docker/USAGE.md) 的「通道模式」一节。
 
 ## 详细文档

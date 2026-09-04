@@ -46,6 +46,28 @@ ARENA_ORIGIN = "https://arena.ai"
 ARENA_PAGE_PATH = "/text/direct"
 STREAM_CREATE_EVALUATION_PATH = "/nextjs-api/stream/create-evaluation"
 
+# The signing key for verification links lives *inside* the browser container:
+# docker-compose mounts ``.interactive-link-secret`` there as a read-only secret
+# and the noVNC gateway reads the same file.  The plugin can therefore read it
+# through CDP instead of asking the operator to copy it into the config, which
+# keeps the two sides in sync by construction — a mistyped or rotated key was
+# the only way a link could come out unopenable.
+BROWSER_LINK_SECRET_FILES = (
+    "file:///run/secrets/interactive_link_secret",
+    "file:///run/secrets/novnc_gateway_secret",
+)
+# Same idea for the *public* address of the gateway, which the plugin cannot
+# guess: it is not in AstrBot's config and not derivable from the container-name
+# CDP URL.  ``setup.sh`` drops it into the browser's state directory so direct
+# mode needs no plugin configuration at all on a standard deployment.
+BROWSER_GATEWAY_URL_FILES = (
+    "file:///data/browser/gateway-url.txt",
+    "file:///data/browser/arena-gateway-url.txt",
+)
+GATEWAY_DEFAULT_PORT = 6081
+LINK_SECRET_CACHE_SECONDS = 3600.0
+_LINK_SECRET_RE = re.compile(r"^[0-9A-Za-z._\-]{16,256}$")
+
 # Chrome splits a cookie larger than ~4 KB into ``<name>.0``, ``<name>.1`` ...
 # The bare name is then *absent* from the browser, so any exact-name lookup
 # reports "not logged in", the request is signed with the ``sign_up`` reCAPTCHA
@@ -374,6 +396,44 @@ def build_interactive_link(gateway_url: str, *, expires_at: float, secret: str) 
     payload = f"{expiry}.{nonce}"
     signature = hmac.new(key.encode("utf-8"), payload.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{base}/v/{quote(f'{payload}.{signature}', safe='')}"
+
+
+def gateway_base_from(*candidates: str) -> str:
+    """Best gateway origin among the addresses the operator already gave us.
+
+    The gateway is published on :data:`GATEWAY_DEFAULT_PORT` of the same host
+    that serves noVNC, so a configured ``browser_vnc_url`` is enough to derive
+    it and the operator does not have to type a second address.
+    """
+    for candidate in candidates:
+        text = str(candidate or "").strip().rstrip("/")
+        if not text:
+            continue
+        parts = urlsplit(text if "//" in text else f"http://{text}")
+        netloc = parts.netloc
+        if not netloc:
+            continue
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port == GATEWAY_DEFAULT_PORT and parts.path:
+            # Already a gateway URL, keep whatever path prefix it carries.
+            return text
+        # Case is preserved on purpose: ``urlsplit().hostname`` lowercases, and
+        # the operator's own text is what has to match their reverse proxy.
+        host = netloc.rsplit("@", 1)[-1]
+        host = host[: host.index("]") + 1] if host.startswith("[") and "]" in host else host.split(":", 1)[0]
+        if not host:
+            continue
+        return f"{parts.scheme or 'http'}://{host}:{GATEWAY_DEFAULT_PORT}"
+    return ""
+
+
+def looks_like_link_secret(value: str) -> bool:
+    """Reject HTML, error pages and empty reads before they become a bad link."""
+    text = str(value or "").strip()
+    return bool(_LINK_SECRET_RE.fullmatch(text))
 
 
 # --- CDP transport -----------------------------------------------------------
@@ -832,6 +892,10 @@ _ACTIONS: dict[str, str] = {}
 _ACTIONS_AT = 0.0
 _UPLOADS: dict[str, dict[str, Any]] = {}
 _SESSIONS: dict[str, dict[str, Any]] = {}
+# cdp_url -> (secret, read_at).  Read once per hour per browser: the file only
+# changes when the operator regenerates it and re-creates the containers.
+_LINK_SECRETS: dict[str, tuple[str, float]] = {}
+_GATEWAY_URLS: dict[str, tuple[str, float]] = {}
 _HEALTH: dict[str, dict[str, Any]] = {"models": {}, "variants": {}}
 _HEALTH_PATH: Path | None = None
 
@@ -1139,6 +1203,58 @@ async def open_page(cdp_url: str, *, timeout: float = 30.0, browser_url: str = "
             ) from exc
 
 
+async def read_browser_file(
+    cdp: CDPWebSocket,
+    url: str,
+    *,
+    attempts: int = 12,
+    timeout: float = 10.0,
+) -> str:
+    """Read a text file from inside the browser container, via a scratch tab.
+
+    Used for the link-signing secret, which is mounted into ``arena-browser``
+    but not into AstrBot.  The tab is opened in the background and closed again
+    in ``finally`` so the operator never sees it and no target leaks if the read
+    fails.  Returns ``""`` rather than raising: every caller has a fallback.
+    """
+    target_id = ""
+    try:
+        created = await cdp.command(
+            "Target.createTarget", {"url": url, "background": True}, timeout=timeout
+        )
+        target_id = str(created.get("targetId") or "")
+        if not target_id:
+            return ""
+        attached = await cdp.command(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+            timeout=timeout,
+        )
+        session_id = str(attached.get("sessionId") or "")
+        if not session_id:
+            return ""
+        for _ in range(max(1, int(attempts))):
+            text = await cdp.evaluate(
+                "document.body ? document.body.innerText : ''",
+                session_id=session_id,
+                timeout=timeout,
+            )
+            if text:
+                return str(text)
+            # file:// targets report a load before the renderer has painted the
+            # text node, so a short poll beats a single read.
+            await asyncio.sleep(0.4)
+        return ""
+    except CDPError:
+        return ""
+    finally:
+        if target_id:
+            with contextlib.suppress(CDPError):
+                await cdp.command(
+                    "Target.closeTarget", {"targetId": target_id}, timeout=timeout
+                )
+
+
 # --- SSE ---------------------------------------------------------------------
 #
 # Arena's stream is a line protocol rather than real SSE events:
@@ -1314,21 +1430,96 @@ class ArenaDirectClient:
             _load_health(Path(data_dir) / "arena_model_health.json")
         if not self.cdp_url:
             raise BridgeError("服务器浏览器 CDP 地址为空")
+        # Last link minted with an auto-discovered secret, so error messages can
+        # still carry a working URL without opening a CDP session of their own.
+        self._link_cache: tuple[str, float] = ("", 0.0)
+        self._mint_failure = ""
 
     # -- plumbing -------------------------------------------------------------
 
+    def _gateway_base(self) -> str:
+        """The gateway origin: configured, or derived from the noVNC address."""
+        if self.gateway_url:
+            return self.gateway_url
+        return gateway_base_from(self.vnc_url)
+
     def _link(self) -> str:
-        """Mint a fresh signed noVNC link, or return '' when unconfigured."""
-        if not self.gateway_url or not self._link_secret:
+        """A link for error messages: signed if we can, cached if we already did."""
+        base = self._gateway_base()
+        if base and self._link_secret:
+            try:
+                return build_interactive_link(
+                    base,
+                    expires_at=time.time() + self.link_ttl,
+                    secret=self._link_secret,
+                )
+            except Exception:
+                return self.vnc_url
+        cached, expires_at = self._link_cache
+        if cached and time.time() < expires_at:
+            return cached
+        return self.vnc_url
+
+    async def _resolve_link_secret(self, cdp: CDPWebSocket) -> str:
+        """Configured secret, else read it out of the browser container.
+
+        Reading beats configuring: the gateway validates against the same file,
+        so an auto-read key cannot drift out of sync, and nothing sensitive has
+        to be pasted into the plugin config.
+        """
+        if self._link_secret:
+            return self._link_secret
+        cached, read_at = _LINK_SECRETS.get(self.cdp_url, ("", 0.0))
+        if cached and time.time() - read_at < LINK_SECRET_CACHE_SECONDS:
+            return cached
+        for source in BROWSER_LINK_SECRET_FILES:
+            value = "".join(str(await read_browser_file(cdp, source)).split())
+            if looks_like_link_secret(value):
+                _LINK_SECRETS[self.cdp_url] = (value, time.time())
+                return value
+        return ""
+
+    async def _resolve_gateway_base(self, cdp: CDPWebSocket) -> str:
+        """Configured address, else the one the deployment left in the browser."""
+        base = self._gateway_base()
+        if base:
+            return base
+        cached, read_at = _GATEWAY_URLS.get(self.cdp_url, ("", 0.0))
+        if cached and time.time() - read_at < LINK_SECRET_CACHE_SECONDS:
+            return cached
+        for source in BROWSER_GATEWAY_URL_FILES:
+            raw = str(await read_browser_file(cdp, source)).strip().splitlines()
+            text = raw[0].strip() if raw else ""
+            if not text.startswith(("http://", "https://")):
+                continue
+            candidate = gateway_base_from(text)
+            if candidate:
+                _GATEWAY_URLS[self.cdp_url] = (candidate, time.time())
+                return candidate
+        return ""
+
+    async def _mint_link(self, cdp: CDPWebSocket) -> str:
+        """The link the operator opens, minted with whatever we could discover.
+
+        ``self._mint_failure`` records *which* half was missing so the caller can
+        say something more useful than "link unavailable".
+        """
+        self._mint_failure = ""
+        base = await self._resolve_gateway_base(cdp)
+        if not base:
+            self._mint_failure = "gateway"
             return self.vnc_url
-        try:
-            return build_interactive_link(
-                self.gateway_url,
-                expires_at=time.time() + self.link_ttl,
-                secret=self._link_secret,
-            )
-        except Exception:
+        secret = await self._resolve_link_secret(cdp)
+        if not secret:
+            self._mint_failure = "secret"
             return self.vnc_url
+        expires_at = time.time() + self.link_ttl
+        link = build_interactive_link(base, expires_at=expires_at, secret=secret)
+        if link:
+            self._link_cache = (link, expires_at)
+        else:
+            self._mint_failure = "sign"
+        return link or self.vnc_url
 
     def _page(self, *, timeout: float | None = None):
         return open_page(
@@ -1533,12 +1724,6 @@ class ArenaDirectClient:
 
     async def start_interactive_auth(self) -> dict[str, Any]:
         session_id = uuid.uuid4().hex
-        link = self._link()
-        if not link:
-            raise _err(
-                "没有配置服务器浏览器验证链接（网关地址或签名密钥为空）。",
-                code="interactive_link_unavailable",
-            )
         async with CDPWebSocket(self.cdp_url, timeout=60.0) as cdp:
             try:
                 target = await self._ensure_target(cdp, session_id)
@@ -1546,6 +1731,10 @@ class ArenaDirectClient:
                 raise _err(
                     f"连不上服务器浏览器：{exc}", code="browser_unavailable"
                 ) from exc
+            # Minted inside the CDP session on purpose: that is what lets the
+            # address and the signing key be discovered from the browser itself
+            # instead of being copied into the plugin config.
+            link = await self._mint_link(cdp)
             session = ""
             with contextlib.suppress(CDPError):
                 attached = await cdp.command(
@@ -1558,6 +1747,18 @@ class ArenaDirectClient:
             if session:
                 with contextlib.suppress(CDPError):
                     state = await _live_state(ArenaPage(cdp, session, target["url"]))
+        if not link:
+            if self._mint_failure == "secret":
+                raise _err(
+                    "拿不到验证链接：网关地址有了，但签名密钥既没配置也没能从服务器浏览器"
+                    "读到（/run/secrets/interactive_link_secret 不可读）。",
+                    code="interactive_link_unavailable",
+                )
+            raise _err(
+                "还差一个地址：请在插件配置里把 browser_gateway_url 填成"
+                f" http://服务器IP:{GATEWAY_DEFAULT_PORT}（签名密钥会自动读取，其它都不用填）。",
+                code="interactive_link_unavailable",
+            )
         now = time.time()
         record = {
             "session_id": session_id,

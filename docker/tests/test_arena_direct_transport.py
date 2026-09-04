@@ -696,6 +696,303 @@ class TransportDispatchTests(DirectTransportCase):
         self.assertEqual(schema["browser_cdp_url"]["default"], "http://arena-browser:9223")
 
 
+class FakeCDP:
+    """A CDP socket that only knows targets and one file:// read.
+
+    ``start_interactive_auth`` talks to the socket directly rather than through
+    ``open_page``, so the auto-secret path needs its own double.  Anything this
+    fake does not implement raises ``CDPError``, which is exactly what the real
+    socket does for an unsupported method - the client is expected to survive it.
+    """
+
+    def __init__(self, *, file_text: str = "", files: dict | None = None, arena_tab: bool = True) -> None:
+        self.file_text = file_text
+        self.files = dict(files or {})
+        self.arena_tab = arena_tab
+        self.calls: list[tuple[str, dict]] = []
+        self.created: list[str] = []
+        self.closed: list[str] = []
+        self._sessions: dict[str, str] = {}
+        self._targets: dict[str, str] = {}
+        self._n = 0
+
+    async def __aenter__(self) -> FakeCDP:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    def _content(self, url: str) -> str:
+        if url in self.files:
+            return self.files[url]
+        if "secrets" in url:
+            return self.file_text
+        return ""
+
+    async def command(self, method, params=None, *, session_id=None, timeout=None):
+        params = dict(params or {})
+        self.calls.append((method, {**params, "session": session_id, "timeout": timeout}))
+        if method == "Target.getTargets":
+            if not self.arena_tab:
+                return {"targetInfos": []}
+            return {
+                "targetInfos": [
+                    {"type": "page", "targetId": "arena-1", "url": "https://arena.ai/text/direct"}
+                ]
+            }
+        if method == "Target.createTarget":
+            self._n += 1
+            target_id = f"target-{self._n}"
+            url = str(params.get("url") or "")
+            self.created.append(url)
+            self._targets[target_id] = url
+            return {"targetId": target_id}
+        if method == "Target.attachToTarget":
+            target_id = str(params.get("targetId") or "")
+            session = f"session-for-{target_id}"
+            if target_id in self._targets:
+                self._sessions[session] = self._targets[target_id]
+            return {"sessionId": session}
+        if method == "Target.closeTarget":
+            self.closed.append(str(params.get("targetId") or ""))
+            return {}
+        if method == "Target.activateTarget":
+            return {}
+        raise arena_direct.CDPError(f"unsupported in the fake: {method}")
+
+    async def evaluate(self, expression, *, session_id: str, timeout=None):
+        self.calls.append(
+            (
+                "Runtime.evaluate",
+                {"session": session_id, "timeout": timeout, "expression": str(expression)[:40]},
+            )
+        )
+        if session_id in self._sessions:
+            return self._content(self._sessions[session_id])
+        raise arena_direct.CDPError("no page here")
+
+
+class AutoLinkSecretTests(DirectTransportCase):
+    """The operator fills in one address; the signing key is discovered.
+
+    A hand-copied key was the only way to produce an unopenable link: it drifts
+    the moment the secret is regenerated.  Reading it out of the same file the
+    gateway validates against removes that failure mode entirely.
+    """
+
+    SECRET = "a1b2c3d4" * 8  # 64 hex chars, like `setup.sh` writes
+
+    def setUp(self) -> None:
+        super().setUp()
+        arena_direct._LINK_SECRETS.clear()
+        arena_direct._GATEWAY_URLS.clear()
+
+    def _cdp(self, **kwargs) -> FakeCDP:
+        fake = FakeCDP(file_text=kwargs.pop("file_text", self.SECRET), **kwargs)
+        self._patch(arena_direct, "CDPWebSocket", lambda *_a, **_k: fake)
+        return fake
+
+    def test_gateway_url_is_derived_from_the_novnc_address(self) -> None:
+        self.assertEqual(
+            arena_direct.gateway_base_from("http://HOST:6082/vnc.html?autoconnect=true"),
+            "http://HOST:6081",
+        )
+        # An address that already points at the gateway keeps its prefix.
+        self.assertEqual(
+            arena_direct.gateway_base_from("https://HOST:6081/arena"),
+            "https://HOST:6081/arena",
+        )
+        self.assertEqual(arena_direct.gateway_base_from("", ""), "")
+
+    def test_secret_shaped_values_are_accepted_and_html_is_not(self) -> None:
+        self.assertTrue(arena_direct.looks_like_link_secret(self.SECRET))
+        self.assertFalse(arena_direct.looks_like_link_secret(""))
+        self.assertFalse(arena_direct.looks_like_link_secret("short"))
+        self.assertFalse(
+            arena_direct.looks_like_link_secret("<html><body>404 not found</body></html>")
+        )
+
+    def test_scratch_tab_is_always_closed(self) -> None:
+        fake = FakeCDP(file_text=self.SECRET)
+        text = self.run_async(
+            arena_direct.read_browser_file(fake, "file:///run/secrets/interactive_link_secret")
+        )
+        self.assertEqual(text, self.SECRET)
+        self.assertEqual(fake.created, ["file:///run/secrets/interactive_link_secret"])
+        self.assertEqual(len(fake.closed), 1, "a leaked tab would pile up in the operator's Chrome")
+        self.assertTrue(all(params.get("background") for m, params in fake.calls if m == "Target.createTarget"))
+        reads = [params for method, params in fake.calls if method == "Runtime.evaluate"]
+        self.assertTrue(reads[0]["expression"].startswith("document.body"))
+        self.assertTrue(all(params["timeout"] for params in reads), "reads must be bounded")
+
+    def test_unreadable_file_returns_empty_and_still_closes(self) -> None:
+        fake = FakeCDP(file_text="")
+        text = self.run_async(
+            arena_direct.read_browser_file(
+                fake, "file:///run/secrets/interactive_link_secret", attempts=1
+            )
+        )
+        self.assertEqual(text, "")
+        self.assertEqual(len(fake.closed), 1)
+
+    def test_link_is_signed_with_the_key_read_from_the_browser(self) -> None:
+        fake = self._cdp()
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223",
+            gateway_url="http://HOST:6081",
+            link_secret="",            # nothing configured: this is the point
+            data_dir=self.data_dir,
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        link = payload["browser_url"]
+        self.assertTrue(link.startswith("http://HOST:6081/v/"))
+        token = link.rsplit("/", 1)[-1]
+        self.assertTrue(_verify_token(token, self.SECRET), "the gateway must accept the link")
+        self.assertNotIn(self.SECRET, link)
+        self.assertIn("file:///run/secrets/interactive_link_secret", fake.created)
+
+    def test_the_key_is_read_once_and_then_cached(self) -> None:
+        fake = self._cdp()
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", gateway_url="http://HOST:6081", data_dir=self.data_dir
+        )
+        first = self.run_async(client.start_interactive_auth())
+        second = self.run_async(client.start_interactive_auth())
+        reads = [url for url in fake.created if url.startswith("file://")]
+        self.assertEqual(len(reads), 1, "one file read per hour, not one per verification")
+        for payload in (first, second):
+            self.assertTrue(
+                _verify_token(payload["browser_url"].rsplit("/", 1)[-1], self.SECRET)
+            )
+
+    def test_a_configured_key_wins_and_skips_the_browser_read(self) -> None:
+        fake = self._cdp(file_text="ffffffff" * 8)
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223",
+            gateway_url="http://HOST:6081",
+            link_secret="explicit-secret-value",
+            data_dir=self.data_dir,
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        token = payload["browser_url"].rsplit("/", 1)[-1]
+        self.assertTrue(_verify_token(token, "explicit-secret-value"))
+        self.assertEqual([u for u in fake.created if u.startswith("file://")], [])
+
+    def test_only_the_novnc_address_is_enough(self) -> None:
+        self._cdp()
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223",
+            vnc_url="http://HOST:6082/vnc.html",
+            data_dir=self.data_dir,
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        self.assertTrue(payload["browser_url"].startswith("http://HOST:6081/v/"))
+        self.assertTrue(
+            _verify_token(payload["browser_url"].rsplit("/", 1)[-1], self.SECRET)
+        )
+
+    def test_no_address_at_all_says_which_field_to_fill(self) -> None:
+        self._cdp()
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir
+        )
+        with self.assertRaises(bridge_client.BridgeError) as ctx:
+            self.run_async(client.start_interactive_auth())
+        message = str(ctx.exception)
+        self.assertIn("browser_gateway_url", message)
+        self.assertIn("6081", message)
+
+    def test_unreadable_secret_reports_it_instead_of_a_dead_link(self) -> None:
+        self._cdp(file_text="")
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", gateway_url="http://HOST:6081", data_dir=self.data_dir
+        )
+        with self.assertRaises(bridge_client.BridgeError) as ctx:
+            self.run_async(client.start_interactive_auth())
+        self.assertIn("interactive_link_secret", str(ctx.exception))
+
+    def test_vnc_url_is_the_fallback_when_no_key_can_be_found(self) -> None:
+        self._cdp(file_text="")
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223",
+            gateway_url="http://HOST:6081",
+            vnc_url="http://HOST:6082/vnc.html",
+            data_dir=self.data_dir,
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        self.assertEqual(payload["browser_url"], "http://HOST:6082/vnc.html")
+
+
+class ZeroConfigDirectTests(DirectTransportCase):
+    """Nothing filled in at all: the address comes from the deployment itself.
+
+    ``setup.sh`` writes the public gateway URL into the browser's state
+    directory, which the plugin can read over CDP.  That is the difference
+    between "flip one switch" and "go find the server IP and paste it".
+    """
+
+    SECRET = "9f8e7d6c" * 8
+    GATEWAY_FILE = "file:///data/browser/gateway-url.txt"
+
+    def setUp(self) -> None:
+        super().setUp()
+        arena_direct._LINK_SECRETS.clear()
+        arena_direct._GATEWAY_URLS.clear()
+
+    def _cdp(self, files: dict) -> FakeCDP:
+        fake = FakeCDP(file_text=self.SECRET, files=files)
+        self._patch(arena_direct, "CDPWebSocket", lambda *_a, **_k: fake)
+        return fake
+
+    def test_address_and_key_both_come_from_the_browser(self) -> None:
+        fake = self._cdp({self.GATEWAY_FILE: "http://198.51.100.7:6081\n"})
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        link = payload["browser_url"]
+        self.assertTrue(link.startswith("http://198.51.100.7:6081/v/"))
+        self.assertTrue(_verify_token(link.rsplit("/", 1)[-1], self.SECRET))
+        self.assertIn(self.GATEWAY_FILE, fake.created)
+
+    def test_a_novnc_address_in_the_file_is_normalised_to_the_gateway_port(self) -> None:
+        self._cdp({self.GATEWAY_FILE: "  http://198.51.100.7:6082/vnc.html  \n"})
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        self.assertTrue(payload["browser_url"].startswith("http://198.51.100.7:6081/v/"))
+
+    def test_configured_address_still_wins_over_the_file(self) -> None:
+        fake = self._cdp({self.GATEWAY_FILE: "http://198.51.100.7:6081"})
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223",
+            gateway_url="http://operator-choice:6081",
+            data_dir=self.data_dir,
+        )
+        payload = self.run_async(client.start_interactive_auth())
+        self.assertTrue(payload["browser_url"].startswith("http://operator-choice:6081/v/"))
+        self.assertNotIn(self.GATEWAY_FILE, fake.created)
+
+    def test_junk_in_the_file_is_ignored_rather_than_producing_a_dead_link(self) -> None:
+        self._cdp({self.GATEWAY_FILE: "<!DOCTYPE html><h1>Index of /data/browser</h1>"})
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir
+        )
+        with self.assertRaises(bridge_client.BridgeError) as ctx:
+            self.run_async(client.start_interactive_auth())
+        self.assertIn("browser_gateway_url", str(ctx.exception))
+
+    def test_the_address_is_read_once_and_then_cached(self) -> None:
+        fake = self._cdp({self.GATEWAY_FILE: "http://198.51.100.7:6081"})
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir
+        )
+        self.run_async(client.start_interactive_auth())
+        self.run_async(client.start_interactive_auth())
+        self.assertEqual(fake.created.count(self.GATEWAY_FILE), 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

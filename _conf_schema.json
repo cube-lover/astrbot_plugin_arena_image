@@ -23,17 +23,17 @@
   },
   "browser_gateway_url": {
     "type": "string",
-    "description": "验证链接网关地址（仅 direct 模式使用），对应 .env 里的 LM_BRIDGE_BROWSER_GATEWAY_URL，例如 http://服务器IP:6081",
+    "description": "direct 模式唯一需要填的地址：验证链接网关，例如 http://服务器IP:6081（对应 .env 的 LM_BRIDGE_BROWSER_GATEWAY_URL）；填了 browser_vnc_url 也能自动推导",
     "default": ""
   },
   "browser_vnc_url": {
     "type": "string",
-    "description": "noVNC 直连地址（可选，仅 direct 模式在没有网关签名密钥时作为兜底链接）",
+    "description": "noVNC 直连地址（可选）；填了它就能自动推出 6081 网关地址，也在拿不到签名密钥时作为兜底链接",
     "default": ""
   },
   "interactive_link_secret": {
     "type": "string",
-    "description": "验证链接签名密钥（仅 direct 模式使用），内容取自 docker/.interactive-link-secret",
+    "description": "验证链接签名密钥（留空即可）：留空时插件会自动从服务器浏览器的 /run/secrets/interactive_link_secret 读取，和网关永远一致；只有非标准部署才需要手填",
     "secret": true,
     "default": ""
   },

@@ -263,28 +263,32 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 少一个容器、少一层转发；Cookie 不再被复制到任何配置文件里，而是每次都用浏览器页面自己的会话
 （`credentials: 'include'`），所以 `__cf_bm`、`arena-auth-prod-v1` 轮换时不会出现“Cookie 失效”。
 
-切到 direct 只改插件配置，不用改 Docker：
+切到 direct 只改插件配置，不用改 Docker。**要填的只有一个开关**：
 
 | 配置项 | 填什么 |
 | --- | --- |
-| `transport_mode` | `direct` |
-| `browser_cdp_url` | `http://arena-browser:9223`（AstrBot 与浏览器同网络时不用改） |
-| `browser_gateway_url` | 和 `docker/.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致，例如 `http://服务器IP:6081` |
-| `interactive_link_secret` | `.interactive-link-secret` 的内容（32 字节随机十六进制，由 `setup.sh` 生成，文件在 compose 同级目录） |
+| `transport_mode` | `direct` ← 只有这一项是必填 |
+| `browser_gateway_url` | 一般不用填。`setup.sh` 会把 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 写进 `arena-browser-data/gateway-url.txt`，插件自己读；老部署没有这个文件时才填 `http://服务器IP:6081` |
+| `interactive_link_secret` | 不用填。插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关用的是同一个文件，永远不会不一致 |
+| `browser_cdp_url` | 不用填，默认 `http://arena-browser:9223`；AstrBot 不在同一个 Docker 网络时才改 |
+| `browser_vnc_url` | 可选。填了它也能推出 `:6081` 网关地址，并在拿不到密钥时作为兜底链接 |
 | `interactive_link_ttl` | 验证链接有效期，默认 `900` 秒 |
-| `browser_vnc_url` | 可选兜底链接；填了网关地址和密钥就不用管 |
 | `allow_stealth_models` | 放行灰测模型，默认开启（bridge 模式下由 `.env` 控制） |
 
-签名密钥必须和 `arena-browser` 里的网关一致，否则验证链接打不开：
+老部署（`setup.sh` 之前装的）补上这个文件就同样零配置，不用重启容器：
 
 ```bash
-# 密钥文件和 docker-compose.arena.yml 在同一个目录：
-#   本仓库部署 -> <仓库>/docker/.interactive-link-secret
-#   早期部署   -> /opt/lmarenabridge/.interactive-link-secret
-find /opt -maxdepth 3 -name '.interactive-link-secret' 2>/dev/null
+cd "$(dirname "$(find /opt -maxdepth 3 -name docker-compose.arena.yml | head -1)")"
+sed -n 's/^LM_BRIDGE_BROWSER_GATEWAY_URL=//p' .env | tail -1 > arena-browser-data/gateway-url.txt
+cat arena-browser-data/gateway-url.txt      # 应该是 http://服务器IP:6081
+```
 
-# 只在需要填配置时查看内容，不要贴到聊天/工单里
-cat "$(find /opt -maxdepth 3 -name '.interactive-link-secret' 2>/dev/null | head -1)"
+签名密钥不需要手抄，因为插件读的就是网关校验用的那个文件。只有非标准部署
+（密钥没挂进 `arena-browser`）才需要手填，位置是 compose 同级目录：
+
+```bash
+find /opt -maxdepth 3 -name '.interactive-link-secret' 2>/dev/null
+# 只在确实要手填时看内容，不要贴到聊天/工单里
 ```
 
 如果 AstrBot 不在同一个 Docker 网络，把 `browser_cdp_url` 改成能通的地址，
@@ -601,10 +605,12 @@ docker compose -f docker-compose.arena.yml --env-file .env up -d
 
 按报错分两种：
 
-- “没有配置服务器浏览器验证链接”“验证链接打不开”：`browser_gateway_url` 和
-  `interactive_link_secret` 有一个没填对。密钥要和 compose 同级目录的
-  `.interactive-link-secret` 完全一致（末尾不要多空行），网关地址要和 `.env` 里的
-  `LM_BRIDGE_BROWSER_GATEWAY_URL` 一致。
+- “还差一个地址：请把 browser_gateway_url 填成 …”：插件既没读到
+  `arena-browser-data/gateway-url.txt`，配置里也没填网关地址。按上面第五节的三行命令
+  补上那个文件，或者直接在插件配置里填 `http://服务器IP:6081`。
+- “拿不到验证链接：网关地址有了，但签名密钥…读不到”：`.interactive-link-secret`
+  没挂进 `arena-browser`（检查 compose 的 `secrets:`），此时可以手填
+  `interactive_link_secret` 作为临时办法。
 - “连不上服务器浏览器”“服务器浏览器响应超时”：`arena-browser` 没起来或 `browser_cdp_url` 不通。
 
 ```bash

@@ -127,6 +127,19 @@ else
   info ".novnc-password 已存在"
 fi
 
+# ---------- 5.1 让插件自己发现网关地址 ----------
+# direct 模式下插件要给管理员一个验证链接，但它猜不出服务器的对外地址。
+# 把地址写进浏览器的状态目录，插件通过 CDP 读一次就够，插件配置可以完全不填。
+GATEWAY_URL="$(sed -n 's/^LM_BRIDGE_BROWSER_GATEWAY_URL=//p' .env | tail -1)"
+if [[ -n "$GATEWAY_URL" ]]; then
+  mkdir -p arena-browser-data
+  printf '%s\n' "$GATEWAY_URL" > arena-browser-data/gateway-url.txt
+  chmod 644 arena-browser-data/gateway-url.txt
+  info "已写入 arena-browser-data/gateway-url.txt（direct 模式零配置）"
+else
+  info "未设置 LM_BRIDGE_BROWSER_GATEWAY_URL，direct 模式需要手填 browser_gateway_url"
+fi
+
 # ---------- 6. 校验 ----------
 docker compose -f docker-compose.arena.yml --env-file .env config --quiet \
   || fail "Docker Compose 配置校验未通过，请检查 .env"

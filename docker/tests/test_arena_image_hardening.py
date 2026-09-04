@@ -846,6 +846,32 @@ class AnimatedInputFrameTest(unittest.TestCase):
         self.assertTrue(warned.called)
 
 
+class CDPExposureTest(unittest.TestCase):
+    """CDP is unauthenticated control of a browser logged into a real account.
+
+    It also reads local files inside the container, which is how the signing key
+    is discovered, so publishing it on 0.0.0.0 hands over the Arena session and
+    the link secret to anyone who scans the port.
+    """
+
+    def _compose(self) -> str:
+        return (PLUGIN_ROOT / "docker" / "docker-compose.arena.yml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_cdp_port_defaults_to_loopback_and_is_never_wide_open(self) -> None:
+        compose = self._compose()
+        self.assertIn('"${ARENA_CDP_BIND:-127.0.0.1}:9223:9223"', compose)
+        for line in compose.splitlines():
+            if "9223:9223" in line:
+                self.assertNotIn("0.0.0.0", line)
+
+    def test_the_shipped_env_example_keeps_the_safe_default(self) -> None:
+        env = (PLUGIN_ROOT / "docker" / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("ARENA_CDP_BIND=127.0.0.1", env)
+        self.assertNotIn("ARENA_CDP_BIND=0.0.0.0", env)
+
+
 class SchemaAndMetadataTest(unittest.TestCase):
     def test_new_config_keys_are_declared_with_matching_defaults(self) -> None:
         import json

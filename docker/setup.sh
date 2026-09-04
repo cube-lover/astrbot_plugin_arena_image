@@ -164,6 +164,17 @@ EOF
   info "已补充可选代理配置 LM_BRIDGE_PROXY_URL"
 fi
 
+if ! grep -q '^ARENA_CDP_BIND=' .env; then
+  cat >> .env <<'EOF'
+
+# Host address the CDP port (9223) is published on.  127.0.0.1 = this machine
+# only.  172.17.0.1 (docker0 gateway) = any container on this host, still not the
+# internet -- use it if AstrBot is in another Docker network.  Never 0.0.0.0.
+ARENA_CDP_BIND=127.0.0.1
+EOF
+  info "已补充 ARENA_CDP_BIND（CDP 端口绑定，默认只绑本机）"
+fi
+
 # ---------- 5. 生成密钥文件 ----------
 if [[ ! -f .interactive-link-secret ]]; then
   rand_hex 32 > .interactive-link-secret

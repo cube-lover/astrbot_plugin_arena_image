@@ -197,7 +197,7 @@ bridge_api_key = 留空
 | `transport_mode` | `bridge` | `bridge` = 走 arena-bridge 容器；`direct` = 插件直连 arena-browser，不需要 bridge |
 | `bridge_url` | `http://arena-bridge:8000` | Bridge 根地址或 `/api/v1` 地址（bridge 模式） |
 | `bridge_api_key` | 空 | Bridge API Key，零配置部署留空 |
-| `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改；连不上时自动改试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`） |
+| `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改；连不上时自动改试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`，配合 `.env` 的 `ARENA_CDP_BIND=172.17.0.1` 可跨 Docker 网络） |
 | `browser_gateway_url` | 空 | 验证链接网关；留空时插件读 `arena-browser-data/gateway-url.txt`（`setup.sh` 写入），老部署才需要手填 `http://服务器IP:6081` |
 | `interactive_link_secret` | 空 | 留空即可：插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关校验用的是同一个文件 |
 | `interactive_link_ttl` | 900 | 验证链接有效期（秒，direct 模式） |
@@ -321,8 +321,10 @@ docker inspect arena-bridge --format '{{json .NetworkSettings.Networks}}'
 http://arena-bridge:8000
 ```
 
-不在同一个网络时,**填地址是没用的** —— Docker 默认把跨网络的包丢掉,填容器 IP、填宿主机网关都超时。
-两个办法任选一个:
+不在同一个网络时,**填容器地址是没用的** —— Docker 默认把跨网络的包丢掉,填容器名解析不出来,
+填容器 IP、填宿主机网关都超时。宿主机地址不受这条限制（publish 出来的端口所有容器都能连,
+NapCat 映射到服务器端口给 AstrBot 用就是这个原理）,只是 `9223` 默认只绑 `127.0.0.1`。
+三个办法任选一个:
 
 ```bash
 # 办法一（推荐）：重跑 setup.sh，它会自动改好 .env 里的网络名，再重启 arena 容器
@@ -332,11 +334,15 @@ http://arena-bridge:8000
 docker network connect $(docker inspect arena-browser \
   --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
   | awk '{print $1}') astrbot
+
+# 办法三：把 CDP 端口发布到 docker0 网关（本机容器都能连、公网连不到），插件仍然不用填任何东西
+echo 'ARENA_CDP_BIND=172.17.0.1' >> docker/.env   # 绝对不要写 0.0.0.0
+docker compose -f docker-compose.arena.yml --env-file .env up -d
 ```
 
 direct 模式连不上 `arena-browser` 时插件会自己试 `host.docker.internal`、`172.17.0.1`、
-`127.0.0.1`（`9223` 已绑定宿主机 `127.0.0.1`，所以 AstrBot 装在宿主机上也能用），
-全试不通才报错，并把上面办法二那行命令一起给出来。
+`127.0.0.1`（`9223` 已绑定宿主机 `127.0.0.1`，所以 AstrBot 装在宿主机上也能用；办法三正好
+落在插件会试的 `172.17.0.1` 上），全试不通才报错，并把上面办法二那行命令一起给出来。
 
 ### 提示 Cookie 失效
 

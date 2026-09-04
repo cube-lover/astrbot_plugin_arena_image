@@ -270,7 +270,7 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 | `transport_mode` | `direct` ← 只有这一项是必填 |
 | `browser_gateway_url` | 一般不用填。`setup.sh` 会把 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 写进 `arena-browser-data/gateway-url.txt`，插件自己读；老部署没有这个文件时才填 `http://服务器IP:6081` |
 | `interactive_link_secret` | 不用填。插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关用的是同一个文件，永远不会不一致 |
-| `browser_cdp_url` | 不用填，默认 `http://arena-browser:9223`。连不上时插件会自己试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`；AstrBot 在另一个 Docker 网络时按下面第十一节接一下网络，也可以在这里填一个能通的地址 |
+| `browser_cdp_url` | 不用填，默认 `http://arena-browser:9223`。连不上时插件会自己试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`；AstrBot 在另一个 Docker 网络时按下面第十一节处理（接一下网络，或者在 `.env` 里设 `ARENA_CDP_BIND=172.17.0.1`，插件依然什么都不用填） |
 | `browser_vnc_url` | 可选。填了它也能推出 `:6081` 网关地址，并在拿不到密钥时作为兜底链接 |
 | `interactive_link_ttl` | 验证链接有效期，默认 `900` 秒 |
 | `allow_stealth_models` | 放行灰测模型，默认开启（bridge 模式下由 `.env` 控制） |
@@ -420,14 +420,16 @@ Cookie 会自动保存。后续 Cookie 失效时执行：
 | 8000 | `127.0.0.1` | Bridge API |
 | 6081 | `0.0.0.0` | 短时验证链接网关，同时代理 noVNC 页面和 WebSocket |
 | 6082 | `127.0.0.1` | noVNC |
-| 9223 | Docker 内网 + `127.0.0.1` | CDP 代理（direct 模式用） |
+| 9223 | Docker 内网 + `${ARENA_CDP_BIND}`（默认 `127.0.0.1`） | CDP 代理（direct 模式用） |
 
 安全建议：
 
 - 不要把 `8000` 直接暴露公网
 - **`9223` 绝对不要绑到 `0.0.0.0`**：CDP 是对一个已登录 Arena 的浏览器的无认证远程控制，
-  拿到它等于拿到账号。默认只绑 `127.0.0.1`，是给「AstrBot 直接装在宿主机、不在 Docker 里」
-  的情况用的；容器之间请用 `docker network connect`，不要靠开放端口
+  拿到它等于拿到账号，还能读容器里的文件。`.env` 里的 `ARENA_CDP_BIND` 控制它绑在哪：
+  `127.0.0.1`（默认，只有宿主机自己能连，够「AstrBot 直接装在服务器上」用）、
+  `172.17.0.1`（docker0 网关，本机所有容器都能连、公网连不到，AstrBot 在别的 Docker 网络时用）。
+  除此之外的值都别填
 - 正常情况下只需要开放 `6081`；验证链接会在同端口加载 noVNC 静态资源并代理 WebSocket，不需要开放 `6082`
 - 如需远程访问管理页面，用 SSH 隧道：
 
@@ -632,7 +634,7 @@ docker exec astrbot python3 -c "import urllib.request,json;print(json.load(urlli
 `127.0.0.1`（端口和路径沿用你填的），试通了就记住 10 分钟。所以 **AstrBot 装在宿主机**
 的情况不用管，`9223` 已经绑了 `127.0.0.1`。
 
-**AstrBot 在另一个 Docker 网络**里则跨不过去，而且**填任何地址都跨不过去**。在本项目的服务器上
+**AstrBot 在另一个 Docker 网络**里，默认配置下**填任何容器地址都跨不过去**。在本项目的服务器上
 实测过（临时建一个网络、一个容器，测完删掉）：
 
 ```text
@@ -643,7 +645,11 @@ host.docker.internal:9223       Linux 上这个名字不存在
 接进同一个网络后 arena-browser:9223  连上了，Chrome/131
 ```
 
-Docker 默认把跨网络的包直接丢掉，所以这不是配置问题，填地址救不回来。两个办法任选一个：
+Docker 默认把跨网络的包直接丢掉，所以这不是「地址填错了」，容器地址都是通不了的。
+
+但**宿主机地址是另一回事**：端口一旦 publish 出来，所有容器都能通过宿主机地址访问它，
+NapCat 把 6099 映射到服务器端口再给 AstrBot 用，就是这个原理。默认 compose 只把 `9223` 绑在
+`127.0.0.1`（安全考虑，不是做不到），所以现在才连不上。三个办法任选一个：
 
 **办法一（推荐，一次到位）**：重跑 `./setup.sh`。它会发现 `.env` 里的 `ASTRBOT_NETWORK` 和
 AstrBot 实际所在网络不一致、自动改好，然后按提示重启 arena 容器：
@@ -661,6 +667,25 @@ docker network connect $(docker inspect arena-browser \
   --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
   | awk '{print $1}') astrbot
 ```
+
+顺带说一句：一个容器可以同时在多个网络里，这就是办法二的原理。很多人的 AstrBot 本来就是
+这么装的（一个网络连 NapCat，一个网络连别的服务），`docker inspect astrbot` 能看到两个网络名。
+
+**办法三（想靠"填地址"解决的话）**：把 CDP 端口发布到 docker0 网关地址上。这个地址所有容器
+都能访问、公网访问不到，而且插件本来就会自己去试 `172.17.0.1`，所以**插件里仍然什么都不用填**：
+
+```dotenv
+# docker/.env
+ARENA_CDP_BIND=172.17.0.1
+```
+
+```bash
+docker compose -f docker-compose.arena.yml --env-file .env up -d
+```
+
+**绝对不要填 `0.0.0.0`。** `9223` 是对一台已登录 Arena 账号的浏览器的**无认证**遥控接口，
+还能读容器里的文件（签名密钥就是这么读出来的）。挂上公网等于把账号和密钥一起送人。
+默认值 `127.0.0.1` 只够宿主机自己访问，够 AstrBot 直接装在服务器上的情况用。
 
 查 AstrBot 实际在哪个网络：
 

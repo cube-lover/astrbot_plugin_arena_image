@@ -83,7 +83,7 @@ detect_gateway_port() {
     echo "$port"
     return 0
   fi
-  port=$(docker port arena-browser 6081/tcp 2>/dev/null \
+  port=$({ docker port arena-browser 6081/tcp 2>/dev/null || true; } \
     | head -1 | sed -n 's/.*:\([0-9]\{1,5\}\)$/\1/p')
   if [[ "$port" =~ ^[0-9]{1,5}$ ]]; then
     echo "$port"
@@ -142,7 +142,9 @@ ARENA_GATEWAY_PORT=${GATEWAY_PORT}
 EOF
   info "已补充 ARENA_GATEWAY_PORT（网关对外端口，当前 ${GATEWAY_PORT}）"
 fi
-RUNNING_PORT=$(docker port arena-browser 6081/tcp 2>/dev/null \
+# 容器还没起来时 `docker port` 会失败，而 `set -o pipefail` 会让那次失败终止整个
+# 脚本，所以这里显式吞掉——第一次安装本来就还没有容器。
+RUNNING_PORT=$({ docker port arena-browser 6081/tcp 2>/dev/null || true; } \
   | head -1 | sed -n 's/.*:\([0-9]\{1,5\}\)$/\1/p')
 if [[ -n "$RUNNING_PORT" && "$RUNNING_PORT" != "$GATEWAY_PORT" ]]; then
   warn "容器现在开在 ${RUNNING_PORT}，但配置写的是 ${GATEWAY_PORT}；跑一次 up -d 让它们一致："
@@ -180,7 +182,7 @@ fi
 # 不一致 = 插件连不上 arena-browser，而且是填任何地址都救不回来的那种不通
 # （Docker 默认丢弃跨网络流量），所以这里直接改成 AstrBot 实际所在的网络。
 CONFIGURED_NET="$(sed -n 's/^ASTRBOT_NETWORK=//p' .env | tail -1 | tr -d '\r')"
-ASTRBOT_C="$(astrbot_container)"
+ASTRBOT_C="$(astrbot_container || true)"  # 没装 AstrBot 也不该终止脚本
 if [[ -n "$CONFIGURED_NET" && -n "$ASTRBOT_C" ]]; then
   if docker inspect "$ASTRBOT_C" \
        --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}

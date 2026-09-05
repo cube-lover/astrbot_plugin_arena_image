@@ -71,6 +71,33 @@ detect_network() {
   return 1
 }
 
+detect_gateway_port() {
+  # 网关的对外端口 = 宿主机上映射到浏览器容器 6081 的那个端口。
+  # 6081 被别的服务占了、于是把映射改成 7081:6081，是最常见的部署改动；
+  # 端口一改，验证链接里的端口也必须跟着改，否则链接指向一个没开的端口。
+  # 可信度排队：.env 里写明的（操作者的意图）> 正在跑的容器 > compose 文件里
+  # 手改过的映射 > 默认 6081。
+  local port
+  port=$(sed -n 's/^ARENA_GATEWAY_PORT=//p' .env 2>/dev/null | tail -1 | tr -d '[:space:]')
+  if [[ "$port" =~ ^[0-9]{1,5}$ ]]; then
+    echo "$port"
+    return 0
+  fi
+  port=$(docker port arena-browser 6081/tcp 2>/dev/null \
+    | head -1 | sed -n 's/.*:\([0-9]\{1,5\}\)$/\1/p')
+  if [[ "$port" =~ ^[0-9]{1,5}$ ]]; then
+    echo "$port"
+    return 0
+  fi
+  port=$(sed -n 's/^[[:space:]]*-[[:space:]]*"\{0,1\}\([0-9]\{1,5\}\):6081"\{0,1\}[[:space:]]*$/\1/p' \
+    docker-compose.arena.yml 2>/dev/null | head -1)
+  if [[ "$port" =~ ^[0-9]{1,5}$ ]]; then
+    echo "$port"
+    return 0
+  fi
+  echo 6081
+}
+
 command -v docker >/dev/null 2>&1 \
   || fail "未检测到 Docker，请先安装 Docker 再运行本脚本"
 
@@ -99,10 +126,33 @@ else
   info "密码和 API Key 已配置，跳过生成"
 fi
 
+# ---------- 2.5 确定网关对外端口 ----------
+# 只在这里定一次，后面写 .env 的验证链接地址和 gateway-url.txt 都用它，
+# 这样「改了映射端口」不需要在插件里补填任何东西。
+GATEWAY_PORT="$(detect_gateway_port)"
+if grep -q '^ARENA_GATEWAY_PORT=' .env; then
+  info "网关对外端口：${GATEWAY_PORT}"
+else
+  cat >> .env <<EOF
+
+# Host port the verification gateway is published on (inside the container it is
+# always 6081).  Change it here if 6081 is taken -- setup.sh puts the same port
+# into the link the plugin hands out, so the plugin config still needs nothing.
+ARENA_GATEWAY_PORT=${GATEWAY_PORT}
+EOF
+  info "已补充 ARENA_GATEWAY_PORT（网关对外端口，当前 ${GATEWAY_PORT}）"
+fi
+RUNNING_PORT=$(docker port arena-browser 6081/tcp 2>/dev/null \
+  | head -1 | sed -n 's/.*:\([0-9]\{1,5\}\)$/\1/p')
+if [[ -n "$RUNNING_PORT" && "$RUNNING_PORT" != "$GATEWAY_PORT" ]]; then
+  warn "容器现在开在 ${RUNNING_PORT}，但配置写的是 ${GATEWAY_PORT}；跑一次 up -d 让它们一致："
+  echo "  docker compose -f docker-compose.arena.yml --env-file .env up -d"
+fi
+
 # ---------- 3. 自动检测服务器公网 IP ----------
 if grep -q 'http://HOST:' .env; then
   if PUBLIC_IP=$(detect_public_ip); then
-    sed -i "s|http://HOST:6081|http://${PUBLIC_IP}:6081|g" .env
+    sed -i "s|http://HOST:6081|http://${PUBLIC_IP}:${GATEWAY_PORT}|g" .env
     sed -i "s|http://HOST:6082|http://${PUBLIC_IP}:6082|g" .env
     info "已自动填入服务器公网 IP"
   else
@@ -195,12 +245,22 @@ fi
 # ---------- 5.1 让插件自己发现网关地址 ----------
 # direct 模式下插件要给管理员一个验证链接，但它猜不出服务器的对外地址。
 # 把地址写进浏览器的状态目录，插件通过 CDP 读一次就够，插件配置可以完全不填。
-GATEWAY_URL="$(sed -n 's/^LM_BRIDGE_BROWSER_GATEWAY_URL=//p' .env | tail -1)"
+GATEWAY_URL="$(sed -n 's/^LM_BRIDGE_BROWSER_GATEWAY_URL=//p' .env | tail -1 | tr -d '\r')"
+# 端口改过、而 .env 里还留着老端口时，这里纠正一次：验证链接的端口必须是
+# 真正开在宿主机上的那个，插件读到什么就照着发什么。
+if [[ "$GATEWAY_URL" =~ ^(https?://[^/]+):[0-9]{1,5}$ ]]; then
+  FIXED="${BASH_REMATCH[1]}:${GATEWAY_PORT}"
+  if [[ "$FIXED" != "$GATEWAY_URL" ]]; then
+    sed -i "s|^LM_BRIDGE_BROWSER_GATEWAY_URL=.*|LM_BRIDGE_BROWSER_GATEWAY_URL=${FIXED}|" .env
+    warn "验证链接端口已按实际映射改成 ${GATEWAY_PORT}"
+    GATEWAY_URL="$FIXED"
+  fi
+fi
 if [[ -n "$GATEWAY_URL" ]]; then
   mkdir -p arena-browser-data
   printf '%s\n' "$GATEWAY_URL" > arena-browser-data/gateway-url.txt
   chmod 644 arena-browser-data/gateway-url.txt
-  info "已写入 arena-browser-data/gateway-url.txt（direct 模式零配置）"
+  info "已写入 arena-browser-data/gateway-url.txt（direct 模式零配置）：${GATEWAY_URL}"
 else
   info "未设置 LM_BRIDGE_BROWSER_GATEWAY_URL，direct 模式需要手填 browser_gateway_url"
 fi

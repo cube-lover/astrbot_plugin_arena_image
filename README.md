@@ -125,6 +125,8 @@ Arena 官网真的画出一张图，再原路发回群里
   - 不确定装没装就跑一下：`docker -v` 和 `docker compose version`，能打印版本号就行
 - 已经能正常聊天的 AstrBot（建议也是 Docker 部署的）
 - 服务器防火墙／安全组要**放开 6081 端口**，不然第 5 步的登录链接你点不开
+  - 6081 被别的服务占了？打开 `docker/.env`，把 `ARENA_GATEWAY_PORT=6081` 改成没被占的端口
+    （例如 `7081`），再跑一次 `./setup.sh`，验证链接会自动跟着换端口，插件里还是什么都不用填
 - 一个能登录 [arena.ai](https://arena.ai) 的账号（Google 账号即可）
 
 > 国内服务器直连 Arena 大概率不通，需要代理，第 1 步后面有说明。香港/海外服务器不用管。
@@ -167,7 +169,7 @@ docker compose -f docker-compose.arena.yml --env-file .env up -d --build
 ```bash
 docker compose -f docker-compose.arena.yml ps     # 两个容器都是 Up / healthy
 curl http://127.0.0.1:8000/api/v1/health          # 返回一段 JSON，里面有模型数量
-curl http://127.0.0.1:6081/health                 # 返回 ok
+curl http://127.0.0.1:6081/health                 # 返回 ok（改过 ARENA_GATEWAY_PORT 就换成你的端口）
 ```
 
 如果某个容器一直重启，看日志：`docker logs --tail 50 arena-browser`。
@@ -306,7 +308,7 @@ transport_mode: bridge  →  direct
 | `bridge_url` | `http://arena-bridge:8000` | Bridge 根地址或 `/api/v1` 地址（bridge 模式） |
 | `bridge_api_key` | 空 | Bridge API Key，零配置部署留空 |
 | `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改；连不上时自动改试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`，配合 `.env` 的 `ARENA_CDP_BIND=172.17.0.1` 可跨 Docker 网络） |
-| `browser_gateway_url` | 空 | 验证链接网关；留空时插件读 `arena-browser-data/gateway-url.txt`（`setup.sh` 写入），老部署才需要手填 `http://服务器IP:6081` |
+| `browser_gateway_url` | 空 | 验证链接网关；留空时插件读 `arena-browser-data/gateway-url.txt`（`setup.sh` 写入），老部署才需要手填 `http://服务器IP:6081`（端口 = 宿主机上映射到浏览器 6081 的那个，改过就填改过的，如 `:7081`；面板上这一栏显示的是「验证链接网关地址」） |
 | `interactive_link_secret` | 空 | 留空即可：插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关校验用的是同一个文件 |
 | `interactive_link_ttl` | 900 | 验证链接有效期（秒，direct 模式） |
 | `allow_stealth_models` | 开启 | 放行灰测（隐身）模型（direct 模式；bridge 模式由 `.env` 控制） |
@@ -444,10 +446,13 @@ direct 模式连不上 `arena-browser` 时插件会自己试 `host.docker.intern
 
 ### `/竞技场验证` 给的链接打不开
 
-- 服务器防火墙／云厂商安全组要放开 **6081** 端口
+- 服务器防火墙／云厂商安全组要放开 **6081** 端口（改过 `ARENA_GATEWAY_PORT` 就放开你改的那个）
 - 链接只有 15 分钟有效期，过期了重新发一次命令
+- 端口冲突改过映射（例如 `7081:6081`）？把 `docker/.env` 里的 `ARENA_GATEWAY_PORT` 也改成同一个数字，
+  再跑一次 `./setup.sh`，插件下次发的链接就是新端口
 - `setup.sh` 认的是服务器公网 IP；如果服务器在 NAT 后面，需要在插件配置里把
-  `browser_gateway_url` 填成你实际能访问到的地址（`http://你的域名或IP:6081`）
+  「验证链接网关地址」（`browser_gateway_url`）填成你实际能访问到的地址
+  （`http://你的域名或IP:6081`，端口按你实际映射的填）
 
 ### 模型列表里为什么没有竞技场上的某些模型（比如 nano-banana-pro）
 

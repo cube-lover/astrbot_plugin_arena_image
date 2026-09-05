@@ -65,6 +65,12 @@ BROWSER_GATEWAY_URL_FILES = (
     "file:///data/browser/arena-gateway-url.txt",
 )
 GATEWAY_DEFAULT_PORT = 6081
+# The only address shape that is provably *not* the gateway, so the only one
+# whose port may be rewritten.  Everything else keeps the port it was given:
+# remapping the host side of ``6081:6081`` is the usual answer to a port clash,
+# and "helpfully" normalising 7081 back to 6081 hands the operator a link to a
+# closed port -- which looks exactly like a broken plugin.
+NOVNC_PAGE_MARKERS = ("vnc.html", "autoconnect=")
 LINK_SECRET_CACHE_SECONDS = 3600.0
 _LINK_SECRET_RE = re.compile(r"^[0-9A-Za-z._\-]{16,256}$")
 
@@ -511,6 +517,46 @@ def gateway_base_from(*candidates: str) -> str:
             continue
         return f"{parts.scheme or 'http'}://{host}:{GATEWAY_DEFAULT_PORT}"
     return ""
+
+
+def gateway_base_text(text: str) -> str:
+    """Normalise an address that is already meant to *be* the gateway.
+
+    Used for the two places where the address was spelled out on purpose — the
+    plugin's ``browser_gateway_url`` and the ``gateway-url.txt`` the deployment
+    writes — so what was written is what gets used:
+
+    * the port is kept exactly as given.  A remapped host port (``7081:6081``
+      when 6081 is taken) used to be rewritten back to
+      :data:`GATEWAY_DEFAULT_PORT`, i.e. a link to a closed port;
+    * a scheme with no port is kept as-is, because that is a reverse proxy on
+      443/80, not a missing port;
+    * only a bare host (no scheme, no port) gets the default port, and only a
+      noVNC *page* address is converted, since that one cannot be the gateway.
+    """
+    raw = str(text or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    lowered = raw.casefold()
+    if any(marker in lowered for marker in NOVNC_PAGE_MARKERS):
+        return gateway_base_from(raw)
+    explicit_scheme = "//" in raw
+    parts = urlsplit(raw if explicit_scheme else f"http://{raw}")
+    if not parts.netloc:
+        return ""
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    # Case is preserved (``hostname`` lowercases) and credentials are dropped:
+    # this string ends up in a chat message.
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    if not authority:
+        return ""
+    scheme = parts.scheme or "http"
+    if port or explicit_scheme:
+        return f"{scheme}://{authority}{parts.path}"
+    return f"{scheme}://{authority}:{GATEWAY_DEFAULT_PORT}{parts.path}"
 
 
 def looks_like_link_secret(value: str) -> bool:
@@ -1695,7 +1741,7 @@ class ArenaDirectClient:
     def _gateway_base(self) -> str:
         """The gateway origin: configured, or derived from the noVNC address."""
         if self.gateway_url:
-            return self.gateway_url
+            return gateway_base_text(self.gateway_url) or self.gateway_url
         return gateway_base_from(self.vnc_url)
 
     def _link(self) -> str:
@@ -1747,7 +1793,7 @@ class ArenaDirectClient:
             text = raw[0].strip() if raw else ""
             if not text.startswith(("http://", "https://")):
                 continue
-            candidate = gateway_base_from(text)
+            candidate = gateway_base_text(text)
             if candidate:
                 _GATEWAY_URLS[self.cdp_url] = (candidate, time.time())
                 return candidate
@@ -2023,8 +2069,15 @@ class ArenaDirectClient:
                     code="interactive_link_unavailable",
                 )
             raise _err(
-                "还差一个地址：请在插件配置里把 browser_gateway_url 填成"
-                f" http://服务器IP:{GATEWAY_DEFAULT_PORT}（签名密钥会自动读取，其它都不用填）。",
+                "还差一个地址：插件没读到网关地址。两条路选一条：\n"
+                "① 推荐：到服务器的 docker 目录重跑 bash setup.sh，它会把地址写进"
+                " arena-browser-data/gateway-url.txt，插件自己读，配置一个都不用填；\n"
+                "② 在插件配置里找「验证链接网关地址」这一栏（面板上只显示这个中文名，"
+                "配置键名是 browser_gateway_url），填"
+                f" http://服务器IP:{GATEWAY_DEFAULT_PORT}"
+                f"——端口用你映射到浏览器容器 {GATEWAY_DEFAULT_PORT} 的那个宿主机端口，"
+                "改过就填改过的（比如 7081）。\n"
+                "签名密钥会自动读取，其它都不用填。",
                 code="interactive_link_unavailable",
             )
         now = time.time()

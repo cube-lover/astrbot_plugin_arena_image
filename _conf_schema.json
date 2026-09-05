@@ -23,12 +23,12 @@
   },
   "browser_gateway_url": {
     "type": "string",
-    "description": "验证链接网关地址（可选，正常部署留空）。留空时插件会自动读浏览器容器里 setup.sh 写好的 gateway-url.txt；只有老部署或自建部署读不到时，才填 http://服务器IP:6081",
+    "description": "验证链接网关地址（可选，正常部署留空）。留空时插件会自动读浏览器容器里 setup.sh 写好的 gateway-url.txt；只有老部署或自建部署读不到时，才填 http://服务器IP:6081（端口用你映射到浏览器容器 6081 的那个宿主机端口，改过就填改过的，例如 http://服务器IP:7081）",
     "default": ""
   },
   "browser_vnc_url": {
     "type": "string",
-    "description": "noVNC 直连地址（可选）；填了它就能自动推出 6081 网关地址，也在拿不到签名密钥时作为兜底链接",
+    "description": "noVNC 直连地址（可选）；填了它就能自动推出网关地址（按默认 6081 端口推算，改过端口请直接填上面那一栏），也在拿不到签名密钥时作为兜底链接",
     "default": ""
   },
   "interactive_link_secret": {

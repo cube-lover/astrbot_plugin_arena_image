@@ -62,7 +62,10 @@ services:
     volumes:
       - ./arena-browser-data:/data/browser
     ports:
-      - "6081:6081"
+      # Container side stays 6081; change ARENA_GATEWAY_PORT in .env when that
+      # port is already taken on the host.  setup.sh writes the same port into
+      # the verification link, so the plugin config still needs nothing.
+      - "${ARENA_GATEWAY_PORT:-6081}:6081"
       - "127.0.0.1:6082:6080"
       # Loopback by default, never 0.0.0.0: CDP is unauthenticated remote control
       # of a logged-in browser.  Set ARENA_CDP_BIND=172.17.0.1 (the docker0

@@ -1510,6 +1510,93 @@ class ZeroConfigDirectTests(DirectTransportCase):
         self.assertEqual(fake.created.count(self.GATEWAY_FILE), 1)
 
 
+class RemappedGatewayPortTests(DirectTransportCase):
+    """`6081` is often already taken, so the host side gets remapped.
+
+    Whatever the deployment or the operator wrote down is the port traffic
+    actually arrives on.  Normalising it back to :data:`GATEWAY_DEFAULT_PORT`
+    produced a link to a closed port — indistinguishable, from the operator's
+    chair, from a broken plugin.
+    """
+
+    SECRET = "5e4d3c2b" * 8
+    GATEWAY_FILE = "file:///data/browser/gateway-url.txt"
+
+    def setUp(self) -> None:
+        super().setUp()
+        arena_direct._LINK_SECRETS.clear()
+        arena_direct._GATEWAY_URLS.clear()
+
+    def _cdp(self, files: dict | None = None) -> FakeCDP:
+        fake = FakeCDP(file_text=self.SECRET, files=files or {})
+        self._patch(arena_direct, "CDPWebSocket", lambda *_a, **_k: fake)
+        return fake
+
+    def _link(self, **kwargs) -> str:
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir, **kwargs
+        )
+        return self.run_async(client.start_interactive_auth())["browser_url"]
+
+    def test_a_remapped_port_in_the_file_is_kept(self) -> None:
+        self._cdp({self.GATEWAY_FILE: "http://198.51.100.7:7081\n"})
+        link = self._link()
+        self.assertTrue(link.startswith("http://198.51.100.7:7081/v/"), link)
+        self.assertTrue(_verify_token(link.rsplit("/", 1)[-1], self.SECRET))
+
+    def test_a_remapped_port_in_the_config_is_kept(self) -> None:
+        self._cdp()
+        link = self._link(gateway_url="http://198.51.100.7:7081")
+        self.assertTrue(link.startswith("http://198.51.100.7:7081/v/"), link)
+
+    def test_a_reverse_proxy_on_the_standard_port_keeps_its_port(self) -> None:
+        self._cdp()
+        link = self._link(gateway_url="https://arena.example.com/gateway")
+        self.assertTrue(link.startswith("https://arena.example.com/gateway/v/"), link)
+
+    def test_a_bare_host_still_gets_the_default_port(self) -> None:
+        self._cdp()
+        link = self._link(gateway_url="198.51.100.7")
+        self.assertTrue(link.startswith("http://198.51.100.7:6081/v/"), link)
+        self.assertTrue(
+            self._link(gateway_url="198.51.100.7:7081").startswith(
+                "http://198.51.100.7:7081/v/"
+            )
+        )
+
+    def test_normalisation_keeps_what_was_written(self) -> None:
+        cases = {
+            "http://HOST:7081": "http://HOST:7081",
+            " http://HOST:7081/ ": "http://HOST:7081",
+            "HOST:7081": "http://HOST:7081",
+            "HOST": "http://HOST:6081",
+            "https://HOST": "https://HOST",
+            "https://HOST/arena": "https://HOST/arena",
+            "http://user:pw@HOST:7081": "http://HOST:7081",
+            # A noVNC page cannot be the gateway, so this one is converted.
+            "http://HOST:6082/vnc.html?autoconnect=true": "http://HOST:6081",
+            "http://HOST:99999": "",
+            "": "",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(arena_direct.gateway_base_text(raw), expected, raw)
+
+    def test_the_missing_address_hint_points_at_what_the_panel_shows(self) -> None:
+        self._cdp()
+        client = arena_direct.ArenaDirectClient(
+            "http://arena-browser:9223", data_dir=self.data_dir
+        )
+        with self.assertRaises(bridge_client.BridgeError) as ctx:
+            self.run_async(client.start_interactive_auth())
+        message = str(ctx.exception)
+        # AstrBot's panel renders the description, never the config key, so the
+        # operator searching for "browser_gateway_url" finds nothing.
+        self.assertIn("验证链接网关地址", message)
+        self.assertIn("browser_gateway_url", message)
+        self.assertIn("setup.sh", message)
+        self.assertIn("7081", message, "a remapped port must not read as wrong")
+
+
 class ForeignNetworkTests(DirectTransportCase):
     """AstrBot deployed outside the compose project, so `arena-browser` is unknown.
 

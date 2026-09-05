@@ -118,7 +118,11 @@ Cookie 存储，并在后续请求中优先使用；如果后台刷新成功，�
 
 ```dotenv
 LM_BRIDGE_BROWSER_GATEWAY_URL=http://HOST:6081
+ARENA_GATEWAY_PORT=6081
 ```
+
+`ARENA_GATEWAY_PORT` 是宿主机侧端口（容器内固定 `6081`）；端口冲突时只改它，
+重跑 `setup.sh` 会把上面那条 URL 和 `arena-browser-data/gateway-url.txt` 一起同步。
 
 短时签名服务内置于 `arena-browser`，不再需要独立 gateway 容器。它会
 验证签名链接，并在同一个 `6081` 端口下代理 noVNC 页面和 WebSocket；

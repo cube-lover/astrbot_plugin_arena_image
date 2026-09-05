@@ -102,7 +102,12 @@ LM_BRIDGE_BROWSER_CDP_URL=http://arena-browser:9223
 LM_BRIDGE_BROWSER_GATEWAY_URL=http://你的服务器IP或域名:6081
 LM_BRIDGE_BROWSER_VNC_URL=http://你的服务器IP或域名:6082/vnc.html?autoconnect=true&resize=scale
 ARENA_NOVNC_PASSWORD=强VNC密码
+ARENA_GATEWAY_PORT=6081
 ```
+
+`ARENA_GATEWAY_PORT` 是网关在**宿主机**上的端口（容器内固定 `6081`）。6081 被占用就改这一行，
+再跑一次 `./setup.sh`：它会把 `LM_BRIDGE_BROWSER_GATEWAY_URL` 和
+`arena-browser-data/gateway-url.txt` 的端口一并改好，插件读的就是新端口。
 
 ### 灰测（隐身）模型
 
@@ -268,10 +273,10 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 | 配置项 | 填什么 |
 | --- | --- |
 | `transport_mode` | `direct` ← 只有这一项是必填 |
-| `browser_gateway_url` | 一般不用填。`setup.sh` 会把 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 写进 `arena-browser-data/gateway-url.txt`，插件自己读；老部署没有这个文件时才填 `http://服务器IP:6081` |
+| `browser_gateway_url` | 一般不用填。`setup.sh` 会把 `.env` 里的 `LM_BRIDGE_BROWSER_GATEWAY_URL` 写进 `arena-browser-data/gateway-url.txt`，插件自己读；老部署没有这个文件时才填 `http://服务器IP:6081`。面板上这一栏叫「验证链接网关地址」（AstrBot 只显示中文说明，不显示配置键名）。端口 = 宿主机上映射到浏览器容器 `6081` 的那个，改成 `7081:6081` 就填 `:7081` |
 | `interactive_link_secret` | 不用填。插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关用的是同一个文件，永远不会不一致 |
 | `browser_cdp_url` | 不用填，默认 `http://arena-browser:9223`。连不上时插件会自己试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`；AstrBot 在另一个 Docker 网络时按下面第十一节处理（接一下网络，或者在 `.env` 里设 `ARENA_CDP_BIND=172.17.0.1`，插件依然什么都不用填） |
-| `browser_vnc_url` | 可选。填了它也能推出 `:6081` 网关地址，并在拿不到密钥时作为兜底链接 |
+| `browser_vnc_url` | 可选。填了它也能推出网关地址（按默认 `6081` 端口推算，改过端口就直接填上面那一栏），并在拿不到密钥时作为兜底链接 |
 | `interactive_link_ttl` | 验证链接有效期，默认 `900` 秒 |
 | `allow_stealth_models` | 放行灰测模型，默认开启（bridge 模式下由 `.env` 控制） |
 
@@ -281,7 +286,13 @@ direct 模式把 Bridge 做的事（模型列表、reCAPTCHA、出图请求、�
 cd "$(dirname "$(find /opt -maxdepth 3 -name docker-compose.arena.yml | head -1)")"
 sed -n 's/^LM_BRIDGE_BROWSER_GATEWAY_URL=//p' .env | tail -1 > arena-browser-data/gateway-url.txt
 cat arena-browser-data/gateway-url.txt      # 应该是 http://服务器IP:6081
+docker port arena-browser 6081/tcp          # 端口对不上就按这里显示的改上面那个文件
 ```
+
+**6081 被占用怎么办**：`.env` 里改一行 `ARENA_GATEWAY_PORT=7081`，重跑
+`./setup.sh`（它会把 `LM_BRIDGE_BROWSER_GATEWAY_URL` 和 `gateway-url.txt` 的端口一起改好），
+再 `docker compose -f docker-compose.arena.yml --env-file .env up -d`，最后放开新端口的防火墙。
+插件配置依旧一个都不用填。
 
 签名密钥不需要手抄，因为插件读的就是网关校验用的那个文件。只有非标准部署
 （密钥没挂进 `arena-browser`）才需要手填，位置是 compose 同级目录：
@@ -418,7 +429,7 @@ Cookie 会自动保存。后续 Cookie 失效时执行：
 | 端口 | 绑定 | 用途 |
 | --- | --- | --- |
 | 8000 | `127.0.0.1` | Bridge API |
-| 6081 | `0.0.0.0` | 短时验证链接网关，同时代理 noVNC 页面和 WebSocket |
+| 6081 | `0.0.0.0` | 短时验证链接网关，同时代理 noVNC 页面和 WebSocket；宿主机侧端口由 `.env` 的 `ARENA_GATEWAY_PORT` 决定（默认 `6081`，容器内固定 `6081`） |
 | 6082 | `127.0.0.1` | noVNC |
 | 9223 | Docker 内网 + `${ARENA_CDP_BIND}`（默认 `127.0.0.1`） | CDP 代理（direct 模式用） |
 
@@ -610,9 +621,14 @@ docker compose -f docker-compose.arena.yml --env-file .env up -d
 
 按报错分两种：
 
-- “还差一个地址：请把 browser_gateway_url 填成 …”：插件既没读到
-  `arena-browser-data/gateway-url.txt`，配置里也没填网关地址。按上面第五节的三行命令
-  补上那个文件，或者直接在插件配置里填 `http://服务器IP:6081`。
+- “还差一个地址：插件没读到网关地址”：插件既没读到 `arena-browser-data/gateway-url.txt`，
+  配置里也没填网关地址。重跑 `./setup.sh`（推荐，会把文件写好），或者在插件配置里找
+  **「验证链接网关地址」**这一栏填 `http://服务器IP:6081`。
+  面板上只显示中文说明，搜 `browser_gateway_url` 是搜不到的，它是配置键名。
+  端口要用 `docker port arena-browser 6081/tcp` 显示的那个宿主机端口，改过映射就填改过的。
+- 链接能拿到但打不开：多半是端口对不上或防火墙没放开。
+  `docker port arena-browser 6081/tcp` 看实际端口，
+  `cat arena-browser-data/gateway-url.txt` 看插件读到的端口，两个必须一致。
 - “拿不到验证链接：网关地址有了，但签名密钥…读不到”：`.interactive-link-secret`
   没挂进 `arena-browser`（检查 compose 的 `secrets:`），此时可以手填
   `interactive_link_secret` 作为临时办法。

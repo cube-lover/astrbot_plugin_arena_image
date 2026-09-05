@@ -18,12 +18,12 @@
   },
   "browser_cdp_url": {
     "type": "string",
-    "description": "arena-browser 的 CDP 地址（仅 direct 模式使用）",
+    "description": "arena-browser 的 CDP 地址（仅 direct 模式）。一般不用改；只有 AstrBot 和浏览器不在同一个 Docker 网络、且自动改试 host.docker.internal / 172.17.0.1 / 127.0.0.1 都连不上时，才填 http://服务器IP:9223",
     "default": "http://arena-browser:9223"
   },
   "browser_gateway_url": {
     "type": "string",
-    "description": "direct 模式唯一需要填的地址：验证链接网关，例如 http://服务器IP:6081（对应 .env 的 LM_BRIDGE_BROWSER_GATEWAY_URL）；填了 browser_vnc_url 也能自动推导",
+    "description": "验证链接网关地址（可选，正常部署留空）。留空时插件会自动读浏览器容器里 setup.sh 写好的 gateway-url.txt；只有老部署或自建部署读不到时，才填 http://服务器IP:6081",
     "default": ""
   },
   "browser_vnc_url": {

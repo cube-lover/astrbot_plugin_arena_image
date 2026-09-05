@@ -16,7 +16,11 @@ import tempfile
 import time
 import unittest
 import uuid
+import zlib
 from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
 
 from astrbot_plugin_arena_image import arena_direct, bridge_client
 
@@ -109,6 +113,8 @@ class FakePage:
         response: dict | None = None,
         url: str = "https://arena.ai/text/direct",
         refreshed_cookies: list[dict] | None = None,
+        responses: list[dict] | None = None,
+        action_sets: list[dict] | None = None,
     ) -> None:
         self.url = url
         self._cookies = list(cookies or [])
@@ -117,11 +123,16 @@ class FakePage:
         )
         self._models = list(models or [])
         self._response = response or {"status": 200, "headers": {}, "text": ""}
+        # A queue of scripted replies, for flows that make several requests.
+        self._responses = None if responses is None else list(responses)
+        self._action_sets = None if action_sets is None else list(action_sets)
         self.actions: list[str] = []
         self.requests: list[dict] = []
         self.cookie_reads: list[bool] = []
         self.table_reads = 0
         self.refresh_calls = 0
+        self.reload_calls = 0
+        self.action_reads = 0
 
     async def cookies(self, *, refresh: bool = False) -> list[dict]:
         self.cookie_reads.append(bool(refresh))
@@ -152,13 +163,20 @@ class FakePage:
                 "timeout": timeout,
             }
         )
-        return dict(self._response)
+        return dict(self._responses.pop(0)) if self._responses else dict(self._response)
+
+    async def reload(self, *, budget: float | None = None) -> bool:
+        self.reload_calls += 1
+        return True
 
     async def model_table(self) -> list[dict]:
         self.table_reads += 1
         return list(self._models)
 
     async def next_actions(self) -> dict[str, str]:
+        self.action_reads += 1
+        if self._action_sets:
+            return dict(self._action_sets.pop(0))
         return {"generateUploadUrl": "UPLOAD_ID", "getSignedUrl": "SIGNED_ID"}
 
 
@@ -723,6 +741,247 @@ class SessionRotationTests(DirectTransportCase):
                 return page.target_id
 
         self.assertEqual(self.run_async(_run()), "arena-1")
+
+
+class ReloadingCDP:
+    """Just enough CDP for `ArenaPage.reload` to be observable."""
+
+    def __init__(self, *, refuse: str = "", ready_after: int = 1, failed_polls: int = 0) -> None:
+        self.refuse = str(refuse)  # a method that this Chrome will not run
+        self.ready_after = int(ready_after)  # polls before the document is done
+        self.failed_polls = int(failed_polls)  # polls that die mid-navigation
+        self.calls: list[dict] = []
+        self.polls = 0
+
+    async def command(self, method, params=None, *, session_id=None, timeout=None):
+        self.calls.append(
+            {"method": str(method), "params": dict(params or {}), "session": session_id}
+        )
+        if method == self.refuse:
+            raise arena_direct.CDPError(f"refused: {method}")
+        return {}
+
+    async def evaluate(self, expression, *, session_id: str, timeout=None):
+        self.polls += 1
+        if self.polls <= self.failed_polls:
+            # Evaluating against a document that is being swapped out is normal.
+            raise arena_direct.CDPError("execution context destroyed")
+        return "complete" if self.polls >= self.ready_after else "loading"
+
+
+class PageReloadTests(DirectTransportCase):
+    """How `ArenaPage.reload` re-fetches the bundle, at the CDP level."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._patch(arena_direct, "PAGE_RELOAD_POLL_SECONDS", 0.01)
+        self._patch(arena_direct, "PAGE_RELOAD_SETTLE_SECONDS", 0.01)
+
+    def _page(self, cdp: ReloadingCDP):
+        return arena_direct.ArenaPage(
+            cdp, "session-1", "https://arena.ai/text/direct", target_id="arena-1"
+        )
+
+    def test_it_reloads_the_tab_and_bypasses_the_cache(self) -> None:
+        cdp = ReloadingCDP()
+        self.assertTrue(self.run_async(self._page(cdp).reload()))
+        methods = [call["method"] for call in cdp.calls]
+        self.assertEqual(methods, ["Page.enable", "Page.reload"])
+        reload_call = cdp.calls[-1]
+        # A cached bundle would hand back the same dead action ids.
+        self.assertIs(reload_call["params"].get("ignoreCache"), True)
+        self.assertEqual(reload_call["session"], "session-1")
+
+    def test_it_waits_for_the_document_before_claiming_success(self) -> None:
+        cdp = ReloadingCDP(ready_after=3)
+        self.assertTrue(self.run_async(self._page(cdp).reload()))
+        self.assertGreaterEqual(cdp.polls, 3)
+
+    def test_a_poll_that_dies_mid_navigation_is_not_a_failure(self) -> None:
+        cdp = ReloadingCDP(failed_polls=2, ready_after=3)
+        self.assertTrue(self.run_async(self._page(cdp).reload()))
+        self.assertGreaterEqual(cdp.polls, 3)
+
+    def test_a_refused_reload_is_reported_rather_than_raised(self) -> None:
+        cdp = ReloadingCDP(refuse="Page.reload")
+        self.assertFalse(self.run_async(self._page(cdp).reload()))
+        self.assertEqual(cdp.polls, 0)
+
+    def test_page_enable_being_unavailable_does_not_stop_the_reload(self) -> None:
+        cdp = ReloadingCDP(refuse="Page.enable")
+        self.assertTrue(self.run_async(self._page(cdp).reload()))
+        self.assertEqual([call["method"] for call in cdp.calls], ["Page.enable", "Page.reload"])
+
+    def test_a_document_that_never_completes_gives_up_inside_the_budget(self) -> None:
+        cdp = ReloadingCDP(ready_after=10**6)
+        started = time.monotonic()
+        self.assertFalse(self.run_async(self._page(cdp).reload(budget=0.1)))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+
+def _png_bytes() -> bytes:
+    """A real 1x1 PNG, so the MIME sniffer agrees it is one."""
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return len(data).to_bytes(4, "big") + body + zlib.crc32(body).to_bytes(4, "big")
+
+    header = (1).to_bytes(4, "big") + (1).to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _png_data_url() -> str:
+    return "data:image/png;base64," + base64.b64encode(_png_bytes()).decode()
+
+
+def _flight(payload: dict) -> str:
+    """A Next.js flight response body, whose `1:` line carries the payload."""
+    return "0:{}\n1:" + json.dumps(payload) + "\n"
+
+
+class FakeHTTPX:
+    """Only the two names the signed-R2 PUT touches on ``httpx``."""
+
+    HTTPError = httpx.HTTPError
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = int(status)
+        self.puts: list[dict] = []
+
+    def AsyncClient(self, **_kwargs):  # noqa: N802 - mirrors httpx's own name
+        outer = self
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc: object) -> None:
+                return None
+
+            async def put(self, url, *, content=None, headers=None):
+                outer.puts.append(
+                    {"url": url, "size": len(content or b""), "headers": dict(headers or {})}
+                )
+                return SimpleNamespace(status_code=outer.status)
+
+        return _Client()
+
+
+class StaleServerActionTests(DirectTransportCase):
+    """Arena redeploys a few times a day; every deploy renames the actions.
+
+    A tab left open across one keeps handing out the previous build's ids, and
+    Arena answers those with a bare 404.  Before the retry below that read as
+    "img2img is broken" and no amount of re-binding the session helped.
+    """
+
+    STALE = {"status": 404, "headers": {}, "text": "Server action not found."}
+    UPLOAD_OK = {
+        "status": 200,
+        "headers": {},
+        "text": _flight(
+            {
+                "success": True,
+                "data": {"uploadUrl": "https://r2.example/put?sig=1", "key": "uploads/a.png"},
+            }
+        ),
+    }
+    SIGNED_OK = {
+        "status": 200,
+        "headers": {},
+        "text": _flight({"success": True, "data": {"url": "https://r2.example/get?sig=2"}}),
+    }
+    OLD_IDS = {"generateUploadUrl": "OLD_UP", "getSignedUrl": "OLD_SIGN"}
+    NEW_IDS = {"generateUploadUrl": "NEW_UP", "getSignedUrl": "NEW_SIGN"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.httpx = FakeHTTPX()
+        self._patch(arena_direct, "httpx", self.httpx)
+
+    def _upload(self, page: FakePage):
+        client = self.client(page)
+        return self.run_async(client._upload_reference(page, _png_data_url()))
+
+    def test_marker_is_what_separates_a_redeploy_from_a_real_404(self) -> None:
+        self.assertTrue(arena_direct.action_is_stale(404, "Server action not found."))
+        self.assertTrue(arena_direct.action_is_stale(404, "SERVER ACTION NOT FOUND."))
+        self.assertFalse(arena_direct.action_is_stale(404, "Not Found"))
+        self.assertFalse(arena_direct.action_is_stale(200, "Server action not found."))
+        self.assertFalse(arena_direct.action_is_stale(0, ""))
+
+    def test_a_redeploy_is_retried_through_a_tab_reload(self) -> None:
+        page = FakePage(
+            responses=[self.STALE, self.UPLOAD_OK, self.SIGNED_OK],
+            action_sets=[self.OLD_IDS, self.NEW_IDS],
+        )
+        entry = self._upload(page)
+        self.assertEqual(entry["contentType"], "image/png")
+        self.assertEqual(entry["url"], "https://r2.example/get?sig=2")
+        self.assertEqual(page.reload_calls, 1)
+        # Rescanning without the reload would have returned the same dead ids.
+        self.assertEqual(page.action_reads, 2)
+        sent = [request["headers"].get("Next-Action") for request in page.requests]
+        self.assertEqual(sent, ["OLD_UP", "NEW_UP", "NEW_SIGN"])
+        self.assertEqual(len(self.httpx.puts), 1)
+        self.assertEqual(self.httpx.puts[0]["size"], len(_png_bytes()))
+
+    def test_a_redeploy_between_step_one_and_step_three_is_also_retried(self) -> None:
+        page = FakePage(
+            responses=[self.UPLOAD_OK, self.STALE, self.UPLOAD_OK, self.SIGNED_OK],
+            action_sets=[self.OLD_IDS, self.NEW_IDS],
+        )
+        entry = self._upload(page)
+        self.assertEqual(entry["url"], "https://r2.example/get?sig=2")
+        self.assertEqual(page.reload_calls, 1)
+        # The image is PUT again on the retry: the first key belonged to the
+        # build that has already gone away.
+        self.assertEqual(len(self.httpx.puts), 2)
+
+    def test_two_failures_in_a_row_stop_and_explain_themselves(self) -> None:
+        page = FakePage(
+            responses=[self.STALE, self.STALE],
+            action_sets=[self.OLD_IDS, self.NEW_IDS],
+        )
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self._upload(page)
+        self.assertEqual(caught.exception.code, "upload_action_stale")
+        message = str(caught.exception)
+        self.assertIn("更新了页面", message)
+        self.assertNotIn("重新绑定", message)  # the session was never the problem
+        self.assertEqual(page.reload_calls, 1)  # exactly one retry, not a loop
+        self.assertEqual(self.httpx.puts, [])
+
+    def test_the_happy_path_never_reloads_the_tab(self) -> None:
+        page = FakePage(responses=[self.UPLOAD_OK, self.SIGNED_OK])
+        self._upload(page)
+        self.assertEqual(page.reload_calls, 0)
+        self.assertEqual(page.action_reads, 1)
+
+    def test_a_plain_404_is_still_reported_as_a_plain_failure(self) -> None:
+        page = FakePage(responses=[{"status": 404, "headers": {}, "text": "Not Found"}])
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self._upload(page)
+        self.assertEqual(caught.exception.code, "upload_url_failed")
+        self.assertEqual(page.reload_calls, 0)
+
+    def test_refreshing_the_actions_ignores_a_warm_cache(self) -> None:
+        arena_direct._ACTIONS = dict(self.OLD_IDS)
+        arena_direct._ACTIONS_AT = time.time()
+        page = FakePage(action_sets=[self.NEW_IDS])
+        client = self.client(page)
+        cached = self.run_async(client._next_actions(page))
+        self.assertEqual(cached, self.OLD_IDS)
+        self.assertEqual(page.reload_calls, 0)
+        fresh = self.run_async(client._next_actions(page, refresh=True))
+        self.assertEqual(fresh, self.NEW_IDS)
+        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(arena_direct._ACTIONS, self.NEW_IDS)
 
 
 class GenerationTests(DirectTransportCase):

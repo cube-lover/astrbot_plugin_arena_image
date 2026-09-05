@@ -120,6 +120,15 @@ MODEL_VARIANT_FAILURE_TTL_SECONDS = 10 * 60
 SESSION_REFRESH_BUDGET_SECONDS = 8.0
 SESSION_REFRESH_POLL_SECONDS = 0.6
 
+# Next.js rebuilds every server-action id on every deploy, and a tab that has
+# been open since the previous deploy keeps serving the ids of the bundle it
+# loaded.  Arena answers a forgotten id with a bare 404 "Server action not
+# found.", so that response means "reload the tab", not "this feature is gone".
+STALE_ACTION_MARKER = "server action not found"
+PAGE_RELOAD_BUDGET_SECONDS = 30.0
+PAGE_RELOAD_POLL_SECONDS = 1.0
+PAGE_RELOAD_SETTLE_SECONDS = 2.0
+
 _NEXT_ACTION_RE = (
     r'\(0,[a-zA-Z_$][\w$]*\.createServerReference\)\(["\']([\w\d]*?)["\'],'
     r'[a-zA-Z_$][\w$]*\.callServer,void 0,[a-zA-Z_$][\w$]*\.findSourceMapURL,'
@@ -151,6 +160,23 @@ def _err(
         payload={"error": error},
         retry_after=retry_after,
     )
+
+
+class _StaleActionError(RuntimeError):
+    """Internal signal: the action ids came from a bundle Arena has replaced."""
+
+
+def action_is_stale(status: Any, body: Any) -> bool:
+    """Whether a server-action POST failed because Arena redeployed.
+
+    Worth telling apart from a real 404: the ids are rebuilt on every deploy, so
+    a tab left open across one answers every upload with this, and a reload fixes
+    it.  Treating it as "img2img is broken" would have the operator re-binding a
+    session that was never the problem.
+    """
+    if int(status or 0) != 404:
+        return False
+    return STALE_ACTION_MARKER in str(body or "").casefold()
 
 
 # --- Arena session cookie decoding (ported from the bridge's auth module) -----
@@ -1256,6 +1282,40 @@ class ArenaPage:
             token = combine_auth_cookie(await self.cookies(refresh=True))
         return token
 
+    async def reload(self, *, budget: float = PAGE_RELOAD_BUDGET_SECONDS) -> bool:
+        """Reload the tab so it fetches the current build's JS chunks.
+
+        The login survives: cookies live in the profile, not in the page.  What
+        does not survive is the previous deploy's server-action ids, which is the
+        entire point of doing this.
+        """
+        with contextlib.suppress(CDPError):
+            await self.cdp.command(
+                "Page.enable", {}, session_id=self.session_id, timeout=15.0
+            )
+        try:
+            await self.cdp.command(
+                "Page.reload",
+                {"ignoreCache": True},
+                session_id=self.session_id,
+                timeout=30.0,
+            )
+        except CDPError:
+            return False
+        deadline = time.monotonic() + max(0.0, float(budget))
+        while time.monotonic() < deadline:
+            await asyncio.sleep(PAGE_RELOAD_POLL_SECONDS)
+            try:
+                state = await self.evaluate("document.readyState", timeout=10.0)
+            except CDPError:
+                continue
+            if str(state or "") == "complete":
+                # The action ids sit in chunks requested after `load`, so give
+                # the page a moment before scanning for them.
+                await asyncio.sleep(PAGE_RELOAD_SETTLE_SECONDS)
+                return True
+        return False
+
     async def sitekey(self) -> str:
         try:
             value = await self.evaluate(_SITEKEY_JS, timeout=20.0)
@@ -2032,12 +2092,25 @@ class ArenaDirectClient:
 
     # -- reference-image upload ----------------------------------------------
 
-    async def _next_actions(self, page: ArenaPage) -> dict[str, str]:
-        """Cached Next.js server-action IDs, rediscovered from the live bundle."""
+    async def _next_actions(
+        self, page: ArenaPage, *, refresh: bool = False
+    ) -> dict[str, str]:
+        """Cached Next.js server-action IDs, rediscovered from the live bundle.
+
+        ``refresh=True`` reloads the tab first: the ids are read out of the JS
+        chunks the page has loaded, so rescanning without a reload just returns
+        the same forgotten ids.
+        """
         global _ACTIONS, _ACTIONS_AT
-        async with _LOCK:
-            if _ACTIONS and time.time() - _ACTIONS_AT <= ACTION_CACHE_SECONDS:
-                return dict(_ACTIONS)
+        if refresh:
+            async with _LOCK:
+                _ACTIONS = {}
+                _ACTIONS_AT = 0.0
+            await page.reload()
+        else:
+            async with _LOCK:
+                if _ACTIONS and time.time() - _ACTIONS_AT <= ACTION_CACHE_SECONDS:
+                    return dict(_ACTIONS)
         actions = await page.next_actions()
         if actions:
             async with _LOCK:
@@ -2060,9 +2133,9 @@ class ArenaDirectClient:
     async def _upload_reference(self, page: ArenaPage, value: str) -> dict[str, Any]:
         """Upload one reference image and return its attachment entry.
 
-        Steps 1 and 3 must run inside the page (they need the session cookies and
-        Cloudflare clearance); step 2 is a plain signed R2 PUT, so it goes out
-        directly from the plugin.
+        Retried exactly once through a tab reload: Arena redeploys several times
+        a day and every deploy invalidates the server-action ids, which used to
+        surface as a flat "img2img is broken" until someone reopened the tab.
         """
         raw, mime = decode_image_value(value)
         digest = hashlib.md5(raw).hexdigest()
@@ -2075,14 +2148,49 @@ class ArenaDirectClient:
                 "url": cached["url"],
             }
 
-        actions = await self._next_actions(page)
-        upload_action = actions.get("generateUploadUrl") or ""
-        signed_action = actions.get("getSignedUrl") or ""
-        if not upload_action or not signed_action:
-            raise _err(
-                "没能从竞技场页面读到上传接口（Next-Action）ID，图生图暂时不可用。",
-                code="upload_action_missing",
-            )
+        for attempt in (0, 1):
+            actions = await self._next_actions(page, refresh=attempt > 0)
+            upload_action = actions.get("generateUploadUrl") or ""
+            signed_action = actions.get("getSignedUrl") or ""
+            if not upload_action or not signed_action:
+                raise _err(
+                    "没能从竞技场页面读到上传接口（Next-Action）ID，图生图暂时不可用。",
+                    code="upload_action_missing",
+                )
+            try:
+                return await self._upload_once(
+                    page,
+                    raw=raw,
+                    mime=mime,
+                    digest=digest,
+                    upload_action=upload_action,
+                    signed_action=signed_action,
+                )
+            except _StaleActionError:
+                if attempt:
+                    raise _err(
+                        "竞技场刚刚更新了页面，上传接口的编号全换了。已经自动刷新过一次还是不行，"
+                        "过一两分钟再发一次就好。",
+                        code="upload_action_stale",
+                    ) from None
+        raise _err("上传参考图失败。", code="upload_failed")  # pragma: no cover
+
+    async def _upload_once(
+        self,
+        page: ArenaPage,
+        *,
+        raw: bytes,
+        mime: str,
+        digest: str,
+        upload_action: str,
+        signed_action: str,
+    ) -> dict[str, Any]:
+        """One pass of Arena's three-step upload.
+
+        Steps 1 and 3 must run inside the page (they need the session cookies and
+        Cloudflare clearance); step 2 is a plain signed R2 PUT, so it goes out
+        directly from the plugin.
+        """
         extension = mimetypes.guess_extension(mime) or ".png"
         filename = f"{digest[:12]}{'.jpg' if extension == '.jpe' else extension}"
         headers = {"Accept": "text/x-component", "Referer": f"{ARENA_ORIGIN}/?mode=direct"}
@@ -2093,6 +2201,8 @@ class ArenaDirectClient:
             body=json.dumps([filename, mime]),
             timeout=60.0,
         )
+        if action_is_stale(first.get("status"), first.get("text")):
+            raise _StaleActionError("generateUploadUrl")
         payload = self._flight_payload(first.get("text") or "")
         data = payload.get("data") if isinstance(payload, dict) else None
         upload_url = str((data or {}).get("uploadUrl") or "")
@@ -2124,6 +2234,8 @@ class ArenaDirectClient:
             body=json.dumps([key]),
             timeout=60.0,
         )
+        if action_is_stale(third.get("status"), third.get("text")):
+            raise _StaleActionError("getSignedUrl")
         payload = self._flight_payload(third.get("text") or "")
         data = payload.get("data") if isinstance(payload, dict) else None
         download_url = str((data or {}).get("url") or "")

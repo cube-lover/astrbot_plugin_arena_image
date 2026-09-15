@@ -113,6 +113,16 @@
     "description": "发送前的图片大小阈值，超过会自动压缩/降采样（需要 Pillow）",
     "default": 8388608
   },
+  "send_max_attempts": {
+    "type": "int",
+    "description": "发送图片的最大尝试次数；被平台拒收（QQ 返回 result 120）时会自动换一种形式重发，填 1 就是只发一次",
+    "default": 3
+  },
+  "send_retry_delay": {
+    "type": "int",
+    "description": "发送失败后重试的等待秒数，每次重试按次数递增；当次发送通常几秒后就通了",
+    "default": 2
+  },
   "max_input_images": {
     "type": "int",
     "description": "一次图生图最多发送的参考图数量",

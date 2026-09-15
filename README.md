@@ -326,6 +326,8 @@ transport_mode: bridge  →  direct
 | `max_image_bytes` | 10 MB | **输入**参考图上限（图生图上传用） |
 | `max_output_image_bytes` | 64 MB | **输出**图片下载上限，超过才报错 |
 | `send_image_max_bytes` | 8 MB | 超过就自动压缩/降采样后再发（需要 Pillow） |
+| `send_max_attempts` | 3 | 发送图片的最大尝试次数；被平台拒收时换一种形式重发，`1` = 只发一次 |
+| `send_retry_delay` | 2 | 发送失败后重试的等待秒数，按尝试次数递增 |
 | `max_input_images` | 4 | 一次图生图最多几张参考图 |
 | `max_output_images` | 1 | 一次请求最多发几张成图 |
 | `max_saved_outputs` | 32 | 本地保留的成图数量 |
@@ -543,6 +545,14 @@ Arena 上游限速。插件已经会读 `Retry-After` 自动重试 2 次（`rate
 
 `max_output_image_bytes`（默认 64 MB）是下载上限，`send_image_max_bytes`（默认 8 MB）是发送阈值，
 超过发送阈值会自动压缩/降采样成 JPEG 再发，不会丢掉已经画好的图。
+
+### 画好了却没收到图 / 提示发送失败
+
+发送由插件自己投递，而不是交给 AstrBot 发一次就算了：平台把消息拒收时（QQ 风控会回
+`result 120`）会自动重试，按 `send_retry_delay`（默认 2 秒，逐次递增）等待，
+重试时依次换成「只发图片」和「压缩后的图片」两种形式。`send_max_attempts`（默认 3，最大 6）
+控制尝试次数；填 1 就退回以前的一次性发送。全部失败时聊天里会明确说明发送失败和最后一次
+的报错，图仍然保留在插件的 `generated/` 目录里。
 
 ### 国内服务器无法访问 Arena
 

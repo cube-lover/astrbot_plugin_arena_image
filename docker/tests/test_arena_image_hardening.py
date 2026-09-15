@@ -170,6 +170,23 @@ class _StubImage:
         return self._base64
 
 
+class _StubPlain:
+    """Minimal Plain component: keeps the caption text."""
+
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+
+
+class _StubMessageChain:
+    """Minimal MessageChain: mirrors the dataclass fields main.py touches."""
+
+    def __init__(self, chain=None, **_) -> None:
+        self.chain = list(chain or [])
+        self.use_t2i_ = None
+        self.use_markdown_ = None
+        self.type = None
+
+
 def _install_astrbot_stubs() -> None:
     """Register a minimal astrbot surface so main.py is importable offline."""
     if "astrbot" in sys.modules:
@@ -185,6 +202,7 @@ def _install_astrbot_stubs() -> None:
     components = types.ModuleType("astrbot.api.message_components")
     components.At = type("At", (), {})
     components.Image = _StubImage
+    components.Plain = _StubPlain
     star_mod = types.ModuleType("astrbot.api.star")
     star_mod.Context = type("Context", (), {})
     star_mod.Star = _StubStar
@@ -192,6 +210,10 @@ def _install_astrbot_stubs() -> None:
     star_mod.register = lambda *args, **kwargs: (lambda cls: cls)  # noqa: ARG005
     core = types.ModuleType("astrbot.core")
     core.__path__ = []
+    core_message = types.ModuleType("astrbot.core.message")
+    core_message.__path__ = []
+    message_result = types.ModuleType("astrbot.core.message.message_event_result")
+    message_result.MessageChain = _StubMessageChain
     core_star = types.ModuleType("astrbot.core.star")
     core_star.__path__ = []
     core_filter = types.ModuleType("astrbot.core.star.filter")
@@ -205,6 +227,8 @@ def _install_astrbot_stubs() -> None:
         ("astrbot.api.message_components", components),
         ("astrbot.api.star", star_mod),
         ("astrbot.core", core),
+        ("astrbot.core.message", core_message),
+        ("astrbot.core.message.message_event_result", message_result),
         ("astrbot.core.star", core_star),
         ("astrbot.core.star.filter", core_filter),
         ("astrbot.core.star.filter.command", command_mod),
@@ -224,8 +248,20 @@ class FakeResult:
 
 
 class FakeEvent:
-    def __init__(self, private: bool = False) -> None:
+    def __init__(
+        self,
+        private: bool = False,
+        *,
+        send_failures: list | None = None,
+        with_send: bool = True,
+    ) -> None:
         self._private = private
+        # Each entry is raised once, in order, before a send is allowed through.
+        self.send_failures = list(send_failures or [])
+        self.send_calls = 0
+        self.sent: list = []
+        if not with_send:
+            self.send = None
 
     def plain_result(self, text: str) -> FakeResult:
         return FakeResult(text)
@@ -235,6 +271,12 @@ class FakeEvent:
 
     def get_group_id(self) -> str:
         return "" if self._private else "group-1"
+
+    async def send(self, chain) -> None:
+        self.send_calls += 1
+        if self.send_failures:
+            raise self.send_failures.pop(0)
+        self.sent.append(chain)
 
 
 def _make_plugin(test_case, config=None):
@@ -685,6 +727,147 @@ class GenerationQueueTest(unittest.TestCase):
         self.assertIn("限流", results[0].text)
         self.assertIn("12 秒", results[0].text)
         self.assertIn("/竞技场画图模型", results[0].text)
+
+
+class ImageDeliveryRetryTest(unittest.TestCase):
+    """A refused send must not throw away a finished picture.
+
+    The deployed instance lost four generations to ``Failed to send the message
+    chain`` / NapCat ``EventChecker Failed ... "result": 120``: a yielded result
+    is sent exactly once, so the picture disappeared with the reject.
+    """
+
+    PROMPT = "画一只猫"
+
+    def _plugin_with_one_image(self, config=None):
+        main, plugin = _make_plugin(self, config)
+        image = plugin.output_dir / "image-fixture.png"
+        image.write_bytes(PNG_MAGIC + b"picture-bytes")
+
+        async def materialize(value):  # noqa: ARG001 - stands in for the download
+            return image
+
+        class _Client:
+            async def complete(self, *, model, prompt, images=None):  # noqa: ARG002
+                return {"images": ["https://img.example/one.png"]}
+
+        plugin._materialize_output = materialize
+        plugin._client = lambda: _Client()
+        return main, plugin, image
+
+    def _generate(self, plugin, event):
+        return _collect(
+            plugin._generate(
+                event,
+                self.PROMPT,
+                include_input_images=False,
+                model_id="gpt-image-2 (medium)",
+            )
+        )
+
+    def test_caption_and_picture_go_out_as_one_message(self) -> None:
+        _, plugin, image = self._plugin_with_one_image()
+        event = FakeEvent()
+
+        results = self._generate(plugin, event)
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.send_calls, 1)
+        chain = event.sent[0].chain
+        self.assertEqual(len(chain), 2)
+        self.assertIn("模型：gpt-image-2 (medium)", chain[0].text)
+        self.assertIn("画图耗时", chain[0].text)
+        self.assertEqual(chain[1].file, str(image))
+
+    def test_rejected_send_is_retried_and_drops_the_caption(self) -> None:
+        main, plugin, image = self._plugin_with_one_image({"send_retry_delay": 0})
+        event = FakeEvent(
+            send_failures=[
+                RuntimeError(
+                    "ActionFailed retcode=1200 EventChecker Failed: "
+                    'NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg {"result": 120}'
+                )
+            ]
+        )
+        delays: list[float] = []
+
+        async def capture_sleep(seconds):
+            delays.append(seconds)
+
+        with (
+            patch.object(main.asyncio, "sleep", capture_sleep),
+            patch.object(main.logger, "warning"),
+        ):
+            results = self._generate(plugin, event)
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.send_calls, 2)
+        self.assertEqual([len(item.chain) for item in event.sent], [1])
+        self.assertEqual(event.sent[0].chain[0].file, str(image))
+
+    def test_exhausted_retries_tell_the_user_why(self) -> None:
+        main, plugin, _ = self._plugin_with_one_image(
+            {"send_max_attempts": 2, "send_retry_delay": 0}
+        )
+        event = FakeEvent(
+            send_failures=[RuntimeError("first reject"), RuntimeError("second reject")]
+        )
+
+        with patch.object(main.logger, "warning"):
+            results = self._generate(plugin, event)
+
+        self.assertEqual(event.send_calls, 2)
+        self.assertEqual(len(results), 1)
+        self.assertIn("发送失败", results[0].text)
+        self.assertIn("已重试 2 次", results[0].text)
+        self.assertIn("second reject", results[0].text)
+
+    def test_single_attempt_build_keeps_the_old_behaviour(self) -> None:
+        main, plugin, image = self._plugin_with_one_image({"send_max_attempts": 1})
+        event = FakeEvent(send_failures=[RuntimeError("rejected")])
+
+        with patch.object(main.logger, "warning"):
+            results = self._generate(plugin, event)
+
+        self.assertEqual(event.send_calls, 1)
+        self.assertEqual(len(results), 1)
+        self.assertIn("已重试 1 次", results[0].text)
+
+    def test_astrbot_without_direct_send_still_yields_the_result(self) -> None:
+        _, plugin, image = self._plugin_with_one_image()
+        event = FakeEvent(with_send=False)
+
+        results = self._generate(plugin, event)
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("模型：gpt-image-2 (medium)", results[0].text)
+        self.assertEqual(len(results[0].chain), 1)
+        self.assertEqual(results[0].chain[0].file, str(image))
+
+    def test_large_picture_adds_a_downscaled_fallback(self) -> None:
+        main, plugin = _make_plugin(self)
+        if main.PILImage is None:
+            self.skipTest("Pillow is not installed")
+        image = plugin.output_dir / "image-big.png"
+        raw = _noisy_png(1200)
+        image.write_bytes(raw)
+        self.assertGreater(len(raw), main.FALLBACK_SEND_IMAGE_BYTES)
+
+        smaller = plugin._smaller_send_copy(image)
+
+        self.assertIsNotNone(smaller)
+        self.assertLessEqual(smaller.stat().st_size, main.FALLBACK_SEND_IMAGE_BYTES)
+        labels = [label for label, _ in plugin._send_plans(image, "模型：x")]
+        self.assertEqual(labels, ["说明+原图", "仅原图", "仅压缩图"])
+
+    def test_small_picture_has_no_redundant_fallback(self) -> None:
+        _, plugin = _make_plugin(self)
+        image = plugin.output_dir / "image-small.png"
+        image.write_bytes(PNG_MAGIC + b"tiny")
+
+        self.assertIsNone(plugin._smaller_send_copy(image))
+        labels = [label for label, _ in plugin._send_plans(image, "模型：x")]
+        self.assertEqual(labels, ["说明+原图", "仅原图"])
 
 
 class InputImageDedupTest(unittest.TestCase):

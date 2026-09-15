@@ -16,8 +16,9 @@ from typing import Any
 import httpx
 from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.command import GreedyStr
 
 try:  # Pillow ships with AstrBot, but stay importable without it.
@@ -52,6 +53,14 @@ DEFAULT_MAX_OUTPUT_IMAGE_BYTES = 64 * 1024 * 1024
 # Messaging platforms reject very large attachments, so anything above this is
 # re-encoded before it is sent instead of being dropped.
 DEFAULT_SEND_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+# A send the platform refused is retried with different shapes of the same
+# message; QQ answers ``result: 120`` for a transient risk-control hit and takes
+# the same picture a moment later.
+DEFAULT_SEND_MAX_ATTEMPTS = 3
+DEFAULT_SEND_RETRY_DELAY = 2.0
+# Last-resort copy: the protocol side inlines the picture as base64, so a
+# multi-megabyte PNG becomes a payload several times its own size.
+FALLBACK_SEND_IMAGE_BYTES = 2 * 1024 * 1024
 # Arena's attachment pipeline only accepts still pictures, so GIF uploads are
 # always flattened even when they hold a single frame.
 ALWAYS_FLATTEN_INPUT_MIMES = frozenset({"image/gif", "image/apng"})
@@ -180,7 +189,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.3",
+    "0.7.4",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -287,6 +296,22 @@ class ArenaImagePlugin(Star):
             DEFAULT_SEND_IMAGE_MAX_BYTES,
             256 * 1024,
             64 * 1024 * 1024,
+        )
+
+    def _send_max_attempts(self) -> int:
+        return _as_int(
+            self.config.get("send_max_attempts"),
+            DEFAULT_SEND_MAX_ATTEMPTS,
+            1,
+            6,
+        )
+
+    def _send_retry_delay(self) -> float:
+        return _as_float(
+            self.config.get("send_retry_delay"),
+            DEFAULT_SEND_RETRY_DELAY,
+            0.0,
+            30.0,
         )
 
     @staticmethod
@@ -1486,6 +1511,10 @@ class ArenaImagePlugin(Star):
 
         self._active_generations += 1
         try:
+            # Generated pictures are handed over once the queue lock is
+            # released: a rejected send is retried below, and waiting out those
+            # retries must not keep the next generation queued behind it.
+            deliveries: list[tuple[Path, str]] = []
             async with self._generation_lock:
                 try:
                     if not model_id:
@@ -1507,10 +1536,9 @@ class ArenaImagePlugin(Star):
                         return
 
                     max_outputs = _as_int(self.config.get("max_output_images"), 1, 1, 4)
-                    sent = 0
                     failures: list[str] = []
                     for url in urls:
-                        if sent >= max_outputs:
+                        if len(deliveries) >= max_outputs:
                             break
                         try:
                             path = await self._materialize_output(url)
@@ -1522,15 +1550,15 @@ class ArenaImagePlugin(Star):
                             )
                             continue
                         elapsed_seconds = time.monotonic() - generation_started_at
-                        result = event.plain_result(
-                            f"模型：{model_id}\n"
-                            f"画图耗时：{elapsed_seconds:.1f} 秒"
+                        deliveries.append(
+                            (
+                                path,
+                                f"模型：{model_id}\n"
+                                f"画图耗时：{elapsed_seconds:.1f} 秒",
+                            )
                         )
-                        result.chain.append(Image.fromFileSystem(str(path)))
-                        yield result
-                        sent += 1
 
-                    if sent:
+                    if deliveries:
                         self._last_generation_seconds = time.monotonic() - generation_started_at
                         self._prune_outputs()
                     elif text:
@@ -1551,8 +1579,133 @@ class ArenaImagePlugin(Star):
                         yield event.plain_result(hint)
                     else:
                         yield event.plain_result(f"生成失败：{_display_error(exc)}")
+                    return
+
+            for path, caption in deliveries:
+                error = await self._deliver_image(event, path, caption)
+                if error is None:
+                    continue
+                if not error:
+                    # This AstrBot build has no direct send: keep the framework
+                    # path, which sends the result exactly once.
+                    result = event.plain_result(caption)
+                    result.chain.append(Image.fromFileSystem(str(path)))
+                    yield result
+                    continue
+                yield event.plain_result(
+                    f"图片已生成，但发送失败（已重试 {self._send_max_attempts()} 次）：{error}"
+                )
         finally:
             self._active_generations = max(0, self._active_generations - 1)
+
+    def _send_plans(
+        self,
+        path: Path,
+        caption: str,
+    ) -> list[tuple[str, MessageChain]]:
+        """Ordered shapes of one picture, from "exactly as before" to smallest.
+
+        The first plan is what this plugin has always sent.  The later ones only
+        run when the platform refused that message: the caption is dropped (a
+        filter that trips on text no longer matters) and the last one carries a
+        downscaled copy, because the protocol side inlines the picture as base64
+        and a multi-megabyte PNG turns into an outsized payload.
+        """
+        plans: list[tuple[str, MessageChain]] = [
+            (
+                "说明+原图",
+                MessageChain(
+                    [Plain(caption), Image.fromFileSystem(str(path))]
+                ),
+            ),
+            ("仅原图", MessageChain([Image.fromFileSystem(str(path))])),
+        ]
+        smaller = self._smaller_send_copy(path)
+        if smaller is not None:
+            plans.append(
+                (
+                    "仅压缩图",
+                    MessageChain([Image.fromFileSystem(str(smaller))]),
+                )
+            )
+        return plans
+
+    def _smaller_send_copy(self, path: Path) -> Path | None:
+        """Write a much smaller JPEG next to the generated file, if possible."""
+        if PILImage is None:
+            return None
+        limit = min(self._send_max_bytes(), FALLBACK_SEND_IMAGE_BYTES)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            logger.debug("[arena_image] 读取生成图片失败：%s", exc)
+            return None
+        if len(raw) <= limit:
+            # The original already fits the fallback budget: re-sending the same
+            # bytes would not be a new attempt.
+            return None
+        data, mime = _shrink_image_bytes(raw, "image/png", limit)
+        if not data or data == raw or mime != "image/jpeg":
+            return None
+        target = path.with_name(f"{path.stem}-small.jpg")
+        try:
+            target.write_bytes(data)
+        except OSError as exc:
+            logger.debug("[arena_image] 写入压缩副本失败：%s", exc)
+            return None
+        return target
+
+    async def _deliver_image(
+        self,
+        event: AstrMessageEvent,
+        path: Path,
+        caption: str,
+    ) -> str | None:
+        """Send one generated picture, retrying a send the platform refused.
+
+        A yielded result is sent exactly once, so a single platform hiccup throws
+        away a picture that took minutes to draw.  QQ risk control rejects a
+        share of sends with ``result: 120`` and accepts the same message a
+        moment later, so the picture goes out through ``event.send`` where it can
+        be retried and reshaped.
+
+        Returns ``None`` once a plan went through, an empty string when this
+        AstrBot build offers no direct send (the caller yields instead, as
+        before), and the last error text when every attempt failed.
+        """
+        sender = getattr(event, "send", None)
+        if not callable(sender):
+            return ""
+        attempts = self._send_max_attempts()
+        delay = self._send_retry_delay()
+        plans = self._send_plans(path, caption)
+        last_error = ""
+        for attempt in range(attempts):
+            label, chain = plans[min(attempt, len(plans) - 1)]
+            try:
+                await sender(chain)
+            except Exception as exc:
+                last_error = _display_error(exc, limit=200)
+                logger.warning(
+                    "[arena_image] 发送图片失败（第 %d/%d 次，%s）：%s",
+                    attempt + 1,
+                    attempts,
+                    label,
+                    last_error,
+                )
+                if attempt + 1 < attempts:
+                    # Linear backoff: the retry has to outlive a short
+                    # risk-control window before the same message lands.
+                    await asyncio.sleep(delay * (attempt + 1))
+                continue
+            if attempt:
+                logger.info(
+                    "[arena_image] 重试第 %d 次发送成功（%s）",
+                    attempt + 1,
+                    label,
+                )
+            return None
+        return last_error
 
     async def _materialize_output(self, value: str) -> Path:
         max_bytes = self._output_max_bytes()

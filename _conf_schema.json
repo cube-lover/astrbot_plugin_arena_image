@@ -113,6 +113,11 @@
     "description": "发送前的图片大小阈值，超过会自动压缩/降采样（需要 Pillow）",
     "default": 8388608
   },
+  "qq_image_send_timeout": {
+    "type": "int",
+    "description": "QQ 图片上传及成功回执的等待秒数（60–600，默认120）；同时延长本次 AstrBot API 等待，不影响其他插件，也不会因超时自动重发",
+    "default": 120
+  },
   "send_max_attempts": {
     "type": "int",
     "description": "发送图片的最大尝试次数（含首次）；仅明确拒收（QQ sendMsg 返回 result 120）才重试，超时或结果不明不自动重发；填 1 只发一次",

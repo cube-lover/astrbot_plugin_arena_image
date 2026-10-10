@@ -44,6 +44,7 @@ from .bridge_client import (
     response_text,
 )
 from .openai_proxy import OpenAIProxyServer
+from .qq_delivery import prepare_qq_image_sender
 
 PLUGIN_NAME = "astrbot_plugin_arena_image"
 GLOBAL_SELECTION_KEY = "__global__"
@@ -58,6 +59,9 @@ DEFAULT_SEND_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 # not prove non-delivery: re-sending after a timeout duplicates real pictures.
 DEFAULT_SEND_MAX_ATTEMPTS = 3
 DEFAULT_SEND_RETRY_DELAY = 2.0
+# NapCat's byte/speed estimate can expire while QQ is still uploading.
+# Extend both the kernel receipt wait and the per-call aiocqhttp deadline.
+DEFAULT_QQ_IMAGE_SEND_TIMEOUT = 120.0
 # Last-resort copy: the protocol side inlines the picture as base64, so a
 # multi-megabyte PNG becomes a payload several times its own size.
 FALLBACK_SEND_IMAGE_BYTES = 2 * 1024 * 1024
@@ -217,7 +221,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.7",
+    "0.7.8",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -1717,12 +1721,22 @@ class ArenaImagePlugin(Star):
         sender = getattr(event, "send", None)
         if not callable(sender):
             return ""
+        qq_sender = prepare_qq_image_sender(
+            event,
+            _as_float(
+                self.config.get("qq_image_send_timeout"),
+                DEFAULT_QQ_IMAGE_SEND_TIMEOUT, 60.0, 600.0,
+            ),
+        )
+        if qq_sender is not None:
+            sender = qq_sender
         attempts = self._send_max_attempts()
         delay = self._send_retry_delay()
         plans = self._send_plans(path, caption)
         last_error = ""
         for attempt in range(attempts):
             label, chain = plans[min(attempt, len(plans) - 1)]
+            send_started_at = time.monotonic()
             try:
                 await sender(chain)
             except Exception as exc:
@@ -1746,6 +1760,11 @@ class ArenaImagePlugin(Star):
                     # risk-control window before the same message lands.
                     await asyncio.sleep(delay * (attempt + 1))
                 continue
+            if qq_sender is not None:
+                logger.info(
+                    "[arena_image] QQ 图片发送已获成功回执，发送耗时 %.1f 秒（%s）",
+                    time.monotonic() - send_started_at, label,
+                )
             if attempt:
                 logger.info(
                     "[arena_image] 重试第 %d 次发送成功（%s）",

@@ -189,7 +189,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.5",
+    "0.7.6",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -344,10 +344,11 @@ class ArenaImagePlugin(Star):
         text = str(exc).casefold()
         if exc.code == "arena_session_rejected":
             return (
-                "Arena 拒绝了这次请求，但服务器上保存的 Arena 会话还没有过期。\n"
-                "这基本都是 reCAPTCHA / Cloudflare 风控，不是登录失效，重新绑定不会有帮助。\n"
-                "请让管理员私聊机器人运行：/竞技场验证，在服务器浏览器里过一次验证后重试。\n"
-                "想确认会话细节可运行：/竞技场验证状态"
+                "Arena 拒绝了这次请求，但浏览器中的登录令牌尚未过期。\n"
+                "仅凭 403 不能判定 Cookie 失效，也不能确定是验证码问题；请看上游返回的原因。\n"
+                f"上游返回：{_display_error(exc)[:400]}\n"
+                "请先运行 /竞技场验证状态；若上游明确要求 reCAPTCHA/Cloudflare 人机验证，"
+                "再由管理员私聊运行 /竞技场验证。"
             )
         auth_error = exc.code in {
             "arena_auth_expired",

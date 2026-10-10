@@ -2595,7 +2595,9 @@ class ArenaDirectClient:
                 "modelAId": model_id,
                 "userMessageId": new_uuid7(),
                 "modelAMessageId": new_uuid7(),
-                "modelBMessageId": new_uuid7(),
+                # Direct-battle starts with one assistant. A B message ID is
+                # only sent for an actual battle turn; even without modelBId,
+                # sending it now causes "Direct chat must start with one model".
                 "userMessage": {
                     "content": prompt or "请根据参考图生成图片",
                     "experimental_attachments": attachments,
@@ -2728,7 +2730,11 @@ class ArenaDirectClient:
                 else "arena_verification_required"
             )
             raise _err(
-                f"竞技场风控拦下了这次请求（HTTP {status}）：{detail}",
+                (
+                    f"竞技场返回了验证码/验证相关错误（HTTP {status}）：{detail}"
+                    if challenged
+                    else f"竞技场拒绝了这次请求（HTTP {status}）：{detail}"
+                ),
                 code=code,
                 status_code=status or 403,
                 browser_url=browser_url,

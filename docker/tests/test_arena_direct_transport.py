@@ -1031,13 +1031,14 @@ class GenerationTests(DirectTransportCase):
         self.assertEqual(sent["recaptchaV3Token"], "token-for-chat_submit")
         self.assertEqual(sent["userMessage"]["content"], "a red apple")
         self.assertEqual(sent["userMessage"]["experimental_attachments"], [])
+        self.assertNotIn("modelBId", sent)
+        self.assertNotIn("modelBMessageId", sent)
         ids = [
             sent["id"],
             sent["userMessageId"],
             sent["modelAMessageId"],
-            sent["modelBMessageId"],
         ]
-        self.assertEqual(len(set(ids)), 4)
+        self.assertEqual(len(set(ids)), 3)
         for value in ids:
             self.assertEqual(uuid.UUID(value).version, 7)
 
@@ -1045,6 +1046,50 @@ class GenerationTests(DirectTransportCase):
         rows = {row["id"]: row for row in health["models"]}
         self.assertEqual(rows[self.MODEL]["status_code"], 200)
         self.assertEqual(health["variants"], [])
+
+    def test_image_edit_first_turn_also_contains_only_one_assistant(self) -> None:
+        from unittest.mock import AsyncMock
+
+        page = self._page()
+        client = self.client(page)
+        attachment = {
+            "name": "reference.png", "contentType": "image/png",
+            "url": "https://cdn.arena.ai/reference.png",
+        }
+        client._upload_reference = AsyncMock(return_value=attachment)
+        self.run_async(client.complete(
+            model=self.MODEL, prompt="paint the apple blue", images=["fixture-image"],
+        ))
+        client._upload_reference.assert_awaited_once_with(page, "fixture-image")
+        self.assertEqual(len(page.requests), 1)
+        sent = json.loads(page.requests[0]["body"])
+        self.assertEqual(sent["userMessage"]["experimental_attachments"], [attachment])
+        self.assertIn("modelAMessageId", sent)
+        self.assertNotIn("modelBId", sent)
+        self.assertNotIn("modelBMessageId", sent)
+
+    def test_plain_403_preserves_reason_without_inventing_a_challenge(self) -> None:
+        page = self._page(status=403, body='{"error":"Access denied for this model"}')
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.run_async(self.client(page).complete(model=self.MODEL, prompt="a red apple"))
+        self.assertEqual(len(page.requests), 1)
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assertIn("Access denied for this model", str(caught.exception))
+        self.assertNotIn("风控", str(caught.exception))
+        self.assertNotIn("已失效", str(caught.exception))
+        _, plugin = _make_plugin(self)
+        hint = plugin._verification_hint(caught.exception)
+        self.assertIn("Access denied for this model", hint)
+        self.assertIn("仅凭 403", hint)
+        self.assertNotIn("这基本都是", hint)
+
+    def test_explicit_recaptcha_error_keeps_its_original_reason(self) -> None:
+        page = self._page(status=403, body='{"error":"recaptcha validation failed"}')
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.run_async(self.client(page).complete(model=self.MODEL, prompt="a red apple"))
+        self.assertEqual(len(page.requests), 1)
+        self.assertIn("recaptcha validation failed", str(caught.exception))
+        self.assertIn("验证相关错误", str(caught.exception))
 
     def test_moderation_refusal_is_reported_as_text_not_as_auth_failure(self) -> None:
         body = 'a3:"Your request was blocked by our content moderation system."'

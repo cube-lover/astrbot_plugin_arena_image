@@ -64,7 +64,8 @@ class DirectNameCatalogTests(DirectTransportCase):
         client = self.client(page)
         catalog = self.run_async(client.model_name_catalog())
         by_id = {row["id"]: row for row in catalog["models"]}
-        self.assertTrue(catalog["complete"])
+        self.assertFalse(catalog["complete"])
+        self.assertEqual(catalog["catalog_scope"], "public_and_account_history")
         self.assertNotIn("gpt-hidden", by_id)
         self.assertNotIn("gpt-image-2.5-flare", [row["display_name"] for row in catalog["models"]])
         self.assertTrue(by_id["gpt-image-1"]["selectable"])

@@ -189,7 +189,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.4",
+    "0.7.5",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -777,19 +777,22 @@ class ArenaImagePlugin(Star):
             marker = " ← 当前" if model_id == current_id else ""
             status_text = self._model_health_text(health_map.get(model_id))
             created_text = self._model_created_text(model)
+            source_text = " [历史发现]" if model.get("history_discovered") else ""
             lines.append(
                 f"{position}. {model_id} [{self._model_kind(model)}]"
-                f"{created_text}{status_text}{marker}"
+                f"{created_text}{source_text}{status_text}{marker}"
             )
         if len(chosen) > limit:
             lines.append(f"……其余 {len(chosen) - limit} 个已省略，可调整 model_list_limit。")
         lines.append("用法：/竞技场切换模型 编号或完整模型名（编号两个列表通用，所以不连号）")
         lines.append("状态为最近一次请求结果，非实时探活；上游端点名可能与模型显示名不同。")
+        if any(model.get("history_discovered") for _, model in chosen):
+            lines.append("历史发现：从已有会话恢复的模型，可用性以真实出图请求为准；不是全站灰测全集。")
         lines.append("GPT 名称查询：/竞技场模型名称 GPT")
         lines.append(
             "另一半：/竞技场画图模型（正式模型）"
             if stealth
-            else "另一半：/竞技场灰测模型（含蒙娜丽莎）"
+            else "另一半：/竞技场灰测模型"
         )
         return "\n".join(lines)
 

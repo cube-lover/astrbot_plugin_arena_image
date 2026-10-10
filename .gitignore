@@ -5,6 +5,8 @@ api-key.txt
 config.json
 models.json
 model_health.json
+arena_history_models.json
+arena_history_models.json.tmp
 arena-data/
 arena-browser-data/
 __pycache__/

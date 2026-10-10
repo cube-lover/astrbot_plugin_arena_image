@@ -41,6 +41,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 import httpx
 
 from .bridge_client import BridgeError, decode_image_value
+from .model_catalog import history_catalog
 
 ARENA_ORIGIN = "https://arena.ai"
 ARENA_PAGE_PATH = "/text/direct"
@@ -934,6 +935,8 @@ def public_model_entry(model: dict[str, Any]) -> dict[str, Any]:
         ),
         "output_image": model_capability(model, "outputCapabilities", "image"),
         "input_image": model_capability(model, "inputCapabilities", "image"),
+        "history_discovered": bool(model.get("history_discovered")),
+        "catalog_source": model.get("catalog_source") or "public_catalog",
     }
 
 
@@ -960,19 +963,55 @@ def parse_model_table(raw: str) -> list[dict[str, Any]]:
 # promise would surface as an opaque CDP exception instead of a diagnosable
 # status, so every one of them catches and reports.
 
-_MODEL_TABLE_JS = """
+_MODEL_TABLE_JS = r"""
 (async () => {
   try {
-    const r = await fetch('%(path)s', {credentials: 'include'});
+    const r = await fetch('%(path)s', {
+      credentials: 'include', signal: AbortSignal.timeout(20000)
+    });
+    if (!r.ok) return {ok: false, status: r.status};
     const t = await r.text();
-    const escaped = t.match(/\\\\"initialModels\\\\":([\\s\\S]*?),\\\\"initialModel[A-Z]Id/);
-    if (escaped) {
-      let json = escaped[1];
-      try { json = JSON.parse('"' + json + '"'); } catch (e) {}
-      return {ok: true, status: r.status, json: json};
+    // Decode Flight string chunks before parsing. The model array may span
+    // several script tags and the following property changes between builds.
+    const chunks = [];
+    for (const script of t.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+      const push = script[1].match(/self\.__next_f\.push\((\[[\s\S]*\])\)\s*;?\s*$/);
+      if (!push) continue;
+      try {
+        const frame = JSON.parse(push[1]);
+        if (frame[0] === 1 && typeof frame[1] === 'string') chunks.push(frame[1]);
+      } catch (_) {}
     }
-    const plain = t.match(/"initialModels":([\\s\\S]*?),"initialModel[A-Z]Id/);
-    if (plain) return {ok: true, status: r.status, json: plain[1]};
+    function arrayAt(source, start) {
+      if (source[start] !== '[') return null;
+      let depth = 0, quoted = false, escaped = false;
+      for (let i = start; i < source.length; i++) {
+        const ch = source[i];
+        if (quoted) {
+          if (escaped) escaped = false;
+          else if (ch === '\\') escaped = true;
+          else if (ch === '"') quoted = false;
+        } else if (ch === '"') quoted = true;
+        else if (ch === '[') depth++;
+        else if (ch === ']' && --depth === 0) {
+          try {
+            const rows = JSON.parse(source.slice(start, i + 1));
+            if (!Array.isArray(rows) || !rows.length ||
+                !rows.every(row => row && typeof row === 'object' &&
+                  !Array.isArray(row) && typeof row.id === 'string' &&
+                  typeof row.publicName === 'string')) return null;
+            return JSON.stringify(rows);
+          } catch (_) { return null; }
+        }
+      }
+      return null;
+    }
+    for (const source of [chunks.join(''), t]) {
+      for (const marker of source.matchAll(/"initialModels"\s*:\s*/g)) {
+        const json = arrayAt(source, marker.index + marker[0].length);
+        if (json !== null) return {ok: true, status: r.status, json};
+      }
+    }
     return {ok: false, status: r.status, len: t.length};
   } catch (e) {
     return {ok: false, status: 0, error: String(e)};
@@ -1805,6 +1844,8 @@ class ArenaDirectClient:
                 else DEFAULT_ALLOWED_STEALTH_MODELS
             )
         )
+        self._data_dir = Path(data_dir) if data_dir else None
+        self._history_catalog = history_catalog(self.cdp_url, self._data_dir)
         if data_dir:
             _load_health(Path(data_dir) / "arena_model_health.json")
         if not self.cdp_url:
@@ -1924,23 +1965,33 @@ class ArenaDirectClient:
             model.get("publicName")
         )
 
-    async def _models(self, page: ArenaPage, *, refresh: bool = False) -> list[dict[str, Any]]:
+    async def _models(
+        self, page: ArenaPage, *, refresh: bool = False, discover: bool = False,
+    ) -> list[dict[str, Any]]:
         global _MODELS, _MODELS_AT
+        table = None
         async with _LOCK:
             fresh = _MODELS and time.time() - _MODELS_AT <= MODEL_CACHE_SECONDS
             if fresh and not refresh:
-                return list(_MODELS)
-        table = await page.model_table()
-        if len(table) < 10:
-            # A truncated table would silently hide most models; keep the old one.
+                table = list(_MODELS)
+        if table is None:
+            table = await page.model_table()
+            if len(table) < 10:
+                # A truncated table must not remove either public or history rows.
+                async with _LOCK:
+                    if _MODELS:
+                        return self._history_catalog.merge(_MODELS)
+                raise _err("竞技场模型列表异常（行数过少），请稍后再试。", code="model_table_empty")
             async with _LOCK:
-                if _MODELS:
-                    return list(_MODELS)
-            raise _err("竞技场模型列表异常（行数过少），请稍后再试。", code="model_table_empty")
-        async with _LOCK:
-            _MODELS = table
-            _MODELS_AT = time.time()
-        return list(table)
+                # Account-history metadata stays in the endpoint/data-dir registry,
+                # never in the shared public-table cache.
+                _MODELS = table
+                _MODELS_AT = time.time()
+        if discover and (self.allow_stealth_models or self.allowed_stealth_models):
+            # Only explicit catalog reads discover history. Generation resolves
+            # already recovered UUIDs without another history scan.
+            await self._history_catalog.recover(page, table)
+        return self._history_catalog.merge(table)
 
     def _variants(self, models: list[dict[str, Any]], public_name: str) -> list[dict[str, Any]]:
         wanted = str(public_name or "").strip().casefold()
@@ -1987,13 +2038,13 @@ class ArenaDirectClient:
 
     async def list_models(self) -> list[dict[str, Any]]:
         async with self._page(timeout=90.0) as page:
-            models = await self._models(page)
+            models = await self._models(page, discover=True)
         return [public_model_entry(model) for model in models if self._keep_model(model)]
 
     async def model_name_catalog(self) -> dict[str, Any]:
         """Read image names using the same visibility rules as the model picker."""
         async with self._page(timeout=90.0) as page:
-            models = await self._models(page, refresh=True)
+            models = await self._models(page, refresh=True, discover=True)
         rows = []
         for model in models:
             public_name = str(model.get("publicName") or "").strip()
@@ -2008,8 +2059,14 @@ class ArenaDirectClient:
                 "display_name": str(model.get("displayName") or public_name).strip(),
                 "user_selectable": True,
                 "selectable": True,
+                "history_discovered": bool(model.get("history_discovered")),
             })
-        return {"models": rows, "complete": True}
+        return {
+            "models": rows,
+            "complete": False,
+            "catalog_scope": "public_and_account_history",
+            "history_discovery": self._history_catalog.status(),
+        }
 
     async def model_health(self) -> dict[str, Any]:
         return _health_snapshot()

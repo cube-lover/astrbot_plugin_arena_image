@@ -738,6 +738,10 @@ class ImageDeliveryRetryTest(unittest.TestCase):
     """
 
     PROMPT = "画一只猫"
+    REJECT = (
+        "ActionFailed retcode=1200 EventChecker Failed: "
+        'NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg {"result": 120}'
+    )
 
     def _plugin_with_one_image(self, config=None):
         main, plugin = _make_plugin(self, config)
@@ -810,7 +814,10 @@ class ImageDeliveryRetryTest(unittest.TestCase):
             {"send_max_attempts": 2, "send_retry_delay": 0}
         )
         event = FakeEvent(
-            send_failures=[RuntimeError("first reject"), RuntimeError("second reject")]
+            send_failures=[
+                RuntimeError(self.REJECT + " first reject"),
+                RuntimeError(self.REJECT + " second reject"),
+            ]
         )
 
         with patch.object(main.logger, "warning"):
@@ -818,20 +825,70 @@ class ImageDeliveryRetryTest(unittest.TestCase):
 
         self.assertEqual(event.send_calls, 2)
         self.assertEqual(len(results), 1)
-        self.assertIn("发送失败", results[0].text)
-        self.assertIn("已重试 2 次", results[0].text)
+        self.assertIn("明确拒收", results[0].text)
+        self.assertIn("已尝试 2 次", results[0].text)
         self.assertIn("second reject", results[0].text)
 
     def test_single_attempt_build_keeps_the_old_behaviour(self) -> None:
         main, plugin, image = self._plugin_with_one_image({"send_max_attempts": 1})
-        event = FakeEvent(send_failures=[RuntimeError("rejected")])
+        event = FakeEvent(send_failures=[RuntimeError(self.REJECT)])
 
         with patch.object(main.logger, "warning"):
             results = self._generate(plugin, event)
 
         self.assertEqual(event.send_calls, 1)
         self.assertEqual(len(results), 1)
-        self.assertIn("已重试 1 次", results[0].text)
+        self.assertIn("已尝试 1 次", results[0].text)
+
+    def test_delivered_image_with_lost_receipt_is_not_sent_twice(self) -> None:
+        main, plugin, image = self._plugin_with_one_image({"send_retry_delay": 0})
+
+        class LostReceiptEvent(FakeEvent):
+            async def send(self, chain):
+                self.send_calls += 1
+                self.sent.append(chain)  # The recipient really received it.
+                raise TimeoutError("Timeout: NTEvent NodeIKernelMsgService/sendMsg")
+
+        event = LostReceiptEvent()
+        with patch.object(main.logger, "warning"):
+            results = self._generate(plugin, event)
+        self.assertEqual(event.send_calls, 1)
+        self.assertEqual(len(event.sent), 1)
+        self.assertEqual(event.sent[0].chain[-1].file, str(image))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].chain, [])  # No framework fallback image.
+        self.assertIn("可能已经送达", results[0].text)
+        self.assertIn("不再自动重发", results[0].text)
+        self.assertEqual(plugin._active_generations, 0)
+
+    def test_unknown_and_connection_errors_never_trigger_retries(self) -> None:
+        errors = [
+            RuntimeError("ActionFailed retcode=1200 EventChecker Failed EventRet: {}"),
+            RuntimeError("Failed to send message chain"),
+            ConnectionError("connection reset after send"),
+            RuntimeError(self.REJECT + " caused by timeout"),
+            RuntimeError(self.REJECT.replace('"result": 120', '"result": 1201')),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__ + str(error)[:32]):
+                main, plugin, _ = self._plugin_with_one_image({"send_retry_delay": 0})
+                event = FakeEvent(send_failures=[error])
+                with patch.object(main.logger, "warning"):
+                    results = self._generate(plugin, event)
+                self.assertEqual(event.send_calls, 1)
+                self.assertIn("发送回执异常", results[0].text)
+                self.assertEqual(results[0].chain, [])
+
+    def test_uncertain_second_attempt_stops_before_compressed_resend(self) -> None:
+        main, plugin, _ = self._plugin_with_one_image({"send_retry_delay": 0})
+        event = FakeEvent(send_failures=[
+            RuntimeError(self.REJECT), TimeoutError("ack timed out"),
+        ])
+        with patch.object(main.logger, "warning"):
+            results = self._generate(plugin, event)
+        self.assertEqual(event.send_calls, 2)
+        self.assertIn("已尝试 2 次", results[0].text)
+        self.assertIn("不再自动重发", results[0].text)
 
     def test_astrbot_without_direct_send_still_yields_the_result(self) -> None:
         _, plugin, image = self._plugin_with_one_image()

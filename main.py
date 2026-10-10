@@ -10,6 +10,7 @@ import mimetypes
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -53,9 +54,8 @@ DEFAULT_MAX_OUTPUT_IMAGE_BYTES = 64 * 1024 * 1024
 # Messaging platforms reject very large attachments, so anything above this is
 # re-encoded before it is sent instead of being dropped.
 DEFAULT_SEND_IMAGE_MAX_BYTES = 8 * 1024 * 1024
-# A send the platform refused is retried with different shapes of the same
-# message; QQ answers ``result: 120`` for a transient risk-control hit and takes
-# the same picture a moment later.
+# Only a confirmed platform rejection may be retried. A missing receipt does
+# not prove non-delivery: re-sending after a timeout duplicates real pictures.
 DEFAULT_SEND_MAX_ATTEMPTS = 3
 DEFAULT_SEND_RETRY_DELAY = 2.0
 # Last-resort copy: the protocol side inlines the picture as base64, so a
@@ -106,6 +106,34 @@ def _display_error(exc: Exception, *, limit: int = 500) -> str:
     """Return a bounded user-facing error without dumping request payloads."""
     text = str(exc).strip() or type(exc).__name__
     return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+@dataclass(frozen=True)
+class _ImageDeliveryFailure:
+    message: str
+    attempts: int
+    uncertain: bool
+
+
+def _confirmed_send_rejection(exc: Exception) -> bool:
+    """Allow only the explicit NapCat send-result rejection, not retcode 1200.
+
+    Timeout/connection ambiguity takes precedence even when an exception chain
+    also contains an earlier rejection. Unknown errors fail closed for retries.
+    """
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return False
+    text = str(exc).casefold().replace('\\"', '"').replace("\\'", "'")
+    if any(word in text for word in (
+        "timeout", "timed out", "超时", "connection", "disconnect",
+        "socket", "closed", "断开", "断连",
+    )):
+        return False
+    return (
+        "eventchecker failed" in text
+        and "nodeikernelmsgservice/sendmsg" in text
+        and re.search(r"""["']?result["']?\s*[:=]\s*120\b""", text) is not None
+    )
 
 
 def _human_bytes(value: int) -> str:
@@ -189,7 +217,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.6",
+    "0.7.7",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -1596,9 +1624,18 @@ class ArenaImagePlugin(Star):
                     result.chain.append(Image.fromFileSystem(str(path)))
                     yield result
                     continue
-                yield event.plain_result(
-                    f"图片已生成，但发送失败（已重试 {self._send_max_attempts()} 次）：{error}"
-                )
+                if error.uncertain:
+                    yield event.plain_result(
+                        f"{caption}\n图片已生成，但发送回执异常（已尝试 {error.attempts} 次）。"
+                        "图片可能已经送达，为避免重复，本次不再自动重发。\n"
+                        "请先检查聊天记录；原图仍保存在服务器。\n"
+                        f"回执详情：{error.message}"
+                    )
+                else:
+                    yield event.plain_result(
+                        f"图片已生成，但平台明确拒收（已尝试 {error.attempts} 次）："
+                        f"{error.message}"
+                    )
         finally:
             self._active_generations = max(0, self._active_generations - 1)
 
@@ -1664,18 +1701,18 @@ class ArenaImagePlugin(Star):
         event: AstrMessageEvent,
         path: Path,
         caption: str,
-    ) -> str | None:
-        """Send one generated picture, retrying a send the platform refused.
+    ) -> _ImageDeliveryFailure | str | None:
+        """Send once; retry only when the platform explicitly rejected delivery.
 
         A yielded result is sent exactly once, so a single platform hiccup throws
         away a picture that took minutes to draw.  QQ risk control rejects a
         share of sends with ``result: 120`` and accepts the same message a
-        moment later, so the picture goes out through ``event.send`` where it can
-        be retried and reshaped.
+        moment later. Receipt timeouts may mean the picture already arrived;
+        they must not trigger the next plan or another image-bearing yield.
 
         Returns ``None`` once a plan went through, an empty string when this
         AstrBot build offers no direct send (the caller yields instead, as
-        before), and the last error text when every attempt failed.
+        before), and a structured outcome when delivery failed or is uncertain.
         """
         sender = getattr(event, "send", None)
         if not callable(sender):
@@ -1691,12 +1728,19 @@ class ArenaImagePlugin(Star):
             except Exception as exc:
                 last_error = _display_error(exc, limit=200)
                 logger.warning(
-                    "[arena_image] 发送图片失败（第 %d/%d 次，%s）：%s",
+                    "[arena_image] 发送回执异常（第 %d/%d 次，%s）：%s",
                     attempt + 1,
                     attempts,
                     label,
                     last_error,
                 )
+                if not _confirmed_send_rejection(exc):
+                    logger.warning(
+                        "[arena_image] 发送结果不确定，停止自动重发以避免重复图片"
+                    )
+                    return _ImageDeliveryFailure(
+                        last_error, attempt + 1, uncertain=True
+                    )
                 if attempt + 1 < attempts:
                     # Linear backoff: the retry has to outlive a short
                     # risk-control window before the same message lands.
@@ -1709,7 +1753,7 @@ class ArenaImagePlugin(Star):
                     label,
                 )
             return None
-        return last_error
+        return _ImageDeliveryFailure(last_error, attempts, uncertain=False)
 
     async def _materialize_output(self, value: str) -> Path:
         max_bytes = self._output_max_bytes()

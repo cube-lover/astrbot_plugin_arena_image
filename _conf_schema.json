@@ -115,12 +115,12 @@
   },
   "send_max_attempts": {
     "type": "int",
-    "description": "发送图片的最大尝试次数；被平台拒收（QQ 返回 result 120）时会自动换一种形式重发，填 1 就是只发一次",
+    "description": "发送图片的最大尝试次数（含首次）；仅明确拒收（QQ sendMsg 返回 result 120）才重试，超时或结果不明不自动重发；填 1 只发一次",
     "default": 3
   },
   "send_retry_delay": {
     "type": "int",
-    "description": "发送失败后重试的等待秒数，每次重试按次数递增；当次发送通常几秒后就通了",
+    "description": "平台明确拒收后重试的等待秒数，按尝试次数递增；回执超时、连接中断或结果不明时不重发",
     "default": 2
   },
   "max_input_images": {

@@ -132,6 +132,7 @@ SESSION_REFRESH_POLL_SECONDS = 0.6
 # loaded.  Arena answers a forgotten id with a bare 404 "Server action not
 # found.", so that response means "reload the tab", not "this feature is gone".
 STALE_ACTION_MARKER = "server action not found"
+REFRESH_REQUIRED_HEADER = "x-arena-refresh-required"
 PAGE_RELOAD_BUDGET_SECONDS = 30.0
 PAGE_RELOAD_POLL_SECONDS = 1.0
 PAGE_RELOAD_SETTLE_SECONDS = 2.0
@@ -171,6 +172,32 @@ def _err(
 
 class _StaleActionError(RuntimeError):
     """Internal signal: the action ids came from a bundle Arena has replaced."""
+
+
+def deployment_refresh_required(response: dict[str, Any]) -> bool:
+    """Recognize Arena's explicit build conflict, not every HTTP 409."""
+    if int(response.get("status") or 0) != 409:
+        return False
+    headers = response.get("headers") or {}
+    if any(
+        str(key).casefold() == REFRESH_REQUIRED_HEADER and str(value) == "1"
+        for key, value in headers.items()
+    ):
+        return True
+    try:
+        body = json.loads(str(response.get("text") or ""))
+    except (ValueError, TypeError):
+        return False
+    return isinstance(body, dict) and body.get("error") == "refresh_required"
+
+
+async def _invalidate_deployment_caches() -> None:
+    """Keep stored model/history records, but stop trusting old build caches."""
+    global _ACTIONS, _ACTIONS_AT, _MODELS_AT
+    async with _LOCK:
+        _ACTIONS = {}
+        _ACTIONS_AT = 0.0
+        _MODELS_AT = 0.0
 
 
 def action_is_stale(status: Any, body: Any) -> bool:
@@ -1511,17 +1538,40 @@ class ArenaPage:
         body: str | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        value = await self.evaluate(
-            _page_fetch_js(path, method=method, headers=headers, body=body),
-            timeout=timeout,
-        )
-        if not isinstance(value, dict):
-            raise CDPError("页面请求没有返回结果")
-        return {
-            "status": int(value.get("status") or 0),
-            "headers": value.get("headers") if isinstance(value.get("headers"), dict) else {},
-            "text": str(value.get("text") or ""),
-        }
+        for attempt in (0, 1):
+            value = await self.evaluate(
+                _page_fetch_js(path, method=method, headers=headers, body=body),
+                timeout=timeout,
+            )
+            if not isinstance(value, dict):
+                raise CDPError("页面请求没有返回结果")
+            response = {
+                "status": int(value.get("status") or 0),
+                "headers": value.get("headers") if isinstance(value.get("headers"), dict) else {},
+                "text": str(value.get("text") or ""),
+            }
+            if not deployment_refresh_required(response) or attempt:
+                return response
+            if any(str(key).casefold() == "next-action" for key in (headers or {})):
+                # Upload code must refresh action IDs too, not replay an old
+                # action header on the new deployment. Its retry is bounded.
+                raise _StaleActionError("Arena deployment refresh required")
+            if not await self.reload():
+                return response
+            self._cookies = None
+            await _invalidate_deployment_caches()
+            if path == STREAM_CREATE_EVALUATION_PATH:
+                # The 409 explicitly rejected this operation before execution.
+                # Preserve evaluation/message IDs and attachments; replace only
+                # the one-use verification token in the newly loaded page.
+                payload = json.loads(body or "{}")
+                state = await _live_state(self)
+                ArenaDirectClient._require_session(state, "")
+                payload["recaptchaV3Token"] = await self.mint_recaptcha(
+                    str(state.get("recaptcha_action") or "chat_submit")
+                )
+                body = json.dumps(payload, ensure_ascii=False)
+        return response  # pragma: no cover
 
     async def model_table(self) -> list[dict[str, Any]]:
         value = await self.evaluate(
@@ -2312,9 +2362,7 @@ class ArenaDirectClient:
         """
         global _ACTIONS, _ACTIONS_AT
         if refresh:
-            async with _LOCK:
-                _ACTIONS = {}
-                _ACTIONS_AT = 0.0
+            await _invalidate_deployment_caches()
             await page.reload()
         else:
             async with _LOCK:
@@ -2666,6 +2714,14 @@ class ArenaDirectClient:
         detail = (error or body)[:300].strip()
         lowered = f"{error} {body[:2000]}".casefold()
 
+        if deployment_refresh_required({"status": status, "text": body, "headers": headers}):
+            raise _err(
+                "竞技场要求刷新网页版本（HTTP 409：refresh_required）。"
+                "已尝试刷新原有页面；请稍后再试。"
+                "这不是模型失效或 Cookie 过期的判定。",
+                code="arena_deployment_refresh_required",
+                status_code=409,
+            )
         if status == 429 or "too many requests" in lowered or "rate limit" in lowered:
             raise _err(
                 f"竞技场上游限流：{detail}",

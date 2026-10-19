@@ -1268,13 +1268,8 @@ def _provider_model_missing(message: str) -> bool:
     ))
 
 
-def _stream_error_status(status: int | None, message: str) -> int | None:
-    """Separate Arena's HTTP-200 stream envelope from a provider failure."""
-    if status != 200 or not message or _moderation_blocked(message):
-        return status
-    lowered = message.casefold()
-    if "too many requests" in lowered or "rate limit" in lowered:
-        return 429
+def _reported_error_status(message: str) -> int | None:
+    """Only an explicitly reported error code, never a local fallback."""
     match = re.search(
         r"\b(?:HTTP(?:\s+status)?|status(?:\s+code)?)\s*[:=]?\s*([45]\d{2})\b"
         r"|\b([45]\d{2})\s+(?:bad request|unauthorized|forbidden|not found|"
@@ -1284,6 +1279,19 @@ def _stream_error_status(status: int | None, message: str) -> int | None:
     )
     if match:
         return int(match.group(1) or match.group(2))
+    return None
+
+
+def _stream_error_status(status: int | None, message: str) -> int | None:
+    """Separate Arena's HTTP-200 stream envelope from a provider failure."""
+    if status != 200 or not message or _moderation_blocked(message):
+        return status
+    lowered = message.casefold()
+    if "too many requests" in lowered or "rate limit" in lowered:
+        return 429
+    reported = _reported_error_status(message)
+    if reported is not None:
+        return reported
     return 404 if _provider_model_missing(message) else 502
 
 
@@ -2694,6 +2702,7 @@ class ArenaDirectClient:
                 browser_url=browser_url,
                 public_name=public_name,
                 model_id=model_id,
+                transport_status=status,
             )
         return self._openai_payload(public_name, model_id, stream)
 
@@ -2708,6 +2717,7 @@ class ArenaDirectClient:
         browser_url: str,
         public_name: str,
         model_id: str = "",
+        transport_status: int | None = None,
     ) -> None:
         """Turn an upstream failure into the error code the UI reacts to."""
         error = str(stream.get("error") or "")
@@ -2795,6 +2805,26 @@ class ArenaDirectClient:
                 status_code=status or 403,
                 browser_url=browser_url,
             )
+        if (
+            transport_status == 200 and status == 502
+            and error and _reported_error_status(error) is None
+        ):
+            exc = _err(
+                f"所选模型：{public_name}\n"
+                f"Arena 已接收请求（HTTP 200），但生成流程失败：{detail}\n"
+                "未返回可用图片；502 是插件的失败分类，不是官网网关返回的状态码。"
+                "这条错误本身不证明 Cookie 失效、触发违禁词或模型已下线。"
+                "本次不自动重发。",
+                code="stream_generation_failed",
+                status_code=502,
+            )
+            exc.payload["error"].update({
+                "requested_model": public_name,
+                "arena_model_id": model_id,
+                "transport_status_code": 200,
+                "reported_upstream_status_code": None,
+            })
+            raise exc
         raise _err(
             f"竞技场上游错误（HTTP {status}）：{detail or '没有返回内容'}",
             code=f"http_{status}" if status else "upstream_error",

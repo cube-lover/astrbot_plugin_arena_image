@@ -521,6 +521,9 @@ class OpenAIProxyServer:
         elif isinstance(exc, BridgeError) and exc.code == "provider_model_unavailable":
             status = 502
             code = "provider_model_unavailable"
+        elif isinstance(exc, BridgeError) and exc.code == "stream_generation_failed":
+            status = 502
+            code = "stream_generation_failed"
         elif isinstance(exc, BridgeError) and exc.status_code in {401, 403}:
             status = 502
             code = "upstream_auth_error"
@@ -528,8 +531,17 @@ class OpenAIProxyServer:
             status = 502
             code = "upstream_error"
         message = str(exc).strip() or type(exc).__name__
+        error = {"message": message[:1000], "type": "api_error", "code": code}
+        if code == "stream_generation_failed":
+            # HTTP 502 here belongs to this compatibility proxy. Preserve the
+            # separately observed Arena HTTP status, without leaking payloads.
+            payload = exc.payload if isinstance(exc.payload, dict) else {}
+            details = payload.get("error")
+            if isinstance(details, dict) and details.get("transport_status_code") == 200:
+                error["transport_status_code"] = 200
+                error["reported_upstream_status_code"] = None
         return self._web.json_response(
-            {"error": {"message": message[:1000], "type": "api_error", "code": code}},
+            {"error": error},
             status=status,
             headers=self._cors_headers(),
         )

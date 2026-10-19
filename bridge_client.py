@@ -48,6 +48,7 @@ NON_INTERACTIVE_AUTH_CODES = frozenset(
     {
         "recaptcha_mint_failed",
         "provider_model_unavailable",
+        "stream_generation_failed",
     }
 )
 

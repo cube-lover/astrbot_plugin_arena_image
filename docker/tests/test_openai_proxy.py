@@ -8,6 +8,7 @@ from aiohttp import FormData
 from aiohttp.test_utils import AioHTTPTestCase
 
 from astrbot_plugin_arena_image.openai_proxy import OpenAIProxyServer
+from astrbot_plugin_arena_image.bridge_client import BridgeError
 
 
 PNG = b"\x89PNG\r\n\x1a\nfixture"
@@ -78,6 +79,50 @@ class OpenAIProxyTest(AioHTTPTestCase):
     async def test_requires_bearer_key(self):
         response = await self.client.get("/v1/models")
         self.assertEqual(response.status, 401)
+
+    async def test_stream_failure_preserves_actual_arena_status_not_private_payload(self):
+        class FailedClient:
+            async def complete(self, **kwargs):
+                raise BridgeError(
+                    "Arena returned HTTP 200 but generation failed",
+                    status_code=502,
+                    payload={"error": {
+                        "code": "stream_generation_failed",
+                        "transport_status_code": 200,
+                        "reported_upstream_status_code": None,
+                        "private_cookie": "PRIVATE_FIXTURE",
+                    }},
+                )
+        self.plugin.client = FailedClient()
+        response = await self.client.post(
+            "/v1/images/generations",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "image-model", "prompt": "a red apple"},
+        )
+        self.assertEqual(response.status, 502)
+        data = await response.json()
+        self.assertEqual(data["error"]["code"], "stream_generation_failed")
+        self.assertEqual(data["error"]["transport_status_code"], 200)
+        self.assertIsNone(data["error"]["reported_upstream_status_code"])
+        self.assertNotIn("PRIVATE_FIXTURE", str(data))
+
+    async def test_real_gateway_failure_is_not_reclassified_as_stream_failure(self):
+        class FailedClient:
+            async def complete(self, **kwargs):
+                raise BridgeError(
+                    "502 Bad Gateway", status_code=502,
+                    payload={"error": {"code": "http_502"}},
+                )
+        self.plugin.client = FailedClient()
+        response = await self.client.post(
+            "/v1/images/generations",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "image-model", "prompt": "a red apple"},
+        )
+        self.assertEqual(response.status, 502)
+        data = await response.json()
+        self.assertEqual(data["error"]["code"], "upstream_error")
+        self.assertNotIn("transport_status_code", data["error"])
 
     async def test_models_generation_and_json_edit(self):
         headers = {"Authorization": "Bearer test-key"}

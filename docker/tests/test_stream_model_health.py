@@ -130,6 +130,72 @@ class StreamHealthTests(DirectTransportCase):
         self.assertTrue(arena_direct._variant_failed_recently(self.rows[0]["id"]))
         self.assertEqual(arena_direct._HEALTH["models"][MODEL]["status_code"], 502)
 
+    def test_generic_generation_failure_keeps_actual_http200_and_no_retry(self):
+        page = self.page(responses=[reply("The generation failed"), reply()])
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.run_async(self.client(page).complete(model=MODEL, prompt="a circle"))
+        exc = caught.exception
+        self.assertEqual(exc.status_code, 502)  # Compatible proxy failure classification.
+        self.assertEqual(exc.code, "stream_generation_failed")
+        self.assertEqual(exc.payload["error"]["transport_status_code"], 200)
+        self.assertIsNone(exc.payload["error"]["reported_upstream_status_code"])
+        self.assertEqual(exc.payload["error"]["requested_model"], MODEL)
+        self.assertEqual(exc.payload["error"]["arena_model_id"], self.rows[0]["id"])
+        self.assertFalse(exc.is_rate_limited)
+        self.assertFalse(exc.requires_interactive_auth)
+        self.assertIn("HTTP 200", str(exc))
+        self.assertIn("The generation failed", str(exc))
+        self.assertNotIn("上游错误（HTTP 502）", str(exc))
+        self.assertEqual(len(page.requests), 1)
+        self.sleep.assert_not_awaited()
+
+    def test_real_http502_is_not_described_as_an_http200_stream_failure(self):
+        page = self.page(responses=[reply("Bad Gateway", status=502)])
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.run_async(self.client(page).complete(model=MODEL, prompt="a circle"))
+        self.assertEqual(caught.exception.code, "http_502")
+        self.assertIn("HTTP 502", str(caught.exception))
+        self.assertNotIn("HTTP 200", str(caught.exception))
+        self.assertEqual(len(page.requests), 1)
+
+    def test_explicit_provider_http502_keeps_reported_upstream_status(self):
+        page = self.page(responses=[reply("Provider returned 502 Bad Gateway")])
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.run_async(self.client(page).complete(model=MODEL, prompt="a circle"))
+        self.assertEqual(caught.exception.code, "http_502")
+        self.assertIn("HTTP 502", str(caught.exception))
+        self.assertNotIn("插件的失败分类", str(caught.exception))
+
+    def test_unknown_failure_is_not_invented_as_moderation_or_auth(self):
+        page = self.page(responses=[reply("The generation failed")])
+        with self.assertRaises(bridge_client.BridgeError) as caught:
+            self.run_async(self.client(page).complete(model=MODEL, prompt="a circle"))
+        self.assertEqual(caught.exception.code, "stream_generation_failed")
+        self.assertFalse(caught.exception.requires_interactive_auth)
+        page = self.page(responses=[reply("recaptcha validation failed", status=403)])
+        with self.assertRaises(bridge_client.BridgeError) as challenged:
+            self.run_async(self.client(page).complete(model=MODEL, prompt="a circle"))
+        self.assertEqual(challenged.exception.code, "arena_session_rejected")
+        self.assertTrue(challenged.exception.requires_interactive_auth)
+
+    def test_model_list_retains_http200_metadata_from_snapshot(self):
+        main, plugin = _make_plugin(self, {"model_health_cache_seconds": 0})
+        plugin._client = lambda: type(
+            "Client", (), {"model_health": AsyncMock(return_value={
+                "models": [{
+                    "id": MODEL, "status_code": 502, "checked_at": time.time(),
+                    "transport_status_code": "200",
+                    "error_code": "stream_generation_failed",
+                }],
+            })},
+        )()
+        health = self.run_async(plugin._fetch_model_health(force=True))
+        self.assertEqual(health[MODEL]["transport_status_code"], 200)
+        text = main.ArenaImagePlugin._model_health_text(health[MODEL])
+        self.assertIn("⚠502", text)
+        self.assertIn("生成失败（请求HTTP200）", text)
+        self.assertNotIn("✅", text)
+
     def test_empty_image_stream_is_not_healthy(self):
         page = self.page(responses=[{"status": 200, "text": "", "headers": {}}])
         with self.assertRaises(bridge_client.BridgeError) as caught:

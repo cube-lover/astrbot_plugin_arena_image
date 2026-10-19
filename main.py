@@ -221,7 +221,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.9",
+    "0.7.10",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -671,6 +671,12 @@ class ArenaImagePlugin(Star):
                     for key in ("error_code", "provider_endpoint"):
                         if item.get(key):
                             health[model_id][key] = str(item[key])
+                    try:
+                        transport_status = int(item.get("transport_status_code") or 0)
+                    except (TypeError, ValueError):
+                        transport_status = 0
+                    if transport_status:
+                        health[model_id]["transport_status_code"] = transport_status
             self._model_health_cache = health
             self._model_health_cached_at = time.monotonic()
             return dict(health)
@@ -770,6 +776,12 @@ class ArenaImagePlugin(Star):
         age = cls._health_age_text(checked_at)
         if isinstance(entry, dict) and entry.get("error_code") == "provider_model_unavailable":
             return f" ⚠{status} 上游端点失效" + (f" {age}" if age else "")
+        if (
+            isinstance(entry, dict)
+            and entry.get("error_code") == "stream_generation_failed"
+            and entry.get("transport_status_code") == 200
+        ):
+            return f" ⚠{status} 生成失败（请求HTTP200）" + (f" {age}" if age else "")
         return f" ⚠{status} {age}" if age else f" ⚠{status}"
 
     @staticmethod

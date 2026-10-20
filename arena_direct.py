@@ -42,6 +42,7 @@ import httpx
 
 from .bridge_client import BridgeError, decode_image_value
 from .model_catalog import history_catalog
+from . import arena_verification
 
 ARENA_ORIGIN = "https://arena.ai"
 ARENA_PAGE_PATH = "/text/direct"
@@ -1573,6 +1574,9 @@ class ArenaPage:
                 # Preserve evaluation/message IDs and attachments; replace only
                 # the one-use verification token in the newly loaded page.
                 payload = json.loads(body or "{}")
+                if payload.get("recaptchaV2Token"):
+                    # A human token is single-use; do not replay or downgrade it.
+                    return response
                 state = await _live_state(self)
                 ArenaDirectClient._require_session(state, "")
                 payload["recaptchaV3Token"] = await self.mint_recaptcha(
@@ -1915,6 +1919,29 @@ class ArenaDirectClient:
 
     # -- plumbing -------------------------------------------------------------
 
+    def _needs_manual_verification(self) -> bool:
+        return arena_verification.required(self.cdp_url, self._data_dir)
+
+    @staticmethod
+    def _manual_verification_error() -> BridgeError:
+        return _err(
+            "Arena 要求本次画图完成 reCAPTCHA V2 人工验证。\n"
+            "最近一次上游错误：HTTP 403，recaptcha validation failed。\n"
+            "请管理员私聊运行 /竞技场验证，打开服务器浏览器链接并手动完成验证；"
+            "完成后尽快重发原画图命令。登录正常不代表画图验证通过。",
+            code="arena_generation_verification_required", status_code=403,
+        )
+
+    async def _with_generation_verification(self, page: ArenaPage, state: dict) -> dict:
+        if not self._needs_manual_verification():
+            return state
+        manual = await arena_verification.snapshot(page)
+        return {
+            **state, "verified": False, "generation_verification_required": True,
+            "generation_token_ready": manual.get("token_ready") is True,
+            "generation_verification_state": manual.get("state") or "unavailable",
+        }
+
     def _gateway_base(self) -> str:
         """The gateway origin: configured, or derived from the noVNC address."""
         if self.gateway_url:
@@ -2133,7 +2160,9 @@ class ArenaDirectClient:
         """Reachability of the server browser plus the live login verdict."""
         async with self._page(timeout=60.0) as page:
             state = await _live_state(page)
+            state = await self._with_generation_verification(page, state)
         healthy = bool(state.get("has_logged_in"))
+        healthy = healthy and not state.get("generation_verification_required")
         payload: dict[str, Any] = {
             "status": "healthy" if healthy else "degraded",
             "transport": "direct-cdp",
@@ -2152,11 +2181,16 @@ class ArenaDirectClient:
                     "session_refreshed",
                     "session_refreshable",
                     "recaptcha_action",
+                    "generation_verification_required",
+                    "generation_token_ready",
                 )
             }
         )
         if not healthy:
             payload["message"] = (
+                self._auth_message("waiting", state)
+                if state.get("generation_verification_required")
+                else
                 "登录还在，但访问令牌过期了、这次没能自动续期，稍后再试一次即可。"
                 if state.get("session_refreshable")
                 else "服务器浏览器可用，但 Arena 还是匿名会话，请私聊运行 /竞技场验证 后登录账号。"
@@ -2213,6 +2247,8 @@ class ArenaDirectClient:
             status = "verified"
         elif expired:
             status = "expired"
+        elif (state or {}).get("generation_verification_required"):
+            status = "waiting"
         else:
             status = str(record.get("status") or "waiting")
         payload: dict[str, Any] = {
@@ -2233,6 +2269,10 @@ class ArenaDirectClient:
 
     @staticmethod
     def _auth_message(status: str, state: dict[str, Any]) -> str:
+        if state.get("generation_verification_required"):
+            if state.get("generation_token_ready"):
+                return "人工验证结果已就绪，请尽快重发原画图命令；上游接受请求后才确认恢复。"
+            return "账号登录与画图验证是两回事。请在服务器浏览器里手动完成 reCAPTCHA V2 验证。"
         if status == "verified":
             return "服务器浏览器已登录 Arena，可以直接画图。"
         if status == "expired":
@@ -2267,14 +2307,16 @@ class ArenaDirectClient:
             state = None
             if session:
                 with contextlib.suppress(CDPError):
-                    state = await _live_state(
-                        ArenaPage(
-                            cdp,
-                            session,
-                            target["url"],
-                            target_id=str(target.get("target_id") or ""),
-                        )
+                    page = ArenaPage(
+                        cdp,
+                        session,
+                        target["url"],
+                        target_id=str(target.get("target_id") or ""),
                     )
+                    state = await _live_state(page)
+                    if state.get("has_logged_in") and self._needs_manual_verification():
+                        await arena_verification.start(page)
+                    state = await self._with_generation_verification(page, state)
         if not link:
             if self._mint_failure == "secret":
                 raise _err(
@@ -2313,7 +2355,7 @@ class ArenaDirectClient:
     async def _current_state(self) -> dict[str, Any] | None:
         try:
             async with self._page(timeout=60.0) as page:
-                return await _live_state(page)
+                return await self._with_generation_verification(page, await _live_state(page))
         except (BridgeError, CDPError):
             return None
 
@@ -2643,8 +2685,14 @@ class ArenaDirectClient:
             state = await _live_state(page)
             self._require_session(state, browser_url)
 
+            needs_manual = self._needs_manual_verification()
+            if needs_manual and not (await arena_verification.snapshot(page)).get("token_ready"):
+                raise self._manual_verification_error()
             attachments = [await self._upload_reference(page, value) for value in images]
-            token = await page.mint_recaptcha(str(state.get("recaptcha_action") or "chat_submit"))
+            human_token = await arena_verification.take(page) if needs_manual else ""
+            if needs_manual and not human_token:
+                raise self._manual_verification_error()
+            token = "" if human_token else await page.mint_recaptcha(str(state.get("recaptcha_action") or "chat_submit"))
             payload = {
                 "id": new_uuid7(),
                 "mode": "direct-battle",
@@ -2662,6 +2710,9 @@ class ArenaDirectClient:
                 "modality": modality,
                 "recaptchaV3Token": token or "",
             }
+            if human_token:
+                payload.pop("recaptchaV3Token", None)
+                payload["recaptchaV2Token"] = human_token
             response = await page.fetch(
                 STREAM_CREATE_EVALUATION_PATH,
                 method="POST",
@@ -2671,6 +2722,13 @@ class ArenaDirectClient:
 
         status = int(response.get("status") or 0)
         body = str(response.get("text") or "")
+        if arena_verification.is_rejected(status, body):
+            arena_verification.set_required(self.cdp_url, self._data_dir, True)
+            _record_health(public_name, model_id, status, "recaptcha validation failed")
+            raise self._manual_verification_error()
+        if status == 200 and human_token:
+            # Authentication was accepted even if generation later fails.
+            arena_verification.set_required(self.cdp_url, self._data_dir, False)
         stream = parse_stream(body)
         error = str(stream.get("error") or "")
         if (

@@ -108,6 +108,7 @@ class BridgeError(RuntimeError):
             # why ``_verification_hint`` branches on the code before the
             # expired-session wording.
             "arena_session_rejected",
+            "arena_generation_verification_required",
             "arena_auth_expired",
             "arena_auth_required",
             "arena_login_required",

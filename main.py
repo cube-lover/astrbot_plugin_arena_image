@@ -221,7 +221,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.11",
+    "0.7.12",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -374,8 +374,6 @@ class ArenaImagePlugin(Star):
         if not isinstance(exc, BridgeError) or not exc.requires_interactive_auth:
             return None
         text = str(exc).casefold()
-        if exc.code == "arena_generation_verification_required":
-            return str(exc)
         if exc.code == "arena_session_rejected":
             return (
                 "Arena 拒绝了这次请求，但浏览器中的登录令牌尚未过期。\n"
@@ -429,14 +427,8 @@ class ArenaImagePlugin(Star):
     def _format_verification_status(payload: dict[str, Any]) -> str:
         status = str(payload.get("status") or "unknown")
         logged_in = bool(payload.get("has_logged_in"))
-        if payload.get("generation_verification_required"):
-            headline = (
-                "人工验证结果已就绪，请尽快重发原画图命令；上游接受后才确认恢复。"
-                if payload.get("generation_token_ready")
-                else "画图仍需 reCAPTCHA V2 人工验证。请管理员私聊运行 /竞技场验证 并完成浏览器中的验证。"
-            )
-        elif status == "verified" or bool(payload.get("verified")):
-            headline = "服务器浏览器验证已完成，可以重试画图命令。"
+        if status == "verified" or bool(payload.get("verified")):
+            headline = "服务器浏览器已登录。此状态只确认登录，不代表每次画图都会通过上游验证。"
         elif payload.get("session_refreshable"):
             headline = "登录还在，只是访问令牌过期了。稍等一会儿或再发一次命令就会自动续期，不用重新登录。"
         elif payload.get("has_cf_clearance") and payload.get("has_arena_auth") and not logged_in:
@@ -1322,18 +1314,10 @@ class ArenaImagePlugin(Star):
             browser_url = str(payload.get("browser_url") or "").strip()
             if not browser_url:
                 raise BridgeError("服务器浏览器链接为空")
-            if payload.get("generation_verification_required"):
-                yield event.plain_result(
-                    self._interactive_auth_message(payload, reveal_url=True)
-                    + "\n请点击“进入验证浏览器”，在 Arena 页面上方手动完成 Google 验证；"
-                    "完成后两分钟内重发原画图命令。验证结果只用一次，不会永久保存到 Cookie。"
-                )
-                return
             yield event.plain_result(
                 "已打开服务器浏览器验证会话。\n"
-                "请打开链接，点击“进入验证浏览器”，然后：\n"
-                "1. 如弹出 Cloudflare，先完成验证\n"
-                "2. 必须在 Arena 页面登录账号（Google 或邮箱），匿名会话无法出图\n"
+                "请打开链接，点击“进入验证浏览器”。已登录且网页可画图时无需重新登录。\n"
+                "只有官网自己弹出验证时才需要处理，插件不会额外插入验证码。\n"
                 f"{browser_url}\n"
                 "完成后运行：/竞技场验证状态"
             )

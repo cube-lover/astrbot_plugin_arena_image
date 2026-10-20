@@ -1,11 +1,11 @@
-"""Real human verification is distinct from login and ordinary HTTP errors."""
+"""Regression: a prior rejection must not lock out future user requests."""
 import asyncio
 import json
 import shutil
 import subprocess
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
-from astrbot_plugin_arena_image import arena_direct as direct, arena_verification as manual
+from astrbot_plugin_arena_image import arena_direct as direct, arena_verification
 from tests.test_arena_direct_transport import (
     DirectTransportCase, FakePage, _chunked_cookies, _session_token,
     _filler_models, _image_model, _uuid7,
@@ -13,215 +13,91 @@ from tests.test_arena_direct_transport import (
 from tests.test_arena_image_hardening import _make_plugin, FakeEvent, _collect
 
 MODEL = "image-fixture"
-SUCCESS = {"status": 200, "text": 'a2:[{"type":"image","image":"https://fixture.invalid/result.png"}]\nad:{"finishReason":"stop"}'}
+SUCCESS = {"status": 200, "text": 'a2:[{"type":"image","image":"https://fixture.invalid/result.png"}]'}
 REJECT = {"status": 403, "text": '{"error":"recaptcha validation failed"}'}
 
 
-class ManualPage(FakePage):
-    def __init__(self, **kwargs):
-        super().__init__(
+class VerificationRegressionTests(DirectTransportCase):
+    def page(self, **kwargs):
+        return FakePage(
             cookies=_chunked_cookies(_session_token()),
             models=_filler_models()+[_image_model(MODEL, _uuid7(1700000000))],
             **kwargs,
         )
-        self.ready = False
-        self.takes = 0
 
-    async def evaluate(self, expression, **kwargs):
-        if expression == manual.SNAPSHOT_JS:
-            return {"state": "ready" if self.ready else "waiting", "token_ready": self.ready}
-        if expression == manual.TAKE_JS:
-            self.takes += 1
-            if self.ready:
-                self.ready = False
-                return "ONE_USE_HUMAN_TOKEN"
-            return ""
-        raise AssertionError("Unexpected expression")
-
-
-class ManualGenerationTests(DirectTransportCase):
-    def setUp(self):
-        super().setUp()
-        manual._REQUIRED.clear()
-        self.addCleanup(manual._REQUIRED.clear)
-
-    def test_exact_rejection_sets_persistent_gate_without_a_second_post(self):
-        page = ManualPage(response=REJECT)
-        client = self.client(page)
-        with self.assertRaises(direct.BridgeError) as caught:
-            self.run_async(client.complete(model=MODEL, prompt="an apple"))
-        self.assertEqual(caught.exception.code, "arena_generation_verification_required")
-        self.assertTrue(caught.exception.requires_interactive_auth)
-        self.assertEqual(len(page.requests), 1)
-        manual._REQUIRED.clear()
-        self.assertTrue(client._needs_manual_verification())
-        with self.assertRaises(direct.BridgeError):
-            self.run_async(client.complete(model=MODEL, prompt="an apple"))
-        self.assertEqual(len(page.requests), 1)
-
-    def test_human_token_uses_v2_only_and_success_clears_gate(self):
-        page = ManualPage(response=SUCCESS)
-        client = self.client(page)
-        manual.set_required(client.cdp_url, self.data_dir, True)
-        page.ready = True
-        result = self.run_async(client.complete(model=MODEL, prompt="an apple"))
+    def test_stale_persisted_gate_does_not_prevent_generation(self):
+        (self.data_dir/"arena_generation_verification.json").write_text(
+            json.dumps({"required": True, "endpoint": "old", "updated_at": 1})
+        )
+        page = self.page(response=SUCCESS)
+        result = self.run_async(self.client(page).complete(model=MODEL, prompt="an apple"))
         self.assertTrue(result)
-        body = json.loads(page.requests[0]["body"])
-        self.assertEqual(body["recaptchaV2Token"], "ONE_USE_HUMAN_TOKEN")
-        self.assertNotIn("recaptchaV3Token", body)
-        self.assertEqual(page.takes, 1)
-        self.assertEqual(page.actions, [])
-        self.assertFalse(client._needs_manual_verification())
-        saved = (self.data_dir/manual._NAME).read_text()
-        self.assertNotIn("ONE_USE_HUMAN_TOKEN", saved)
-
-    def test_failed_v2_is_not_retried_and_still_requires_manual_input(self):
-        page = ManualPage(response=REJECT)
-        client = self.client(page)
-        manual.set_required(client.cdp_url, self.data_dir, True)
-        page.ready = True
-        with self.assertRaises(direct.BridgeError):
-            self.run_async(client.complete(model=MODEL, prompt="an apple"))
         self.assertEqual(len(page.requests), 1)
-        self.assertTrue(client._needs_manual_verification())
-        self.assertFalse(page.ready)
+        self.assertNotIn("recaptchaV2Token", json.loads(page.requests[0]["body"]))
 
-    def test_generation_failure_after_accepted_verification_does_not_rechallenge(self):
-        page = ManualPage(response={"status": 200, "text": 'a3:"The generation failed"'})
+    def test_explicit_rejection_does_not_persist_a_gate_or_automatically_retry(self):
+        page = self.page(responses=[REJECT, SUCCESS])
         client = self.client(page)
-        manual.set_required(client.cdp_url, self.data_dir, True)
-        page.ready = True
-        with self.assertRaises(direct.BridgeError) as caught:
+        with self.assertRaises(direct.BridgeError) as error:
             self.run_async(client.complete(model=MODEL, prompt="an apple"))
-        self.assertEqual(caught.exception.code, "stream_generation_failed")
-        self.assertFalse(client._needs_manual_verification())
+        self.assertEqual(error.exception.code, "arena_session_rejected")
         self.assertEqual(len(page.requests), 1)
-    def test_token_expired_during_reference_upload_stops_before_generation(self):
-        page = ManualPage(response=SUCCESS)
-        client = self.client(page)
-        manual.set_required(client.cdp_url, self.data_dir, True)
-        page.ready = True
-        async def upload(*args):
-            page.ready = False
-            return {"url": "https://fixture.invalid/reference"}
-        client._upload_reference = upload
-        with self.assertRaises(direct.BridgeError):
-            self.run_async(client.complete(model=MODEL, prompt="an apple", images=["fixture"]))
-        self.assertEqual(page.requests, [])
+        self.assertFalse((self.data_dir/"arena_generation_verification.json").exists())
+        # A separate explicit user command is allowed to reach the site.
+        self.assertTrue(self.run_async(client.complete(model=MODEL, prompt="an apple")))
+        self.assertEqual(len(page.requests), 2)
 
-    def test_status_never_claims_verified_from_login_or_ready_token(self):
-        page = ManualPage()
+    def test_login_status_does_not_read_stale_local_gate_or_claim_generation_success(self):
+        page = self.page()
         client = self.client(page)
-        manual.set_required(client.cdp_url, self.data_dir, True)
-        for ready in (False, True):
-            page.ready = ready
-            state = self.run_async(client.latest_interactive_auth_status())
-            self.assertTrue(state["has_logged_in"])
-            self.assertFalse(state["verified"])
-            self.assertEqual(state["status"], "waiting")
-            self.assertEqual(state["generation_token_ready"], ready)
-
-    def test_unknown_403_does_not_create_manual_challenge(self):
-        page = ManualPage(response={"status": 403, "text": '{"error":"forbidden"}'})
-        client = self.client(page)
-        with self.assertRaises(direct.BridgeError) as caught:
-            self.run_async(client.complete(model=MODEL, prompt="an apple"))
-        self.assertEqual(caught.exception.code, "arena_session_rejected")
-        self.assertFalse(client._needs_manual_verification())
-
-    def test_private_command_shows_existing_browser_link_and_manual_instructions(self):
+        (self.data_dir/"arena_generation_verification.json").write_text('{"required":true}')
+        state = self.run_async(client.latest_interactive_auth_status())
+        self.assertTrue(state["has_logged_in"])
+        self.assertFalse(state.get("generation_verification_required", False))
+        self.assertIn("实际生成请求", state["message"])
         _, plugin = _make_plugin(self)
-        payload = {
-            "status": "waiting", "has_logged_in": True,
-            "generation_verification_required": True,
-            "browser_url": "https://fixture.invalid/verify",
-        }
-        plugin._client = lambda: type("Client", (), {"start_interactive_auth": AsyncMock(return_value=payload)})()
+        text = plugin._format_verification_status(state)
+        self.assertIn("只确认登录", text)
+
+    def test_private_command_gives_link_without_forcing_a_custom_captcha(self):
+        _, plugin = _make_plugin(self)
+        plugin._client = lambda: type("Client", (), {"start_interactive_auth": AsyncMock(return_value={
+            "status": "verified", "has_logged_in": True, "browser_url": "https://fixture.invalid/verify",
+        })})()
         results = _collect(plugin.interactive_verify(FakeEvent(private=True)))
-        text = results[0].text
-        self.assertIn("fixture.invalid/verify", text)
-        self.assertIn("Google", text)
-        self.assertIn("两分钟", text)
-        self.assertIn("只用一次", text)
+        self.assertIn("fixture.invalid/verify", results[0].text)
+        self.assertIn("无需重新登录", results[0].text)
+        self.assertIn("不会额外插入验证码", results[0].text)
 
-    def test_group_command_does_not_expose_link_or_render_widget(self):
+    def test_group_command_still_does_not_expose_browser(self):
         _, plugin = _make_plugin(self)
-        plugin._client = lambda: self.fail("Group must not render verification or mint links")
-        results = _collect(plugin.interactive_verify(FakeEvent(private=False)))
-        self.assertIn("私聊", results[0].text)
+        plugin._client = lambda: self.fail("Group must not open browser access")
+        self.assertIn("私聊", _collect(plugin.interactive_verify(FakeEvent(private=False)))[0].text)
 
-    def test_requirement_is_scoped_by_endpoint_and_directory(self):
-        manual.set_required("endpoint-a", self.data_dir, True)
-        self.assertTrue(manual.required("endpoint-a", self.data_dir))
-        self.assertFalse(manual.required("endpoint-b", self.data_dir))
-        self.assertFalse(manual.required("endpoint-a", self.data_dir/"other"))
-
-    def test_only_exact_recaptcha_error_qualifies(self):
-        self.assertTrue(manual.is_rejected(403, REJECT["text"]))
-        for code, body in [
-            (429, REJECT["text"]), (200, REJECT["text"]), (403, '{"error":"forbidden"}'),
-            (403, "recaptcha validation failed"), (403, '{"error":"account banned"}'),
-        ]:
-            self.assertFalse(manual.is_rejected(code, body))
-
-    def test_widget_single_use_expiry_cancel_and_stale_callback_in_javascript(self):
+    def test_cleanup_invalidates_old_callbacks_and_preserves_official_widget(self):
         node = shutil.which("node")
-        self.assertIsNotNone(node, "Node is required to test the browser state machine")
+        self.assertIsNotNone(node)
         script = r"""
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const code=JSON.parse(fs.readFileSync(0,'utf8'));
-const elements=new Map(); let options; let renders=0; let clock=0;
-Date.now=()=>clock;
-class Element {
-  constructor(){this.style={};this.children=[];}
-  append(...children){this.children.push(...children);}
-  remove(){elements.delete(this.id);}
-}
-global.document={
-  createElement:()=>new Element(),
-  getElementById:id=>elements.get(id),
-  body:{append(el){elements.set(el.id,el);}}
-};
-global.window={grecaptcha:{enterprise:{
-  ready:fn=>fn(),render:(el,opts)=>{options=opts;renders++;}
-}}};
-(async()=>{
-  assert.equal((await eval(code.render)).state,'waiting');
-  assert.equal((await eval(code.render)).state,'waiting');
-  assert.equal(renders,1);
-  assert.equal(eval(code.snapshot).token_ready,false);
-  options.callback('FIXTURE_ONLY_HUMAN_TOKEN');
-  assert.equal(eval(code.snapshot).token_ready,true);
-  assert.equal(eval(code.take),'FIXTURE_ONLY_HUMAN_TOKEN');
-  assert.equal(eval(code.take),'');
-  assert.equal(eval(code.snapshot).state,'consumed');
-  await eval(code.render); options.callback('EXPIRED_FIXTURE');
-  clock=111000;
-  assert.equal(eval(code.take),'');
-  assert.equal(eval(code.snapshot).token_ready,false);
-  await eval(code.render); const old=options.callback;
-  elements.get('arena-plugin-manual-verification').children.at(-1).onclick();
-  old('CANCELLED_FIXTURE'); assert.equal(eval(code.take),'');
-  await eval(code.render); old('LATE_OLD_FIXTURE');
-  assert.equal(eval(code.snapshot).token_ready,false);
-  options.callback('CURRENT_FIXTURE');
-  assert.equal(eval(code.take),'CURRENT_FIXTURE');
-  process.stdout.write('ok');
-})().catch(e=>{console.error(e);process.exit(1)});
+const nodes=new Map();
+nodes.set('recaptcha-v2-container',{official:true});
+nodes.set('arena-plugin-manual-verification',{remove(){nodes.delete('arena-plugin-manual-verification')}});
+global.document={getElementById:id=>nodes.get(id)};
+const previous={state:'waiting',token:'FIXTURE_TOKEN'};
+global.window={__arenaManualVerification:previous};
+assert.equal(eval(code).removed,true);
+assert.equal(previous.token,'');
+assert.equal(previous.state,'cancelled');
+assert.equal(window.__arenaManualVerification,undefined);
+assert.equal(nodes.get('recaptcha-v2-container').official,true);
+assert.equal(eval(code).removed,false);
+process.stdout.write('ok');
 """
         result = subprocess.run(
-            [node, "-e", script], input=json.dumps({
-                "render": manual.render_js("PUBLIC_SITEKEY_FIXTURE"),
-                "snapshot": manual.SNAPSHOT_JS, "take": manual.TAKE_JS,
-            }), text=True, capture_output=True, timeout=20,
+            [node, "-e", script], input=json.dumps(arena_verification.CLEANUP_JS),
+            text=True, capture_output=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "ok")
-
-    def test_persistence_failure_does_not_lose_current_gate_or_success(self):
-        with patch.object(manual.Path, "mkdir", side_effect=OSError("read-only")):
-            manual.set_required("fixture", self.data_dir, True)
-            self.assertTrue(manual.required("fixture", self.data_dir))
-            manual.set_required("fixture", self.data_dir, False)
-            self.assertFalse(manual.required("fixture", self.data_dir))

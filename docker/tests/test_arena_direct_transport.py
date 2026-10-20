@@ -1089,8 +1089,8 @@ class GenerationTests(DirectTransportCase):
             self.run_async(self.client(page).complete(model=self.MODEL, prompt="a red apple"))
         self.assertEqual(len(page.requests), 1)
         self.assertIn("recaptcha validation failed", str(caught.exception))
-        self.assertEqual(caught.exception.code, "arena_generation_verification_required")
-        self.assertIn("reCAPTCHA V2 人工验证", str(caught.exception))
+        self.assertEqual(caught.exception.code, "arena_session_rejected")
+        self.assertIn("验证相关错误", str(caught.exception))
 
     def test_moderation_refusal_is_reported_as_text_not_as_auth_failure(self) -> None:
         body = 'a3:"Your request was blocked by our content moderation system."'

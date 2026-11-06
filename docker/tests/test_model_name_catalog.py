@@ -72,7 +72,7 @@ class DirectNameCatalogTests(DirectTransportCase):
         self.assertNotIn("gpt-chat", by_id)
         selectable = self.run_async(client.list_models())
         self.assertNotIn("gpt-hidden", [row["id"] for row in selectable])
-        self.assertEqual(client._variants(arena_direct._MODELS, "gpt-hidden"), [])
+        self.assertEqual(client._variants(arena_direct.cache_scope(page)["models"], "gpt-hidden"), [])
         self.assertEqual(page.requests, [])
         self.assertEqual(page.actions, [])
         self.assertFalse((self.data_dir / "arena_model_health.json").exists())

@@ -29,10 +29,10 @@ SUCCESS = {"status": 200, "headers": {}, "text": '{"models":[]}'}
 class DeploymentRefreshTest(unittest.TestCase):
     def setUp(self):
         direct._LOCK = asyncio.Lock()
-        direct._ACTIONS = {"generateUploadUrl": "OLD_ACTION"}
-        direct._ACTIONS_AT = 100
-        direct._MODELS = [{"id": "KEEP_STORED_MODEL"}]
-        direct._MODELS_AT = 100
+        direct.reset_caches()
+        direct.cache_scope().update(actions={"generateUploadUrl": "OLD_ACTION"},
+                                    actions_at=100, models=[{"id": "KEEP_STORED_MODEL"}],
+                                    models_at=100)
 
     def test_only_explicit_409_or_header_triggers_refresh(self):
         self.assertTrue(direct.deployment_refresh_required(STALE))
@@ -54,9 +54,9 @@ class DeploymentRefreshTest(unittest.TestCase):
         self.assertEqual(result["status"], 200)
         page.reload.assert_awaited_once()
         self.assertEqual(len(page.expressions), 2)
-        self.assertEqual(direct._ACTIONS, {})
-        self.assertEqual(direct._MODELS_AT, 0)
-        self.assertEqual(direct._MODELS, [{"id": "KEEP_STORED_MODEL"}])
+        self.assertEqual(direct.cache_scope(page)["actions"], {})
+        self.assertEqual(direct.cache_scope(page)["models_at"], 0)
+        self.assertEqual(direct.cache_scope(page)["models"], [{"id": "KEEP_STORED_MODEL"}])
         page.mint_recaptcha.assert_not_awaited()
 
     def test_generation_keeps_request_identity_attachments_and_prompt(self):

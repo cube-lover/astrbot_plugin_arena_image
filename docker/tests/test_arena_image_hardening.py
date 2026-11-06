@@ -121,6 +121,20 @@ class _StubFilter:
         return decorator
 
     @staticmethod
+    def regex(pattern, **kwargs):
+        def decorator(func):
+            func.arena_regex = pattern
+            return func
+        return decorator
+
+    @staticmethod
+    def custom_filter(filter_class, **kwargs):
+        def decorator(func):
+            func.arena_custom_filter = filter_class()
+            return func
+        return decorator
+
+    @staticmethod
     def permission_type(value):
         def decorator(func):
             func.arena_permission = value
@@ -201,6 +215,7 @@ def _install_astrbot_stubs() -> None:
     event_mod.filter = _StubFilter
     components = types.ModuleType("astrbot.api.message_components")
     components.At = type("At", (), {})
+    components.Reply = type("Reply", (), {"__init__": lambda self, **kw: vars(self).update(kw)})
     components.Image = _StubImage
     components.Plain = _StubPlain
     star_mod = types.ModuleType("astrbot.api.star")
@@ -1136,7 +1151,7 @@ class SchemaAndMetadataTest(unittest.TestCase):
             for line in metadata.splitlines()
             if line.startswith("version:")
         )
-        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(version, r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
         self.assertIn("author: cube-lover", metadata)
         # The @register version used to drift behind metadata.yaml, which made the
         # AstrBot console show a stale plugin version after an upgrade.

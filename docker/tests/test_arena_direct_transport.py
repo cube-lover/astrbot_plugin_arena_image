@@ -190,12 +190,7 @@ class DirectTransportCase(unittest.TestCase):
         # A fresh lock per test: every test drives its own `asyncio.run` loop and
         # an `asyncio.Lock` refuses to be shared across event loops.
         arena_direct._LOCK = asyncio.Lock()
-        arena_direct._MODELS = []
-        arena_direct._MODELS_AT = 0.0
-        arena_direct._ACTIONS = {}
-        arena_direct._ACTIONS_AT = 0.0
-        arena_direct._UPLOADS.clear()
-        arena_direct._SESSIONS.clear()
+        arena_direct.reset_caches()
         arena_direct._HEALTH = {"models": {}, "variants": {}}
         arena_direct._HEALTH_PATH = None
         arena_direct._LINK_SECRETS.clear()
@@ -449,7 +444,7 @@ class ModelSelectionTests(DirectTransportCase):
         client = self.client(good)
         self.assertEqual(len(self.run_async(client.list_models())), 12)
 
-        arena_direct._MODELS_AT = 0.0  # force a refetch, keep the cached rows
+        arena_direct.cache_scope()["models_at"] = 0.0  # refetch, keep cached rows
         truncated = FakePage(models=_filler_models(3))
         client = self.client(truncated)
         self.assertEqual(len(self.run_async(client.list_models())), 12)
@@ -971,8 +966,8 @@ class StaleServerActionTests(DirectTransportCase):
         self.assertEqual(page.reload_calls, 0)
 
     def test_refreshing_the_actions_ignores_a_warm_cache(self) -> None:
-        arena_direct._ACTIONS = dict(self.OLD_IDS)
-        arena_direct._ACTIONS_AT = time.time()
+        arena_direct.cache_scope()["actions"] = dict(self.OLD_IDS)
+        arena_direct.cache_scope()["actions_at"] = time.time()
         page = FakePage(action_sets=[self.NEW_IDS])
         client = self.client(page)
         cached = self.run_async(client._next_actions(page))
@@ -981,7 +976,7 @@ class StaleServerActionTests(DirectTransportCase):
         fresh = self.run_async(client._next_actions(page, refresh=True))
         self.assertEqual(fresh, self.NEW_IDS)
         self.assertEqual(page.reload_calls, 1)
-        self.assertEqual(arena_direct._ACTIONS, self.NEW_IDS)
+        self.assertEqual(arena_direct.cache_scope()["actions"], self.NEW_IDS)
 
 
 class GenerationTests(DirectTransportCase):
@@ -1244,7 +1239,7 @@ class TransportDispatchTests(DirectTransportCase):
             (PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig")
         )
         self.assertEqual(schema["transport_mode"]["default"], "bridge")
-        self.assertEqual(schema["transport_mode"]["options"], ["bridge", "direct"])
+        self.assertEqual(schema["transport_mode"]["options"], ["bridge", "direct", "userscript"])
         for key in (
             "browser_cdp_url",
             "browser_gateway_url",

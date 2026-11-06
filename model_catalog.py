@@ -194,6 +194,10 @@ class HistoryModelCatalog:
             and _uuid(path.removeprefix("/api/evaluation/"))
         ):
             raise ValueError("Unexpected model discovery endpoint")
+        hook = getattr(page, "history_json", None)
+        if callable(hook):
+            result = await hook(path, timeout=timeout)
+            return result if isinstance(result, dict) else {"status": 0, "body": None}
         expression = _READ_JSON_JS % {
             "path": json.dumps(path),
             "timeout_ms": max(1000, int(timeout * 1000)),

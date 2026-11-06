@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
+from .arena_battle import BattleProtocolMixin
 from .bridge_client import BridgeError, decode_image_value
 from .model_catalog import history_catalog
 from . import arena_verification
@@ -192,13 +193,13 @@ def deployment_refresh_required(response: dict[str, Any]) -> bool:
     return isinstance(body, dict) and body.get("error") == "refresh_required"
 
 
-async def _invalidate_deployment_caches() -> None:
-    """Keep stored model/history records, but stop trusting old build caches."""
-    global _ACTIONS, _ACTIONS_AT, _MODELS_AT
+async def _invalidate_deployment_caches(page: Any = None) -> None:
+    """Invalidate this browser's build caches; preserve model/history records."""
     async with _LOCK:
-        _ACTIONS = {}
-        _ACTIONS_AT = 0.0
-        _MODELS_AT = 0.0
+        scope = cache_scope(page)
+        scope["actions"] = {}
+        scope["actions_at"] = 0.0
+        scope["models_at"] = 0.0
 
 
 def action_is_stale(status: Any, body: Any) -> bool:
@@ -1082,7 +1083,9 @@ _NEXT_ACTION_JS = """
   let scanned = 0;
   try {
     const pattern = %(pattern)s;
-    const sources = [...document.scripts].map(s => s.src).filter(Boolean).slice(0, 120);
+    const sources = [...new Set([...document.scripts].map(s => s.src).filter(Boolean).concat(
+      performance.getEntriesByType('resource').map(r => r.name).filter(url => url.includes('/_next/') && url.endsWith('.js'))
+    ))].filter(url => { try { return new URL(url, location.href).origin === location.origin; } catch(e) { return false; } }).slice(0, 120);
     for (const url of sources) {
       try {
         const text = await (await fetch(url)).text();
@@ -1161,14 +1164,10 @@ def _page_fetch_js(
 # --- shared state ------------------------------------------------------------
 #
 # ``main.py`` builds a fresh client for every command, so anything worth keeping
-# between commands lives here.  One browser per deployment means one cache.
+# between commands lives here. Cache records are scoped to the original browser.
 
 _LOCK = asyncio.Lock()
-_MODELS: list[dict[str, Any]] = []
-_MODELS_AT = 0.0
-_ACTIONS: dict[str, str] = {}
-_ACTIONS_AT = 0.0
-_UPLOADS: dict[str, dict[str, Any]] = {}
+_SCOPES: dict[str, dict[str, Any]] = {}
 _SESSIONS: dict[str, dict[str, Any]] = {}
 # cdp_url -> (secret, read_at).  Read once per hour per browser: the file only
 # changes when the operator regenerates it and re-creates the containers.
@@ -1176,6 +1175,43 @@ _LINK_SECRETS: dict[str, tuple[str, float]] = {}
 _GATEWAY_URLS: dict[str, tuple[str, float]] = {}
 _HEALTH: dict[str, dict[str, Any]] = {"models": {}, "variants": {}}
 _HEALTH_PATH: Path | None = None
+
+
+def cdp_browser_scope(endpoint: str) -> str:
+    """Stable configured browser identity, never URL userinfo/query credentials."""
+    parts = urlsplit(str(endpoint or "").strip().rstrip("/"))
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    authority = host + (f":{parts.port}" if parts.port is not None else "")
+    return f"cdp:{parts.scheme}://{authority}{parts.path.rstrip('/')}"
+
+
+def cache_scope(page: Any = None) -> dict[str, Any]:
+    """The cache bucket for the browser behind ``page``.
+
+    ``page.cache_key`` is the browser's identity: the CDP endpoint for the
+    server container, ``relay:<browser id>`` for a userscript browser.  Pages
+    without one share the default bucket, which is what a single-browser
+    deployment has always had.
+    """
+    key = str(getattr(page, "cache_key", "") or "default")
+    scope = _SCOPES.get(key)
+    if scope is None:
+        scope = {
+            "models": [],
+            "models_at": 0.0,
+            "actions": {},
+            "actions_at": 0.0,
+            "uploads": {},
+        }
+        _SCOPES[key] = scope
+    return scope
+
+def reset_caches() -> None:
+    """Forget every browser's caches and verification sessions."""
+    _SCOPES.clear()
+    _SESSIONS.clear()
 
 
 # --- model health ------------------------------------------------------------
@@ -1415,11 +1451,13 @@ class ArenaPage:
         url: str,
         *,
         target_id: str = "",
+        cache_key: str = "",
     ) -> None:
         self.cdp = cdp
         self.session_id = session_id
         self.url = url
         self.target_id = target_id
+        self.cache_key = str(cache_key or "")
         self._cookies: list[dict[str, Any]] | None = None
 
     async def evaluate(self, expression: str, *, timeout: float | None = None) -> Any:
@@ -1568,7 +1606,7 @@ class ArenaPage:
             if not await self.reload():
                 return response
             self._cookies = None
-            await _invalidate_deployment_caches()
+            await _invalidate_deployment_caches(self)
             if path == STREAM_CREATE_EVALUATION_PATH:
                 # The 409 explicitly rejected this operation before execution.
                 # Preserve evaluation/message IDs and attachments; replace only
@@ -1657,6 +1695,7 @@ async def open_page(cdp_url: str, *, timeout: float = 30.0, browser_url: str = "
                 session_id,
                 str(chosen.get("url") or ""),
                 target_id=str(chosen.get("targetId") or ""),
+                cache_key=cdp_browser_scope(cdp_url),
             )
         except CDPError as exc:
             # Everything above this module speaks ``BridgeError``, so a CDP
@@ -1825,6 +1864,9 @@ def _url_is_challenged(url: str) -> bool:
 
 async def _live_state(page: ArenaPage) -> dict[str, Any]:
     """Classify the browser's *current* session without storing any cookie."""
+    hook = getattr(page, "live_state", None)
+    if callable(hook):
+        return await hook()
     cookies = await page.cookies(refresh=True)
     token = combine_auth_cookie(cookies)
     refreshed = False
@@ -1867,7 +1909,7 @@ async def _live_state(page: ArenaPage) -> dict[str, Any]:
 # --- client ------------------------------------------------------------------
 
 
-class ArenaDirectClient:
+class ArenaDirectClient(BattleProtocolMixin):
     """Same interface as ``ArenaBridgeClient``, no bridge container required.
 
     ``main.py`` only chooses which of the two to build; every command above it
@@ -1908,6 +1950,7 @@ class ArenaDirectClient:
         )
         self._data_dir = Path(data_dir) if data_dir else None
         self._history_catalog = history_catalog(self.cdp_url, self._data_dir)
+        self._last_models: list[dict[str, Any]] = []
         if data_dir:
             _load_health(Path(data_dir) / "arena_model_health.json")
         if not self.cdp_url:
@@ -2027,33 +2070,39 @@ class ArenaDirectClient:
             model.get("publicName")
         )
 
+    def _history_for_page(self, page: ArenaPage):
+        return self._history_catalog
+
     async def _models(
         self, page: ArenaPage, *, refresh: bool = False, discover: bool = False,
     ) -> list[dict[str, Any]]:
-        global _MODELS, _MODELS_AT
+        scope = cache_scope(page)
+        catalog = self._history_for_page(page)
         table = None
         async with _LOCK:
-            fresh = _MODELS and time.time() - _MODELS_AT <= MODEL_CACHE_SECONDS
+            fresh = scope["models"] and time.time() - scope["models_at"] <= MODEL_CACHE_SECONDS
             if fresh and not refresh:
-                table = list(_MODELS)
+                table = list(scope["models"])
         if table is None:
             table = await page.model_table()
             if len(table) < 10:
                 # A truncated table must not remove either public or history rows.
                 async with _LOCK:
-                    if _MODELS:
-                        return self._history_catalog.merge(_MODELS)
+                    if scope["models"]:
+                        self._last_models = catalog.merge(scope["models"])
+                        return self._last_models
                 raise _err("竞技场模型列表异常（行数过少），请稍后再试。", code="model_table_empty")
             async with _LOCK:
                 # Account-history metadata stays in the endpoint/data-dir registry,
                 # never in the shared public-table cache.
-                _MODELS = table
-                _MODELS_AT = time.time()
+                scope["models"] = table
+                scope["models_at"] = time.time()
         if discover and (self.allow_stealth_models or self.allowed_stealth_models):
             # Only explicit catalog reads discover history. Generation resolves
             # already recovered UUIDs without another history scan.
-            await self._history_catalog.recover(page, table)
-        return self._history_catalog.merge(table)
+            await catalog.recover(page, table)
+        self._last_models = catalog.merge(table)
+        return self._last_models
 
     def _variants(self, models: list[dict[str, Any]], public_name: str) -> list[dict[str, Any]]:
         wanted = str(public_name or "").strip().casefold()
@@ -2276,6 +2325,7 @@ class ArenaDirectClient:
                         session,
                         target["url"],
                         target_id=str(target.get("target_id") or ""),
+                        cache_key=cdp_browser_scope(self.cdp_url),
                     )
                     state = await _live_state(page)
                     await arena_verification.cleanup(page)
@@ -2372,19 +2422,19 @@ class ArenaDirectClient:
         chunks the page has loaded, so rescanning without a reload just returns
         the same forgotten ids.
         """
-        global _ACTIONS, _ACTIONS_AT
+        scope = cache_scope(page)
         if refresh:
-            await _invalidate_deployment_caches()
+            await _invalidate_deployment_caches(page)
             await page.reload()
         else:
             async with _LOCK:
-                if _ACTIONS and time.time() - _ACTIONS_AT <= ACTION_CACHE_SECONDS:
-                    return dict(_ACTIONS)
+                if scope["actions"] and time.time() - scope["actions_at"] <= ACTION_CACHE_SECONDS:
+                    return dict(scope["actions"])
         actions = await page.next_actions()
         if actions:
             async with _LOCK:
-                _ACTIONS = actions
-                _ACTIONS_AT = time.time()
+                scope["actions"] = actions
+                scope["actions_at"] = time.time()
         return dict(actions)
 
     @staticmethod
@@ -2408,8 +2458,9 @@ class ArenaDirectClient:
         """
         raw, mime = decode_image_value(value)
         digest = hashlib.md5(raw).hexdigest()
+        uploads = cache_scope(page)["uploads"]
         async with _LOCK:
-            cached = dict(_UPLOADS.get(digest) or {})
+            cached = dict(uploads.get(digest) or {})
         if cached and float(cached.get("expiry") or 0) > time.time() + 60:
             return {
                 "name": cached["name"],
@@ -2516,11 +2567,12 @@ class ArenaDirectClient:
             )
 
         entry = {"name": filename, "contentType": mime, "url": download_url}
+        uploads = cache_scope(page)["uploads"]
         async with _LOCK:
-            if len(_UPLOADS) >= UPLOAD_CACHE_LIMIT:
-                for stale in list(_UPLOADS)[: max(1, UPLOAD_CACHE_LIMIT // 10)]:
-                    _UPLOADS.pop(stale, None)
-            _UPLOADS[digest] = {
+            if len(uploads) >= UPLOAD_CACHE_LIMIT:
+                for stale in list(uploads)[: max(1, UPLOAD_CACHE_LIMIT // 10)]:
+                    uploads.pop(stale, None)
+            uploads[digest] = {
                 **entry,
                 "key": key,
                 "expiry": signed_url_expiry(download_url) or (time.time() + 3600),
@@ -2554,7 +2606,7 @@ class ArenaDirectClient:
                 # endpoint warrants one immediate retry on another selectable
                 # variant of that exact name; never guess a renamed model.
                 if exc.code == "provider_model_unavailable" and variant_retries == 0:
-                    rows = self._variants(_MODELS, clean_model)
+                    rows = self._variants(self._last_models, clean_model)
                     if any(not _variant_failed_recently(str(row["id"])) for row in rows):
                         variant_retries += 1
                         await asyncio.sleep(2.0)

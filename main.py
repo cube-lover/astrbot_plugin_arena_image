@@ -32,6 +32,9 @@ try:
 except ImportError:  # AstrBot versions before the shared quoted-message helper.
     extract_quoted_message_images = None
 
+from .battle_commands import BattleCommandsMixin
+from .battle_reply import BattleMessageReceipt, BattleReplyFilter, message_id
+from .arena_relay import ArenaUserscriptClient, RelayServer
 from .arena_direct import ArenaDirectClient
 from .bridge_client import (
     ArenaBridgeClient,
@@ -221,9 +224,9 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.12",
+    "0.7.16-battle",
 )
-class ArenaImagePlugin(Star):
+class ArenaImagePlugin(BattleCommandsMixin, Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
 
     def __init__(self, context: Context, config: dict | None = None):
@@ -250,15 +253,214 @@ class ArenaImagePlugin(Star):
         self._last_generation_seconds = 0.0
         self._interactive_auth_session_id = ""
         self._openai_proxy = OpenAIProxyServer(self)
+        self._relay: RelayServer | None = None
+        self._init_battles()
+
+    @filter.command("battle", alias={"竞技场battle", "竞技场对战"})
+    async def battle(self, event: AstrMessageEvent, prompt: GreedyStr = GreedyStr):
+        generator = BattleCommandsMixin.battle(self, event, prompt)
+        try:
+            async for result in generator:
+                yield result
+        finally:
+            # The outer scheduler may close immediately after the ACK. Close
+            # the inner generator too so its queue reservation is released.
+            await generator.aclose()
+
+
+    @filter.command("battle投票", alias={"battlevote", "竞技场投票"})
+    async def battle_vote(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        async for result in BattleCommandsMixin.battle_vote(self, event, text):
+            yield result
+
+
+    @filter.command("battle揭晓", alias={"battlereveal", "竞技场揭晓", "battle不投票"})
+    async def battle_reveal(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        async for result in BattleCommandsMixin.battle_reveal(self, event, text):
+            yield result
+
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("battle揭晓开关")
+    async def battle_reveal_switch(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        async for result in BattleCommandsMixin.battle_reveal_switch(self, event, text):
+            yield result
+
+
+    @filter.regex(r"(?i)^battle(?:[ \t]+|$)")
+    async def battle_plain_entry(self, event: AstrMessageEvent):
+        # Regex bypasses AstrBot's wake_prefix. The ordinary command handles
+        # already-woken events; only raw unprefixed battle reaches this route.
+        if getattr(event, "is_at_or_wake_command", False):
+            return
+        raw = str(event.get_message_str() or "").strip()
+        prompt = re.sub(r"(?i)^battle(?:[ \t]+|$)", "", raw, count=1)
+        generator = BattleCommandsMixin.battle(self, event, prompt)
+        try:
+            async for result in generator:
+                yield result
+        finally:
+            await generator.aclose()
+        # AstrBot 4.27 checks is_stopped() before downstream send for every
+        # yielded result. Stop propagation only after all results were consumed.
+        event.stop_event()
+
+
+    @filter.custom_filter(BattleReplyFilter)
+    async def battle_reply_entry(self, event: AstrMessageEvent):
+        generator = BattleCommandsMixin.battle_reply(self, event)
+        try:
+            async for result in generator:
+                yield result
+        finally:
+            await generator.aclose()
+        # Only this exact quoted intent is ours. Stop after every reply yielded
+        # so the real scheduler still sends it before blocking LLM propagation.
+        event.stop_event()
+
+    def _battle_client(self) -> ArenaDirectClient:
+        # The bundled bridge only offers single-model completions. Battle uses
+        # its existing arena-browser directly; ordinary /jjc stays on the bridge.
+        if self._transport_mode() != "bridge":
+            return self._client()
+        return ArenaDirectClient(
+            str(self.config.get("browser_cdp_url") or "http://arena-browser:9223"),
+            gateway_url=str(self.config.get("browser_gateway_url") or ""),
+            vnc_url=str(self.config.get("browser_vnc_url") or ""),
+            link_secret=str(self.config.get("interactive_link_secret") or ""),
+            timeout=_as_float(self.config.get("request_timeout"), 300.0, 10.0, 1800.0),
+            rate_limit_retries=0, data_dir=self.data_dir,
+        )
+
+
+    def _battle_command_prefix(self, event: AstrMessageEvent) -> str:
+        """Choose a wake prefix from the event's core config, not plugin config."""
+        try:
+            prefixes = self.context.get_config(
+                getattr(event, "unified_msg_origin", None)
+            ).get("wake_prefix", [])
+        except Exception:
+            return "/"
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        if not isinstance(prefixes, (list, tuple)):
+            return "/"
+        nonempty = [
+            prefix for prefix in prefixes
+            if isinstance(prefix, str) and prefix
+        ]
+        if "," in nonempty:
+            return ","
+        return nonempty[0] if nonempty else "/"
+
+    async def _deliver_battle_message(
+        self,
+        event: AstrMessageEvent,
+        result: Any,
+    ) -> _ImageDeliveryFailure | BattleMessageReceipt | str | None:
+        """Send the complete anonymous result; retry only explicit QQ rejection.
+
+        Every attempt retains all native components, including both lane labels
+        and every image. Only a missing direct-send interface returns ``""``;
+        uncertain delivery never permits another transport or an image yield.
+        Diagnostics deliberately exclude exception text and message contents.
+        """
+        failure_message = "对战消息发送失败，请检查平台发送状态。"
+        try:
+            sender = getattr(event, "send", None)
+            if sender is None:
+                return ""
+            if not callable(sender):
+                return _ImageDeliveryFailure(failure_message, 0, uncertain=True)
+            qq_sender = prepare_qq_image_sender(
+                event,
+                _as_float(
+                    self.config.get("qq_image_send_timeout"),
+                    DEFAULT_QQ_IMAGE_SEND_TIMEOUT, 60.0, 600.0,
+                ),
+            )
+            if qq_sender is not None:
+                sender = qq_sender
+            attempts = self._send_max_attempts()
+            delay = self._send_retry_delay()
+        except Exception:
+            logger.warning("[arena_battle] 对战消息发送准备失败")
+            return _ImageDeliveryFailure(failure_message, 0, uncertain=True)
+
+        for attempt in range(attempts):
+            try:
+                receipt = await sender(MessageChain(result.chain))
+            except Exception as exc:
+                try:
+                    rejected = _confirmed_send_rejection(exc)
+                except Exception:
+                    rejected = False
+                if not rejected:
+                    logger.warning(
+                        "[arena_battle] 对战消息回执不确定，停止自动重发（第 %d/%d 次）",
+                        attempt + 1, attempts,
+                    )
+                    return _ImageDeliveryFailure(
+                        failure_message, attempt + 1, uncertain=True
+                    )
+                logger.warning(
+                    "[arena_battle] QQ 明确拒收对战消息（第 %d/%d 次）",
+                    attempt + 1, attempts,
+                )
+                if attempt + 1 < attempts:
+                    try:
+                        await asyncio.sleep(delay * (attempt + 1))
+                    except Exception:
+                        logger.warning("[arena_battle] 对战消息重试等待失败，停止自动重发")
+                        return _ImageDeliveryFailure(
+                            failure_message, attempt + 1, uncertain=False
+                        )
+                continue
+            if qq_sender is not None:
+                logger.info("[arena_battle] QQ 对战消息已获成功回执")
+            if attempt:
+                logger.info(
+                    "[arena_battle] 对战消息重试发送成功（第 %d 次）", attempt + 1,
+                )
+            native_id = message_id(receipt.get("message_id")) if isinstance(receipt, dict) else ""
+            if native_id:
+                return BattleMessageReceipt(native_id)
+            if qq_sender is not None:
+                return _ImageDeliveryFailure(failure_message, attempt + 1, uncertain=True)
+            # Other native adapters may not expose a message ID. Preserve their
+            # confirmed-send semantics, but never guess a quote binding.
+            return None
+        return _ImageDeliveryFailure(failure_message, attempts, uncertain=False)
 
     async def initialize(self):
-        if self._transport_mode() == "direct":
+        mode = self._transport_mode()
+        if mode == "userscript":
+            relay = self._relay_server()
+            try:
+                await relay.start()
+            except BridgeError as exc:
+                # A busy port must not unload the plugin: health() and
+                # /竞技场浏览器状态 both surface bind_error, which is fixable live.
+                logger.error("[arena_image] 油猴中转启动失败：%s", _display_error(exc))
+            else:
+                # The install link carries a one-time token, so it stays out of
+                # the log; /竞技场浏览器接入 mints a fresh one in private chat.
+                logger.info(
+                    "[arena_image] 插件已加载，油猴中转监听 %s:%s%s，对外地址 %s"
+                    "（私聊运行 /竞技场浏览器接入 获取安装链接）",
+                    relay.host,
+                    relay.port,
+                    relay.prefix,
+                    relay.public_url or "未配置（relay_public_url）",
+                )
+        elif mode == "direct":
             logger.info(
                 "[arena_image] 插件已加载，直连服务器浏览器：%s",
                 str(self.config.get("browser_cdp_url") or "http://arena-browser:9223"),
             )
         else:
             logger.info("[arena_image] 插件已加载，Bridge 地址：%s", self._bridge_url())
+
         if self._openai_proxy._enabled():
             try:
                 await self._openai_proxy.start()
@@ -267,20 +469,64 @@ class ArenaImagePlugin(Star):
                 logger.error("[arena_image] OpenAI 图像中转启动失败：%s", exc)
 
     async def terminate(self):
-        await self._openai_proxy.stop()
-
+        # Either listener must be stopped even when the other cleanup fails.
+        try:
+            await self._openai_proxy.stop()
+        finally:
+            relay, self._relay = self._relay, None
+            if relay is not None:
+                await relay.stop()
     def _bridge_url(self) -> str:
         return str(self.config.get("bridge_url") or "http://arena-bridge:8000").strip()
 
     def _transport_mode(self) -> str:
-        """``bridge`` keeps today's behaviour; ``direct`` drops the container."""
+        """``bridge`` keeps today's behaviour; the other two drop the container."""
         mode = str(self.config.get("transport_mode") or "bridge").strip().casefold()
-        return "direct" if mode == "direct" else "bridge"
+        return mode if mode in {"direct", "userscript"} else "bridge"
+
+    def _relay_server(self) -> RelayServer:
+        """The one relay this plugin owns; created on demand, started once."""
+        if self._relay is None:
+            self._relay = RelayServer(
+                host=str(self.config.get("relay_bind_host") or "0.0.0.0"),
+                port=_as_int(self.config.get("relay_port"), 6083, 1, 65535),
+                secret=str(self.config.get("relay_secret") or ""),
+                data_dir=self.data_dir,
+                public_url=str(self.config.get("relay_public_url") or ""),
+                max_browsers=_as_int(self.config.get("relay_max_browsers"), 4, 1, 16),
+                job_timeout=_as_float(
+                    self.config.get("relay_job_timeout"), 120.0, 15.0, 600.0
+                ),
+                allow_ips=tuple(
+                    str(item).strip()
+                    for item in (self.config.get("relay_allow_ips") or [])
+                    if str(item).strip()
+                ),
+                install_ttl=_as_float(
+                    self.config.get("relay_lease_seconds"), 1800.0, 300.0, 86400.0
+                ),
+                logger=logger,
+            )
+        return self._relay
+
+
+    def _relay_client(self) -> ArenaUserscriptClient:
+        return ArenaUserscriptClient(
+            self._relay_server(),
+            timeout=_as_float(self.config.get("request_timeout"), 300.0, 10.0, 1800.0),
+            rate_limit_retries=_as_int(self.config.get("rate_limit_retries"), 2, 0, 5),
+            rate_limit_max_wait=_as_float(self.config.get("rate_limit_max_wait"), 30.0, 1.0, 300.0),
+            allow_stealth_models=bool(self.config.get("allow_stealth_models", True)),
+            data_dir=self.data_dir,
+            acquire_wait=_as_float(self.config.get("relay_acquire_wait"), 20.0, 0.0, 300.0),
+        )
 
     def _client(self) -> ArenaBridgeClient | ArenaDirectClient:
         timeout = _as_float(self.config.get("request_timeout"), 300.0, 10.0, 1800.0)
         retries = _as_int(self.config.get("rate_limit_retries"), 2, 0, 5)
         max_wait = _as_float(self.config.get("rate_limit_max_wait"), 30.0, 1.0, 300.0)
+        if self._transport_mode() == "userscript":
+            return self._relay_client()
         if self._transport_mode() == "direct":
             return ArenaDirectClient(
                 str(self.config.get("browser_cdp_url") or "http://arena-browser:9223"),
@@ -370,9 +616,79 @@ class ArenaImagePlugin(Star):
         )
 
     @staticmethod
-    def _verification_hint(exc: Exception) -> str | None:
+    def _browser_hint(exc: Exception) -> str | None:
+        """Userscript-mode transport failures: nobody can fix these on the server.
+
+        The relay already words each one for the person holding the browser, so
+        the hint's job is to say who has to act and where to look next -- never to
+        echo the install link, which is private-chat only.
+        """
+        if not isinstance(exc, BridgeError):
+            return None
+        code = str(getattr(exc, "code", "") or "")
+        if not code.startswith("relay_"):
+            return None
+        message = _display_error(exc)
+        if code == "relay_public_url_missing":
+            # The raw message already names the key; sending the operator to
+            # /竞技场浏览器接入 would just fail the same way.
+            return f"{message}\n改完配置后重载插件，再私聊运行：/竞技场浏览器接入"
+        if code == "relay_no_browser":
+            return (
+                f"{message}\n"
+                "管理员私聊机器人运行 /竞技场浏览器接入 可以拿到安装链接和步骤。"
+            )
+        if code in {"relay_browser_paused", "relay_browser_offline", "relay_browser_lost"}:
+            return (
+                f"{message}\n"
+                "接入情况可运行：/竞技场浏览器状态"
+            )
+        if code == "relay_job_timeout":
+            return (
+                f"{message}\n"
+                "画图本身比较慢，超时多半是那台电脑睡了或者标签页被切走太久。\n"
+                "接入情况可运行：/竞技场浏览器状态"
+            )
+        if code in {"relay_bind_failed", "relay_not_running", "relay_stopped"}:
+            return (
+                f"{message}\n"
+                "这是服务器端的中转服务没起来，请管理员检查插件配置里的"
+                "「油猴中转监听端口」（relay_port）后重载插件。"
+            )
+        return f"{message}\n接入情况可运行：/竞技场浏览器状态"
+
+
+    @staticmethod
+    def _userscript_verification_hint(exc: BridgeError) -> str:
+        """Login trouble in userscript mode: the fix is in the visitor's browser.
+
+        The relay client already words the fix for whoever owns that browser, so
+        this keeps its message and only adds where to look next.  Telling anyone
+        to open a *server* browser here would simply be wrong.
+        """
+        message = _display_error(exc)
+        if exc.code == "arena_session_rejected":
+            return (
+                f"{message}\n"
+                "这基本都是 reCAPTCHA / Cloudflare 风控，不是登录失效。\n"
+                "请在接入的那台电脑上刷新一次 arena.ai，需要时手动过一次验证，然后重试。\n"
+                "接入情况可运行：/竞技场浏览器状态"
+            )
+        if exc.code == "arena_auth_stale":
+            return f"{message}\n接入情况可运行：/竞技场浏览器状态"
+        return (
+            f"{message}\n"
+            "这个模式下 Arena 登录在你自己的浏览器里，服务器上没有账号可以修。\n"
+            "登录好之后点一下脚本面板的「测试连通」，再运行：/竞技场浏览器状态"
+        )
+
+
+    @staticmethod
+    def _verification_hint(exc: Exception, *, mode: str = "") -> str | None:
         if not isinstance(exc, BridgeError) or not exc.requires_interactive_auth:
             return None
+        if mode == "userscript":
+            return ArenaImagePlugin._userscript_verification_hint(exc)
         text = str(exc).casefold()
         if exc.code == "arena_session_rejected":
             return (
@@ -424,19 +740,28 @@ class ArenaImagePlugin(Star):
         )
 
     @staticmethod
-    def _format_verification_status(payload: dict[str, Any]) -> str:
+    def _format_verification_status(payload: dict[str, Any], *, mode: str = "") -> str:
         status = str(payload.get("status") or "unknown")
         logged_in = bool(payload.get("has_logged_in"))
+        relay = mode == "userscript"
+        # Same verdict, different owner: in userscript mode the browser belongs to
+        # a person, so "服务器浏览器" would send them looking in the wrong place.
+        browser = "接入的浏览器" if relay else "服务器浏览器"
+        rebind = "/竞技场浏览器接入" if relay else "/竞技场重新绑定"
         if status == "verified" or bool(payload.get("verified")):
-            headline = "服务器浏览器已登录。此状态只确认登录，不代表每次画图都会通过上游验证。"
+            headline = f"{browser}已登录。此状态只确认登录，不代表每次画图都会通过上游验证。"
         elif payload.get("session_refreshable"):
             headline = "登录还在，只是访问令牌过期了。稍等一会儿或再发一次命令就会自动续期，不用重新登录。"
         elif payload.get("has_cf_clearance") and payload.get("has_arena_auth") and not logged_in:
-            headline = "CF 已通过，但仍是匿名会话。请在服务器浏览器里登录 Arena 账号后再查状态。"
+            headline = f"CF 已通过，但仍是匿名会话。请在{browser}里登录 Arena 账号后再查状态。"
         elif status in {"starting", "waiting"}:
-            headline = "服务器浏览器正在等待你完成 Arena 登录/CF 验证。"
+            headline = (
+                "正在等你装好油猴脚本并在自己的浏览器里登录 Arena。"
+                if relay
+                else f"{browser}正在等待你完成 Arena 登录/CF 验证。"
+            )
         elif status == "expired":
-            headline = "验证会话已过期，请重新运行 /竞技场验证。"
+            headline = f"验证会话已过期，请重新运行 {'/竞技场浏览器接入' if relay else '/竞技场验证'}。"
         else:
             headline = str(payload.get("message") or "验证状态未知。")
         details = [
@@ -458,6 +783,10 @@ class ArenaImagePlugin(Star):
                 details.append(f"会话来源：{source}")
             else:
                 details.append(f"会话来源：{source}（还有约 {minutes} 分钟）")
+            if source == "assumed":
+                # The userscript could not read the httpOnly cookie, so the verdict
+                # is "looks logged in" rather than proof.  Say so instead of lying.
+                details.append("说明：脚本读不到会话 Cookie，登录状态是乐观推断的。")
         action = str(payload.get("recaptcha_action") or "").strip()
         if action:
             note = ""
@@ -465,7 +794,7 @@ class ArenaImagePlugin(Star):
                 note = "（异常：已登录时应为 chat_submit，请更新 Bridge）"
             details.append(f"reCAPTCHA 动作：{action}{note}")
         if not logged_in and status in {"waiting", "expired", "starting"}:
-            details.append("重新获取链接：/竞技场重新绑定（需私聊）")
+            details.append(f"重新获取链接：{rebind}（需私聊）")
         return "\n".join(details)
 
     def _session_key(self, event: AstrMessageEvent) -> str:
@@ -1280,17 +1609,26 @@ class ArenaImagePlugin(Star):
         payload: dict[str, Any],
         *,
         reveal_url: bool = False,
+        mode: str = "",
     ) -> str:
-        message = ArenaImagePlugin._format_verification_status(payload)
+        message = ArenaImagePlugin._format_verification_status(payload, mode=mode)
+        relay = mode == "userscript"
         status = str(payload.get("status") or "")
         browser_url = str(payload.get("browser_url") or "").strip()
+        enter = "/竞技场浏览器接入" if relay else "/竞技场验证"
+        again = "/竞技场浏览器接入" if relay else "/竞技场重新绑定"
         if status in {"starting", "waiting"} and browser_url:
             if reveal_url:
-                message += f"\n服务器浏览器链接：\n{browser_url}"
+                label = "油猴脚本安装链接" if relay else "服务器浏览器链接"
+                message += f"\n{label}：\n{browser_url}"
             else:
-                message += "\n验证链接只在私聊发放，请私聊机器人运行：/竞技场验证"
+                message += f"\n验证链接只在私聊发放，请私聊机器人运行：{enter}"
         elif status == "verified":
-            message += "\n如需重新绑定 Cookie，请私聊运行：/竞技场重新绑定"
+            message += (
+                "\n换一台电脑接入请私聊运行：/竞技场浏览器接入"
+                if relay
+                else f"\n如需重新绑定 Cookie，请私聊运行：{again}"
+            )
         return message
 
     # The browser link hands out control of a server-side browser that holds the
@@ -1306,6 +1644,10 @@ class ArenaImagePlugin(Star):
         """Open the visible server browser for a manual Arena/CF challenge."""
         if not self._is_private_chat(event):
             yield event.plain_result(self._GROUP_LINK_REFUSAL)
+            return
+        if self._transport_mode() == "userscript":
+            async for result in self.relay_enroll(event):
+                yield result
             return
         try:
             self._interactive_auth_session_id = ""
@@ -1331,6 +1673,10 @@ class ArenaImagePlugin(Star):
         if not self._is_private_chat(event):
             yield event.plain_result(self._GROUP_LINK_REFUSAL)
             return
+        if self._transport_mode() == "userscript":
+            async for result in self.relay_enroll(event):
+                yield result
+            return
         try:
             self._interactive_auth_session_id = ""
             payload = await self._client().start_interactive_auth()
@@ -1352,6 +1698,7 @@ class ArenaImagePlugin(Star):
     @filter.command("竞技场验证状态", alias={"arena验证状态"})
     async def interactive_verify_status(self, event: AstrMessageEvent):
         """Check and persist the current server-browser verification session."""
+        mode = self._transport_mode()
         try:
             if self._interactive_auth_session_id:
                 payload = await self._client().interactive_auth_status(
@@ -1366,29 +1713,144 @@ class ArenaImagePlugin(Star):
                 self._interactive_auth_message(
                     payload,
                     reveal_url=self._is_private_chat(event),
+                    mode=mode,
                 )
             )
         except Exception as exc:
-            yield event.plain_result(
-                f"读取验证状态失败：{_display_error(exc)}\n"
-                "需要验证时私聊运行：/竞技场验证；Cookie 失效时私聊运行：/竞技场重新绑定"
+            tail = (
+                "需要接入时私聊运行：/竞技场浏览器接入；接入情况用：/竞技场浏览器状态"
+                if mode == "userscript"
+                else "需要验证时私聊运行：/竞技场验证；Cookie 失效时私聊运行：/竞技场重新绑定"
             )
+            yield event.plain_result(f"读取验证状态失败：{_display_error(exc)}\n{tail}")
+
+    _USERSCRIPT_STEPS = (
+        "1. 在自己的电脑上装 Tampermonkey（油猴）扩展\n"
+        "2. 打开下面的链接，油猴会弹出安装页，点「安装」\n"
+        "3. 在自己的浏览器打开 https://arena.ai 并登录账号（Google 或邮箱），匿名会话无法出图\n"
+        "4. 页面右下角出现「Arena 中转」小面板，点「测试连通」看到「已接入」"
+    )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("竞技场浏览器接入", alias={"arena浏览器接入", "竞技场油猴"})
+    async def relay_enroll(self, event: AstrMessageEvent):
+        """Hand out the signed one-click Tampermonkey install link (private only).
+
+        The link embeds a short-lived token that unlocks the shared secret, so it
+        is exactly as sensitive as the server-browser link and follows the same
+        private-chat-only rule.
+        """
+        if not self._is_private_chat(event):
+            yield event.plain_result(self._GROUP_LINK_REFUSAL)
+            return
+        if self._transport_mode() != "userscript":
+            yield event.plain_result(
+                "当前传输模式不是油猴脚本模式。\n"
+                "请先在插件配置里把「传输模式」（transport_mode）改成 userscript 并重载插件。"
+            )
+            return
+        relay = self._relay_server()
+        if not relay.running:
+            try:
+                await relay.start()
+            except Exception as exc:
+                yield event.plain_result(
+                    self._browser_hint(exc) or f"启动油猴中转失败：{_display_error(exc)}"
+                )
+                return
+        link = relay.install_url()
+        if not link:
+            yield event.plain_result(
+                "拿不到安装链接：插件不知道自己对外的地址。\n"
+                "请在插件配置里填「油猴中转对外地址」（relay_public_url），"
+                f"例如 http://服务器IP:{relay.port}，然后重载插件。"
+            )
+            return
+        minutes = max(1, int(relay.install_ttl // 60))
+        yield event.plain_result(
+            "油猴脚本接入步骤：\n"
+            f"{self._USERSCRIPT_STEPS}\n"
+            f"{link}\n"
+            f"（链接内含临时口令，{minutes} 分钟内有效，请勿转发到群里）\n"
+            "接入后用 /竞技场浏览器状态 查看，然后直接 /jjc 出图。"
+        )
+
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("竞技场浏览器状态", alias={"arena浏览器状态"})
+    async def relay_status(self, event: AstrMessageEvent):
+        """Show every attached browser, plus the relay's own listening state."""
+        if self._transport_mode() != "userscript":
+            yield event.plain_result(
+                "当前传输模式不是油猴脚本模式，没有接入的浏览器。\n"
+                "服务器浏览器的状态请用：/竞技场验证状态"
+            )
+            return
+        status = self._relay_server().status()
+        lines = [
+            f"中转服务：{'运行中' if status['running'] else '未运行'}"
+            + (f"（监听失败：{status['bind_error']}）" if status["bind_error"] else ""),
+            f"监听地址：{status['listen']}{status['prefix']}",
+            f"对外地址：{status['public_url'] or '未配置（无法发安装链接）'}",
+            f"口令指纹：{status['secret_fingerprint']}",
+            f"接入浏览器：{status['browser_count']} 个"
+            f"（在线 {status['online']}，可接单 {status['ready']}，已登录 {status['verified']}）",
+        ]
+        if status["running"]:
+            lines.append(f"已运行：{status['uptime']} 秒")
+        for row in status["browsers"]:
+            flags = [
+                "在线" if row["online"] else f"离线 {int(row['idle_for'])} 秒",
+                "已登录" if row["verified"] else "未登录",
+            ]
+            if row["paused"]:
+                flags.append("已暂停")
+            lines.append(
+                f"· {row['label'] or row['id']}｜{'，'.join(flags)}｜"
+                f"排队 {row['queued']}，进行中 {row['inflight']}，"
+                f"完成 {row['jobs_done']}，失败 {row['jobs_failed']}"
+            )
+        if not status["browsers"]:
+            lines.append("还没有浏览器接入，私聊运行 /竞技场浏览器接入 拿安装链接。")
+        for entry in status["log"][-5:]:
+            when = time.strftime("%H:%M:%S", time.localtime(entry.get("at", 0)))
+            lines.append(f"[{when}] {entry.get('kind', '')} {entry.get('message', '')}".rstrip())
+        yield event.plain_result("\n".join(lines))
+
 
     @filter.command("竞技场状态", alias={"arena状态"})
     async def status(self, event: AstrMessageEvent):
+        mode = self._transport_mode()
+        label = {
+            "userscript": "油猴中转",
+            "direct": "服务器浏览器",
+        }.get(mode, "Bridge")
         try:
             health = await self._client().health()
             models = await self._fetch_models()
             current, _ = await self._resolve_model(event)
             state = health.get("status", "unknown")
-            yield event.plain_result(
-                f"Bridge：{state}\n"
-                f"模型数：{len(models)}\n"
-                f"当前模型：{self._model_id(current)}\n"
-                f"数据目录：{self.data_dir}"
-            )
+            lines = [
+                f"{label}：{state}",
+                f"模型数：{len(models)}",
+                f"当前模型：{self._model_id(current)}",
+                f"数据目录：{self.data_dir}",
+            ]
+            if mode == "userscript":
+                relay = health.get("relay") or {}
+                lines.insert(
+                    1,
+                    f"接入浏览器：{relay.get('ready', 0)}/{relay.get('browser_count', 0)} 可接单"
+                    "（详情：/竞技场浏览器状态）",
+                )
+            message = str(health.get("message") or "").strip()
+            if message and state != "healthy":
+                lines.append(message)
+            yield event.plain_result("\n".join(lines))
         except Exception as exc:
-            yield event.plain_result(f"Bridge 状态读取失败：{_display_error(exc)}")
+            yield event.plain_result(
+                self._browser_hint(exc) or f"{label} 状态读取失败：{_display_error(exc)}"
+            )
 
     async def _collect_input_images(self, event: AstrMessageEvent) -> list[str]:
         """Convert current and quoted AstrBot Image components to data URIs."""
@@ -1621,7 +2083,8 @@ class ArenaImagePlugin(Star):
                         )
                 except Exception as exc:
                     logger.exception("[arena_image] 生成失败")
-                    hint = self._rate_limit_hint(exc) or self._verification_hint(exc)
+                    hint = (self._rate_limit_hint(exc) or self._browser_hint(exc)
+                            or self._verification_hint(exc, mode=self._transport_mode()))
                     if hint:
                         yield event.plain_result(hint)
                     else:
@@ -1868,7 +2331,8 @@ class ArenaImagePlugin(Star):
         keep = _as_int(self.config.get("max_saved_outputs"), 32, 4, 500)
         try:
             files = sorted(
-                (path for path in self.output_dir.iterdir() if path.is_file()),
+                (path for path in self.output_dir.iterdir()
+                 if path.is_file() and path not in self._battle_pending_outputs),
                 key=lambda path: path.stat().st_mtime,
                 reverse=True,
             )

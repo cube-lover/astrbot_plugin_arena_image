@@ -18,6 +18,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
+# Install current vendor stable Chrome from the signed Google repository.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg locales fonts-liberation fonts-noto-color-emoji \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl --fail --silent --show-error --location --max-time 60 \
+        https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+    && echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
+        > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && sed -i '/^# zh_CN.UTF-8 UTF-8/s/^# //' /etc/locale.gen \
+    && sed -i '/^# en_US.UTF-8 UTF-8/s/^# //' /etc/locale.gen \
+    && locale-gen \
+    && google-chrome-stable --version \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_BIN=/usr/bin/google-chrome-stable \
+    LANG=zh_CN.UTF-8 \
+    LC_ALL=zh_CN.UTF-8
+
 RUN mkdir -p /app
 COPY arena-browser-entrypoint.sh /usr/local/bin/arena-browser-entrypoint.sh
 COPY novnc_gateway.py /app/novnc_gateway.py

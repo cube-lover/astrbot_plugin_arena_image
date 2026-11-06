@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export DISPLAY=:99
+export LANG="${LANG:-zh_CN.UTF-8}"
+export LC_ALL="${LC_ALL:-zh_CN.UTF-8}"
 STATE_DIR=/data/browser
 PROFILE="$STATE_DIR/chrome-profile"
 mkdir -p "$PROFILE"
@@ -20,7 +22,13 @@ x11vnc -storepasswd "${NOVNC_PASSWORD}" "$STATE_DIR/vnc.pass" >/dev/null
 x11vnc -display "$DISPLAY" -forever -shared -rfbauth "$STATE_DIR/vnc.pass" -rfbport 5900 -localhost -noxdamage >/tmp/arena-x11vnc.log 2>&1 &
 websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/arena-novnc.log 2>&1 &
 python3 /app/novnc_gateway.py >/tmp/arena-auth-gateway.log 2>&1 &
-CHROME="$(find "${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}" /root/.cache/ms-playwright -type f \( -path "*/chrome-linux64/chrome" -o -path "*/chrome-linux/chrome" \) -print -quit 2>/dev/null)"
+CHROME="${CHROME_BIN:-}"
+if [ -z "$CHROME" ]; then
+  CHROME="$(command -v google-chrome-stable || command -v google-chrome || true)"
+fi
+if [ -z "$CHROME" ]; then
+  CHROME="$(find "${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}" /root/.cache/ms-playwright -type f \( -path "*/chrome-linux64/chrome" -o -path "*/chrome-linux/chrome" \) -print -quit 2>/dev/null || true)"
+fi
 if [ -z "$CHROME" ]; then
   echo "chromium executable not found" >&2
   exit 1
@@ -50,7 +58,7 @@ if [ -n "$PROXY_URL" ]; then
     --proxy-server="$CHROME_PROXY_URL"
     --proxy-bypass-list="localhost;127.0.0.1;arena-browser;arena-bridge;172.16.0.0/12;192.168.0.0/16;10.0.0.0/8"
   )
-  echo "arena browser proxy enabled" >&2
+  echo "arena browser proxy configured" >&2
 fi
 run_chrome() {
   while true; do
@@ -59,19 +67,15 @@ run_chrome() {
       --no-sandbox \
       --no-first-run \
       --no-default-browser-check \
-      --disable-dev-shm-usage \
-      --disable-background-networking \
-      --disable-quic \
-      --disable-blink-features=AutomationControlled \
-      --disable-features=AutomationControlled \
       --lang=zh-CN \
-      --remote-allow-origins=* \
+      --remote-allow-origins=http://127.0.0.1:9222,http://localhost:9222 \
       --remote-debugging-port=9222 \
-      --remote-debugging-address=0.0.0.0 \
+      --remote-debugging-address=127.0.0.1 \
       --user-data-dir="$PROFILE" \
       "${proxy_args[@]}" \
       --window-position=0,0 \
       --window-size=1280,900 \
+      --restore-last-session \
       "https://arena.ai/?mode=direct" \
       >>/tmp/arena-chromium.log 2>&1 || true
     echo "arena browser exited; restarting" >>/tmp/arena-browser-watch.log

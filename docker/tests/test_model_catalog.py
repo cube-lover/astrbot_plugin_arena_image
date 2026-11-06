@@ -258,8 +258,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.old_models, self.old_time = direct._MODELS, direct._MODELS_AT
-        direct._MODELS, direct._MODELS_AT = [], 0
+        self.old_scopes = dict(direct._SCOPES)
+        direct._SCOPES.clear()
         self.client = direct.ArenaDirectClient("http://test-integration.invalid")
         self.client._history_catalog = catalog.HistoryModelCatalog()
         self.client._history_catalog.models[uid(1)] = catalog.historical_image_model(model())
@@ -268,7 +268,8 @@ class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.page = types.SimpleNamespace(model_table=AsyncMock(return_value=self.public))
 
     async def asyncTearDown(self):
-        direct._MODELS, direct._MODELS_AT = self.old_models, self.old_time
+        direct._SCOPES.clear()
+        direct._SCOPES.update(self.old_scopes)
 
     async def test_recovered_model_is_resolved_to_original_uuid(self):
         row, variants = await self.client._resolve(self.page, "luna-lisa-alpha")
@@ -284,7 +285,7 @@ class DirectIntegrationTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.client._models(self.page)
         self.assertEqual(self.page.model_table.await_count, 1)
         self.assertIn(uid(1), {m["id"] for m in rows})
-        self.assertNotIn(uid(1), {m["id"] for m in direct._MODELS})
+        self.assertNotIn(uid(1), {m["id"] for m in direct.cache_scope(self.page)["models"]})
 
     async def test_generation_resolution_does_not_scan_history(self):
         self.client._history_catalog.recover = AsyncMock()

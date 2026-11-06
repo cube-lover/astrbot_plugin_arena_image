@@ -1,8 +1,8 @@
 {
   "transport_mode": {
     "type": "string",
-    "description": "通道模式：bridge = 走 arena-bridge 容器（默认，和以前完全一样）；direct = 插件直连 arena-browser，不需要 bridge 容器",
-    "options": ["bridge", "direct"],
+    "description": "通道模式：bridge = 走 arena-bridge 容器（默认，和以前完全一样）；direct = 插件直连 arena-browser，不需要 bridge 容器；userscript = 不用服务器浏览器，改由自己电脑上的油猴脚本接入（装完脚本请私聊运行 /竞技场浏览器接入）",
+    "options": ["bridge", "direct", "userscript"],
     "default": "bridge"
   },
   "bridge_url": {
@@ -168,5 +168,66 @@
       "动漫=anime key visual, clean cel shading, vibrant colors, expressive eyes, detailed background, {}",
       "手办=1/7 scale figure, PVC statue on round base, studio product photo, glossy finish, {}"
     ]
+  },
+  "relay_bind_host": {
+    "type": "string",
+    "description": "油猴中转监听网卡（仅 userscript 模式使用）：0.0.0.0 = 所有网卡；只在本机测试可填 127.0.0.1",
+    "default": "0.0.0.0"
+  },
+  "relay_port": {
+    "type": "int",
+    "description": "油猴中转监听端口（仅 userscript 模式使用）：被占用就换一个，同时记得改防火墙和下面的对外地址",
+    "default": 6083
+  },
+  "relay_public_url": {
+    "type": "string",
+    "description": "油猴中转对外地址（仅 userscript 模式使用）：浏览器要能访问到的地址，例如 http://服务器IP:6083 或 https://arena.example.com；留空就发不出安装链接",
+    "default": ""
+  },
+  "relay_secret": {
+    "type": "string",
+    "description": "油猴中转共享口令（留空即可）：留空时插件会自动生成并存到数据目录，安装链接里带一次性口令；换了这个值所有已装脚本都要重装",
+    "secret": true,
+    "default": ""
+  },
+  "relay_lease_seconds": {
+    "type": "int",
+    "description": "安装链接有效期（秒，仅 userscript 模式使用）：过期就再私聊运行一次 /竞技场浏览器接入",
+    "default": 1800
+  },
+  "relay_job_timeout": {
+    "type": "int",
+    "description": "单条浏览器指令的超时（秒，仅 userscript 模式使用）：画图本身走的是这个上限，电脑容易休眠可以调大",
+    "default": 120
+  },
+  "relay_acquire_wait": {
+    "type": "int",
+    "description": "等待空闲浏览器的时间（秒，仅 userscript 模式使用）：所有接入的浏览器都在忙时最多排队这么久",
+    "default": 20
+  },
+  "relay_max_browsers": {
+    "type": "int",
+    "description": "最多允许几个浏览器同时接入（仅 userscript 模式使用）：多台会轮流接单，分摊 Arena 的限流",
+    "default": 4
+  },
+  "relay_allow_ips": {
+    "type": "list",
+    "description": "油猴中转来源 IP 白名单（仅 userscript 模式使用）：留空 = 不限制（仍然要通过签名校验）；填了就只接受这些 IP 的浏览器",
+    "default": []
+  },
+  "battle_enabled": {
+    "type": "bool",
+    "description": "开启官网匿名双模型 Battle（battle 提示词）；bridge 模式复用 arena-browser 的 CDP，单模型通道不变",
+    "default": true
+  },
+  "battle_allow_reveal_without_vote": {
+    "type": "bool",
+    "description": "随机投票揭晓开关。默认关闭；开启后，未投票且两路完整呈现的对战使用 /battle不投票 或 /battle揭晓 会提交随机 A/B 偏好票并揭晓，不是免投票。失败或超时重试保留原选择，已确认投票不再提交；失败场次禁止随机票，揭晓后不能再投票",
+    "default": false
+  },
+  "battle_session_ttl": {
+    "type": "int",
+    "description": "Battle 会话保存及操作有效期（秒），按聊天与发起人隔离，默认 24 小时",
+    "default": 86400
   }
 }

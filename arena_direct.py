@@ -1655,7 +1655,8 @@ class ArenaPage:
 @contextlib.asynccontextmanager
 async def open_page(cdp_url: str, *, timeout: float = 30.0, browser_url: str = ""):
     """Attach to the signed-in Arena tab: getTargets → attachToTarget(flatten)."""
-    async with CDPWebSocket(cdp_url, timeout=timeout) as cdp:
+    from .video_runtime import browser_lock
+    async with browser_lock(cdp_url), CDPWebSocket(cdp_url, timeout=timeout) as cdp:
         try:
             targets = await cdp.command("Target.getTargets", timeout=30.0)
         except CDPError as exc:

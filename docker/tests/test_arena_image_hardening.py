@@ -184,6 +184,29 @@ class _StubImage:
         return self._base64
 
 
+class _StubVideo:
+    """Minimal native Video factories/serialization; never reads media bytes."""
+
+    def __init__(self, file: str = "") -> None:
+        self.file = file
+
+    @classmethod
+    def fromFileSystem(cls, path: str):  # noqa: N802 - mirrors AstrBot's API
+        # Video serialization preserves a local URI, unlike inline images.
+        return cls(file=Path(path).resolve().as_uri())
+
+    @classmethod
+    def fromBase64(cls, value: str):  # noqa: N802 - mirrors AstrBot's API
+        return cls(file="base64://" + value)
+
+    @classmethod
+    def fromURL(cls, url: str):  # noqa: N802 - mirrors AstrBot's API
+        return cls(file=url)
+
+    def to_dict(self) -> dict:
+        return {"type": "video", "data": {"file": self.file}}
+
+
 class _StubPlain:
     """Minimal Plain component: keeps the caption text."""
 
@@ -217,6 +240,7 @@ def _install_astrbot_stubs() -> None:
     components.At = type("At", (), {})
     components.Reply = type("Reply", (), {"__init__": lambda self, **kw: vars(self).update(kw)})
     components.Image = _StubImage
+    components.Video = _StubVideo
     components.Plain = _StubPlain
     star_mod = types.ModuleType("astrbot.api.star")
     star_mod.Context = type("Context", (), {})
@@ -323,6 +347,31 @@ def _noisy_png(size: int = 900) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+class VideoStubTests(unittest.TestCase):
+    def test_native_factories_and_serialization(self):
+        _install_astrbot_stubs()
+        components = importlib.import_module("astrbot.api.message_components")
+        self.assertIs(components.Video, _StubVideo)
+        path = Path(PLUGIN_ROOT / "offline-video.mp4")
+        for component, expected in (
+            (components.Video.fromFileSystem(str(path)), path.resolve().as_uri()),
+            (components.Video.fromBase64("Zml4dHVyZQ=="), "base64://Zml4dHVyZQ=="),
+            (components.Video.fromURL("https://media.invalid/fixture.mp4"),
+             "https://media.invalid/fixture.mp4"),
+        ):
+            self.assertEqual(component.file, expected)
+            self.assertEqual(component.to_dict(), {"type": "video", "data": {"file": expected}})
+
+    def test_repeat_install_does_not_overwrite_another_surface(self):
+        _install_astrbot_stubs()
+        components = importlib.import_module("astrbot.api.message_components")
+        alternate = type("AlternateVideo", (), {})
+        with patch.object(components, "Video", alternate):
+            _install_astrbot_stubs()
+            self.assertIs(components.Video, alternate)
+        self.assertIs(components.Video, _StubVideo)
 
 
 class ForeignNetworkHintTest(unittest.TestCase):

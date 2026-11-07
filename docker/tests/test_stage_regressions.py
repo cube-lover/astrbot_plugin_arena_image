@@ -8,19 +8,62 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from .test_arena_image_hardening import _make_plugin, _plugin_module
 from .test_battle_commands import (
-    ACK, Client, Event, Host, battle_module, collect, image_components, text,
+    ACK, Client, Event, Host as ImageHost, battle_module, collect, image_components, text,
 )
 from .test_arena_direct_transport import FakePage, _image_model, _filler_models
 from astrbot_plugin_arena_image import arena_direct, arena_relay, battle_reply, bridge_client, model_catalog, qq_delivery
 
 STAGE = Path(__file__).resolve().parents[2]
 PRESERVATION_FIXTURE = Path(__file__).with_name("fixtures") / "arena-preservation.json"
+
+
+class Host(ImageHost):
+    """Stage-local adapter for the real wrapper's cross-store arbitration hooks.
+
+    Do not patch the shared ImageHost: other modules test the mixin in isolation.
+    Bind production methods, not an always-false collision predicate, including
+    the lazy controller needed to load persisted video receipts on first quote.
+    """
+
+    def __init__(self, directory, config=None, client=None):
+        super().__init__(directory, config, client)
+        plugin = _plugin_module().ArenaImagePlugin
+        for name in ("_ambiguous_battle_quote", "_video_controller"):
+            setattr(self, name, getattr(plugin, name).__get__(self, type(self)))
+
+
+@asynccontextmanager
+async def _tracked_task(coro):
+    """Cancel and retrieve the child even when a barrier/assertion fails."""
+    task = asyncio.create_task(coro)
+    try:
+        yield task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+
+async def _wait_for_barrier(event, child, *, timeout=5):
+    """Race the signal against child completion; expose the original exception."""
+    async with _tracked_task(event.wait()) as signal:
+        done, _ = await asyncio.wait(
+            {signal, child}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if child in done:
+            child.result()  # Never turn an early child exception into a timeout.
+            if signal not in done and not event.is_set():
+                raise AssertionError("child completed before signalling the barrier")
+        if signal not in done and not event.is_set():
+            raise TimeoutError(f"async barrier was not signalled within {timeout}s")
+        await signal
 
 
 def _preservation_fixture():
@@ -82,6 +125,47 @@ def _assert_online_readme_prefix(testcase, readme):
     testcase.assertGreaterEqual(len(readme), length, "online README prefix truncated")
     testcase.assertEqual(hashlib.sha256(readme[:length]).hexdigest(), expected["sha256"],
                          "online README prefix changed")
+
+class BarrierGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_child_exception_is_propagated_before_timeout(self):
+        event = asyncio.Event()
+        failure = RuntimeError("fixture failed before signalling")
+
+        async def fail():
+            raise failure
+
+        async with _tracked_task(fail()) as child:
+            with self.assertRaises(RuntimeError) as raised:
+                await _wait_for_barrier(event, child, timeout=1)
+            self.assertIs(raised.exception, failure)
+        self.assertTrue(child.done())
+
+    async def test_successful_child_without_signal_is_not_a_timeout(self):
+        async def finish():
+            return None
+
+        async with _tracked_task(finish()) as child:
+            with self.assertRaisesRegex(AssertionError, "before signalling"):
+                await _wait_for_barrier(asyncio.Event(), child, timeout=1)
+
+    async def test_successful_child_with_signal_is_accepted(self):
+        event = asyncio.Event()
+
+        async def finish():
+            event.set()
+
+        async with _tracked_task(finish()) as child:
+            await _wait_for_barrier(event, child, timeout=1)
+        self.assertTrue(child.done())
+
+    async def test_timeout_cleans_pending_child_and_signal(self):
+        before = asyncio.all_tasks()
+        async with _tracked_task(asyncio.Event().wait()) as child:
+            with self.assertRaisesRegex(TimeoutError, "not signalled"):
+                await _wait_for_barrier(asyncio.Event(), child, timeout=0.02)
+        self.assertTrue(child.cancelled())
+        self.assertEqual(asyncio.all_tasks(), before)
+
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -460,7 +544,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.host._deliver_battle_message = deliver
         first = asyncio.create_task(collect(self.host.battle(self.event, 'first')))
         try:
-            await asyncio.wait_for(started.wait(), timeout=5)
+            await _wait_for_barrier(started, first)
             self.assertEqual(len(self.calls), 1)
             self.assert_group(self.calls[0][1])
             async with self.host._generation_lock:
@@ -480,7 +564,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             if not first.done():
                 first.cancel()
                 try:
-                    await first
+                    await asyncio.wait_for(first, timeout=5)
                 except asyncio.CancelledError:
                     pass
 
@@ -498,14 +582,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         battle = asyncio.create_task(collect(self.host.battle(self.event, 'prompt')))
         vote = None
         try:
-            await asyncio.wait_for(started.wait(), timeout=5)
+            await _wait_for_barrier(started, battle)
             guard = self.host._battle_guard
             def signal_guard(code):
                 vote_waiting.set()
                 return guard(code)
             with patch.object(self.host, '_battle_guard', side_effect=signal_guard):
                 vote = asyncio.create_task(collect(self.host.battle_vote(self.event, 'A')))
-                await asyncio.wait_for(vote_waiting.wait(), timeout=5)
+                await _wait_for_barrier(vote_waiting, vote)
                 self.assertFalse(vote.done())
                 self.assertFalse([x for x in self.host.client.calls if x[0] in {'vote', 'reveal'}])
                 self.assertIsNone(self.on_disk()['vote'])
@@ -525,7 +609,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 if task is not None and not task.done():
                     task.cancel()
                     try:
-                        await task
+                        await asyncio.wait_for(task, timeout=5)
                     except asyncio.CancelledError:
                         pass
 
@@ -1064,6 +1148,34 @@ class RandomRevealTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.disk(code)["random_choice"], side)
         self.assertEqual(self.disk(code)["vote"], side)
 
+    async def test_real_host_helpers_reject_cross_store_quote_without_voting(self):
+        from .test_battle_reply import QuoteEvent
+
+        plugin = _plugin_module().ArenaImagePlugin
+        for name in ("_ambiguous_battle_quote", "_video_controller"):
+            self.assertIs(getattr(self.host, name).__func__, getattr(plugin, name))
+        self.assertNotIn("_video_battles", vars(self.host))
+        self.assertFalse(self.host._ambiguous_battle_quote(self.event))
+        self.assertNotIn("_video_battles", vars(self.host))
+        code, _ = await self.begin()
+        entry = self.host._battle_sessions[code]
+        entry["platform_message_id"] = "123"
+        self.host._battle_save()
+        controller = self.host._video_controller()
+        self.assertIs(self.host._video_controller(), controller)
+        self.assertEqual(controller.data_dir, self.host.data_dir / "video_battles")
+        controller._battle_sessions["ABCDEF"] = entry.copy()
+        quote = QuoteEvent("不投票", "123")
+        self.assertTrue(self.host._ambiguous_battle_quote(quote))
+        with patch.object(battle_module.secrets, "choice") as choose:
+            result = await self.optout(event=quote)
+        choose.assert_not_called()
+        self.assertIn("未提交投票", text(result))
+        self.assertFalse(self.calls("vote"))
+        self.assertFalse(self.calls("reveal"))
+        controller._battle_sessions["ABCDEF"]["chat"] = "other-room"
+        self.assertFalse(self.host._ambiguous_battle_quote(quote))
+
     async def test_random_a_saved_before_network_and_vote_mark_before_names(self):
         await self.assert_random_choice("a")
 
@@ -1152,11 +1264,11 @@ class RandomRevealTests(unittest.IsolatedAsyncioTestCase):
         code, _ = await self.begin()
         self.host.client.vote_gate = asyncio.Event()
         with patch.object(battle_module.secrets, "choice", return_value="b"):
-            task = asyncio.create_task(self.optout(code))
-            await self.host.client.vote_started.wait()
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            async with _tracked_task(self.optout(code)) as task:
+                await _wait_for_barrier(self.host.client.vote_started, task)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
         self.assertEqual(self.disk(code)["random_choice"], "b")
         self.assertEqual(self.disk(code)["vote"], "")
         self.assertFalse(self.host._battle_busy)
@@ -1173,11 +1285,11 @@ class RandomRevealTests(unittest.IsolatedAsyncioTestCase):
         code, _ = await self.begin()
         self.host.client.vote_gate = asyncio.Event()
         with patch.object(battle_module.secrets, "choice", return_value="a") as choose:
-            first = asyncio.create_task(self.optout(code))
-            await self.host.client.vote_started.wait()
-            second = asyncio.create_task(self.optout(code))
-            self.host.client.vote_gate.set()
-            results = await asyncio.gather(first, second)
+            async with _tracked_task(self.optout(code)) as first:
+                await _wait_for_barrier(self.host.client.vote_started, first)
+                async with _tracked_task(self.optout(code)) as second:
+                    self.host.client.vote_gate.set()
+                    results = await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
         choose.assert_called_once()
         self.assertTrue(all("已随机投票 A" in text(result) for result in results))
         self.assertEqual(len(self.calls("vote")), 1)
@@ -1202,16 +1314,16 @@ class RandomRevealTests(unittest.IsolatedAsyncioTestCase):
             return guard(requested)
 
         with patch.object(battle_module.secrets, "choice", return_value="a"):
-            random_vote = asyncio.create_task(self.optout(code))
-            await self.host.client.vote_started.wait()
-            with patch.object(self.host, "_battle_guard", side_effect=signal_guard):
-                manual = asyncio.create_task(collect(self.host.battle_vote(self.event, "B " + code)))
-                await manual_waiting.wait()
-                self.assertFalse(manual.done())
-                self.assertEqual(len(self.calls("vote")), 1)
-                self.host.client.vote_gate.set()
-                await random_vote
-                rejected = await manual
+            async with _tracked_task(self.optout(code)) as random_vote:
+                await _wait_for_barrier(self.host.client.vote_started, random_vote)
+                with patch.object(self.host, "_battle_guard", side_effect=signal_guard):
+                    async with _tracked_task(collect(self.host.battle_vote(self.event, "B " + code))) as manual:
+                        await _wait_for_barrier(manual_waiting, manual)
+                        self.assertFalse(manual.done())
+                        self.assertEqual(len(self.calls("vote")), 1)
+                        self.host.client.vote_gate.set()
+                        await asyncio.wait_for(random_vote, timeout=5)
+                        rejected = await asyncio.wait_for(manual, timeout=5)
         self.assertIn("继续 /battle不投票", text(rejected))
         self.assertEqual(len(self.calls("vote")), 1)
         self.assertEqual(self.disk(code)["random_choice"], "a")
@@ -1220,12 +1332,12 @@ class RandomRevealTests(unittest.IsolatedAsyncioTestCase):
     async def test_random_waits_for_manual_vote_then_only_reads_names(self):
         code, _ = await self.begin()
         self.host.client.vote_gate = asyncio.Event()
-        manual = asyncio.create_task(collect(self.host.battle_vote(self.event, "B " + code)))
-        await self.host.client.vote_started.wait()
-        with patch.object(battle_module.secrets, "choice") as choose:
-            random_vote = asyncio.create_task(self.optout(code))
-            self.host.client.vote_gate.set()
-            _, revealed = await asyncio.gather(manual, random_vote)
+        async with _tracked_task(collect(self.host.battle_vote(self.event, "B " + code))) as manual:
+            await _wait_for_barrier(self.host.client.vote_started, manual)
+            with patch.object(battle_module.secrets, "choice") as choose:
+                async with _tracked_task(self.optout(code)) as random_vote:
+                    self.host.client.vote_gate.set()
+                    _, revealed = await asyncio.wait_for(asyncio.gather(manual, random_vote), timeout=5)
         choose.assert_not_called()
         self.assertNotIn("已随机投票", text(revealed))
         self.assertEqual(len(self.calls("vote")), 1)
@@ -1552,16 +1664,16 @@ class RandomRevealTests(unittest.IsolatedAsyncioTestCase):
             code, _ = await self.begin()
             self.host.client.vote_gate = asyncio.Event()
             with patch.object(battle_module.secrets, "choice", return_value="a"):
-                task = asyncio.create_task(self.optout(code))
-                await self.host.client.vote_started.wait()
-                with patch.object(battle_module.time, "time", return_value=1010):
-                    self.host._battle_trim()
-                    self.assertIn(code, self.host._battle_sessions)
-                    self.assertEqual(self.disk(code)["random_choice"], "a")
-                blocked = await collect(self.host.battle(Event("bob"), "another comparison"))
-                self.assertIn("会话已满", text(blocked))
-                self.host.client.vote_gate.set()
-                result = await task
+                async with _tracked_task(self.optout(code)) as task:
+                    await _wait_for_barrier(self.host.client.vote_started, task)
+                    with patch.object(battle_module.time, "time", return_value=1010):
+                        self.host._battle_trim()
+                        self.assertIn(code, self.host._battle_sessions)
+                        self.assertEqual(self.disk(code)["random_choice"], "a")
+                    blocked = await collect(self.host.battle(Event("bob"), "another comparison"))
+                    self.assertIn("会话已满", text(blocked))
+                    self.host.client.vote_gate.set()
+                    result = await asyncio.wait_for(task, timeout=5)
             self.assertIn("已随机投票 A", text(result))
             self.assertEqual(len(self.calls("vote")), 1)
             self.assertFalse(self.host._battle_busy)
@@ -1637,29 +1749,29 @@ class BattleMergeContractTests(unittest.TestCase):
         registration = next(node for node in plugin.decorator_list
                             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                             and node.func.id == "register")
-        self.assertEqual(ast.literal_eval(registration.args[3]), "0.7.17-battle")
+        self.assertEqual(ast.literal_eval(registration.args[3]), "0.7.18-battle")
         metadata = (STAGE / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn("\nversion: 0.7.17-battle\n", metadata)
+        self.assertIn("\nversion: 0.7.18-battle\n", metadata)
         # No broad decorator-stripping or fixture rewrite: method ASTs remain exact.
         baseline = _preservation_fixture()["reply_baseline"]["main_function_sha256"]
         current = _function_fingerprints(STAGE / "main.py")
         self.assertEqual(len(baseline), 86)
         self.assertEqual({name for name in baseline if baseline[name] != current[name]},
-                         {"ArenaImagePlugin._deliver_battle_message"})
+                         {"ArenaImagePlugin._deliver_battle_message", "ArenaImagePlugin.battle_vote", "ArenaImagePlugin.battle_reveal"})
 
     def test_main_functions_preserved_against_deployed_reply_baseline(self):
         before = _preservation_fixture()["reply_baseline"]["main_function_sha256"]
         after = _function_fingerprints(STAGE / "main.py")
         self.assertEqual(len(before), 86)
         self.assertTrue(before.keys() <= after.keys(), "deployed main functions removed")
-        self.assertEqual(set(after) - set(before), {"ArenaImagePlugin.battle_reply_entry"})
+        self.assertEqual(set(after) - set(before), {'ArenaImagePlugin.video_battle_reveal', 'ArenaImagePlugin._deliver_video_battle_message', 'ArenaImagePlugin.battle_reply_entry', 'ArenaImagePlugin.video_battle', 'ArenaImagePlugin._battle_reply_generator', 'ArenaImagePlugin._video_battle_client', 'ArenaImagePlugin._prune_video_outputs', 'ArenaImagePlugin.video_battle_vote', 'ArenaImagePlugin._video_controller', 'ArenaImagePlugin.video_battle_plain_entry', 'ArenaImagePlugin._materialize_video_output', 'ArenaImagePlugin._battle_reply_generator.ambiguous', 'ArenaImagePlugin._ambiguous_battle_quote', 'ArenaImagePlugin.video_battle_resume'})
         # Lifecycle/transport changes from v0.7.12 were already deployed before
         # this patch. Against the actual immutable v0.7.15 snapshot, only the
         # grouped sender changes, to retain its confirmed native receipt ID.
         # The release-only @register version is outside function fingerprints;
         # do not weaken full method hashes or change the public baseline fixture.
         changed = {name for name in before if before[name] != after[name]}
-        self.assertEqual(changed, {"ArenaImagePlugin._deliver_battle_message"})
+        self.assertEqual(changed, {"ArenaImagePlugin._deliver_battle_message", "ArenaImagePlugin.battle_vote", "ArenaImagePlugin.battle_reveal"})
 
     def test_existing_single_model_methods_are_ast_identical_to_online_baseline(self):
         before = _preservation_fixture()["online_baseline"]["class_methods"]["main.py"]["ArenaImagePlugin"]

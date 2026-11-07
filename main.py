@@ -224,7 +224,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.17-battle",
+    "0.7.18-battle",
 )
 class ArenaImagePlugin(BattleCommandsMixin, Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -270,12 +270,18 @@ class ArenaImagePlugin(BattleCommandsMixin, Star):
 
     @filter.command("battle投票", alias={"battlevote", "竞技场投票"})
     async def battle_vote(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        if self._ambiguous_battle_quote(event):
+            yield event.plain_result("引用消息与多个对战对应，未提交投票。")
+            return
         async for result in BattleCommandsMixin.battle_vote(self, event, text):
             yield result
 
 
     @filter.command("battle揭晓", alias={"battlereveal", "竞技场揭晓", "battle不投票"})
     async def battle_reveal(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        if self._ambiguous_battle_quote(event):
+            yield event.plain_result("引用消息与多个对战对应，未提交投票。")
+            return
         async for result in BattleCommandsMixin.battle_reveal(self, event, text):
             yield result
 
@@ -308,7 +314,7 @@ class ArenaImagePlugin(BattleCommandsMixin, Star):
 
     @filter.custom_filter(BattleReplyFilter)
     async def battle_reply_entry(self, event: AstrMessageEvent):
-        generator = BattleCommandsMixin.battle_reply(self, event)
+        generator = self._battle_reply_generator(event)
         try:
             async for result in generator:
                 yield result
@@ -317,6 +323,128 @@ class ArenaImagePlugin(BattleCommandsMixin, Star):
         # Only this exact quoted intent is ours. Stop after every reply yielded
         # so the real scheduler still sends it before blocking LLM propagation.
         event.stop_event()
+
+    def _video_controller(self):
+        # Lazy isolated store: loading the image plugin does not create video
+        # files, start another browser, or alter existing image sessions.
+        if "_video_battles" not in self.__dict__:
+            from .video_commands import VideoBattleController
+            self._video_battles = VideoBattleController(self)
+        return self._video_battles
+
+    def _ambiguous_battle_quote(self, event):
+        from .battle_reply import quoted_message_id
+        try:
+            native_id = quoted_message_id(event)
+        except Exception:
+            # Malformed/multiple native quotes reject before either transport.
+            return True
+        if not native_id:
+            return False
+        chat = str(getattr(event, "unified_msg_origin", "") or "")
+        stores = (self._battle_sessions, self._video_controller()._battle_sessions)
+        matches = sum(entry.get("chat") == chat and entry.get("platform_message_id") == native_id
+                      for store in stores for entry in store.values())
+        return matches > 1
+
+    def _battle_reply_generator(self, event):
+        from .battle_reply import quoted_message_id
+        native_id = quoted_message_id(event)
+        controller = self._video_controller()
+        chat = str(getattr(event, "unified_msg_origin", "") or "")
+        video_matches = [entry for entry in controller._battle_sessions.values()
+                         if entry.get("chat") == chat and entry.get("platform_message_id") == native_id]
+        image_matches = [entry for entry in self._battle_sessions.values()
+                         if entry.get("chat") == chat and entry.get("platform_message_id") == native_id]
+        if video_matches and not image_matches:
+            return controller.battle_reply(event)
+        if video_matches:
+            async def ambiguous():
+                yield event.plain_result("引用消息与多个对战对应，未提交投票。")
+            return ambiguous()
+        return BattleCommandsMixin.battle_reply(self, event)
+
+    @filter.command("mvbattle", alias={"视频battle", "videobattle", "竞技场视频对战"})
+    async def video_battle(self, event: AstrMessageEvent, prompt: GreedyStr = GreedyStr):
+        generator = self._video_controller().video_battle(event, prompt)
+        try:
+            async for result in generator:
+                yield result
+        finally:
+            await generator.aclose()
+
+    @filter.command("mvbattle读回", alias={"视频battle读回", "videobattleresume"})
+    async def video_battle_resume(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        generator = self._video_controller().video_resume(event, text)
+        try:
+            async for result in generator:
+                yield result
+        finally:
+            await generator.aclose()
+
+    @filter.command("mvbattle投票", alias={"视频battle投票", "videobattlevote"})
+    async def video_battle_vote(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        async for result in self._video_controller().battle_vote(event, text):
+            yield result
+
+    @filter.command("mvbattle揭晓", alias={"视频battle揭晓", "videobattlereveal", "视频battle不投票"})
+    async def video_battle_reveal(self, event: AstrMessageEvent, text: GreedyStr = GreedyStr):
+        async for result in self._video_controller().battle_reveal(event, text):
+            yield result
+
+    @filter.regex(r"(?i)^(?:mvbattle|视频battle|videobattle|竞技场视频对战)(?:[ \t]+|$)")
+    async def video_battle_plain_entry(self, event: AstrMessageEvent):
+        if getattr(event, "is_at_or_wake_command", False):
+            return
+        raw = str(event.get_message_str() or "").strip()
+        prompt = re.sub(r"(?i)^(?:mvbattle|视频battle|videobattle|竞技场视频对战)(?:[ \t]+|$)", "", raw, count=1)
+        generator = self._video_controller().video_battle(event, prompt)
+        try:
+            async for result in generator:
+                yield result
+        finally:
+            await generator.aclose()
+        event.stop_event()
+
+    def _video_battle_client(self):
+        from .video_client import ArenaVideoClient
+        if self._transport_mode() not in {"bridge", "direct"}:
+            raise ValueError("视频 Battle 仅支持原服务器浏览器，不支持 userscript。")
+        return ArenaVideoClient(
+            str(self.config.get("browser_cdp_url") or "http://arena-browser:9223"),
+            gateway_url=str(self.config.get("browser_gateway_url") or ""),
+            vnc_url=str(self.config.get("browser_vnc_url") or ""),
+            link_secret=str(self.config.get("interactive_link_secret") or ""),
+            timeout=_as_float(self.config.get("video_request_timeout"), 900.0, 60.0, 1800.0),
+            rate_limit_retries=0, data_dir=self.data_dir / "video_battles",
+        )
+
+    async def _materialize_video_output(self, candidate, *, output_dir):
+        from .video_delivery import materialize_video_output
+        return await materialize_video_output(
+            candidate, output_dir=output_dir,
+            max_bytes=_as_int(self.config.get("video_max_bytes"), 64 * 1024 * 1024,
+                              1024 * 1024, 64 * 1024 * 1024),
+            timeout=90.0, ffprobe=True,
+        )
+
+    async def _deliver_video_battle_message(self, event, result):
+        from .video_delivery import deliver_video_battle_message
+        return await deliver_video_battle_message(self, event, result)
+
+    def _prune_video_outputs(self, *, output_dir, pending):
+        root = Path(output_dir)
+        if not root.is_dir():
+            return
+        files = [p for p in root.rglob("*.mp4") if p.is_file() and p not in pending]
+        keep = _as_int(self.config.get("video_max_saved_outputs"), 8, 2, 64)
+        for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[keep:]:
+            try:
+                path.unlink()
+                if path.parent != root:
+                    path.parent.rmdir()
+            except OSError:
+                pass
 
     def _battle_client(self) -> ArenaDirectClient:
         # The bundled bridge only offers single-model completions. Battle uses

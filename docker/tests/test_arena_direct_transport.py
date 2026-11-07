@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import tempfile
 import time
@@ -868,11 +869,11 @@ class FakeHTTPX:
 
 
 class StaleServerActionTests(DirectTransportCase):
-    """Arena redeploys a few times a day; every deploy renames the actions.
+    """Legacy-only coverage for the retained ``_upload_once`` Flight helper.
 
-    A tab left open across one keeps handing out the previous build's ids, and
-    Arena answers those with a bare 404.  Before the retry below that read as
-    "img2img is broken" and no amount of re-binding the session helped.
+    The active reference uploader now uses REST and never scans Action IDs.
+    Keep the original stale/retry contracts here using a test-local copy of the
+    old orchestration; the REST suite locks the active fail-closed behavior.
     """
 
     STALE = {"status": 404, "headers": {}, "text": "Server action not found."}
@@ -901,7 +902,35 @@ class StaleServerActionTests(DirectTransportCase):
 
     def _upload(self, page: FakePage):
         client = self.client(page)
-        return self.run_async(client._upload_reference(page, _png_data_url()))
+
+        async def legacy_upload():
+            # Original bounded retry, deliberately NOT the active REST entrypoint.
+            raw, mime = arena_direct.decode_image_value(_png_data_url())
+            digest = hashlib.md5(raw).hexdigest()
+            for attempt in (0, 1):
+                actions = await client._next_actions(page, refresh=attempt > 0)
+                upload_action = actions.get("generateUploadUrl") or ""
+                signed_action = actions.get("getSignedUrl") or ""
+                if not upload_action or not signed_action:
+                    raise arena_direct._err(
+                        "没能从竞技场页面读到上传接口（Next-Action）ID，图生图暂时不可用。",
+                        code="upload_action_missing",
+                    )
+                try:
+                    return await client._upload_once(
+                        page, raw=raw, mime=mime, digest=digest,
+                        upload_action=upload_action, signed_action=signed_action,
+                    )
+                except arena_direct._StaleActionError:
+                    if attempt:
+                        raise arena_direct._err(
+                            "竞技场刚刚更新了页面，上传接口的编号全换了。已经自动刷新过一次还是不行，"
+                            "过一两分钟再发一次就好。",
+                            code="upload_action_stale",
+                        ) from None
+            raise AssertionError("legacy retry exhausted without a result")
+
+        return self.run_async(legacy_upload())
 
     def test_marker_is_what_separates_a_redeploy_from_a_real_404(self) -> None:
         self.assertTrue(arena_direct.action_is_stale(404, "Server action not found."))
@@ -1060,6 +1089,47 @@ class GenerationTests(DirectTransportCase):
         sent = json.loads(page.requests[0]["body"])
         self.assertEqual(sent["userMessage"]["experimental_attachments"], [attachment])
         self.assertIn("modelAMessageId", sent)
+        self.assertNotIn("modelBId", sent)
+        self.assertNotIn("modelBMessageId", sent)
+
+    def test_image_edit_upload_uses_json_storage_and_storage_key_attachment(self) -> None:
+        page = self._page()
+        page._responses = [
+            {"status": 200, "headers": {}, "text": json.dumps({
+                "uploadUrl": "https://storage.example.invalid/put",
+                "key": "uploads/direct-fixture.png",
+            })},
+            {"status": 200, "headers": {}, "text": json.dumps({
+                "url": "https://storage.example.invalid/reference.png",
+            })},
+            {"status": 200, "headers": {}, "text": self.SUCCESS_BODY},
+        ]
+        httpx = FakeHTTPX()
+        self._patch(arena_direct, "httpx", httpx)
+        result = self.run_async(self.client(page).complete(
+            model=self.MODEL, prompt="paint the apple blue", images=[_png_data_url()],
+        ))
+        self.assertEqual(bridge_client.image_urls(result), [self.IMAGE])
+        self.assertEqual([request["path"] for request in page.requests], [
+            "/api/storage/generate-upload-url", "/api/storage/get-signed-url",
+            arena_direct.STREAM_CREATE_EVALUATION_PATH,
+        ])
+        self.assertEqual(page.action_reads, 0)
+        self.assertEqual(page.reload_calls, 0)
+        self.assertEqual(len(httpx.puts), 1)
+        self.assertEqual(page._responses, [])
+        for request in page.requests[:2]:
+            self.assertEqual(request["method"], "POST")
+            self.assertEqual(request["headers"], {
+                "Content-Type": "application/json", "Accept": "application/json",
+            })
+        self.assertEqual(json.loads(page.requests[1]["body"]),
+                         {"key": "uploads/direct-fixture.png"})
+        sent = json.loads(page.requests[2]["body"])
+        self.assertEqual(sent["userMessage"]["experimental_attachments"], [{
+            "name": "uploads/direct-fixture.png", "contentType": "image/png",
+            "url": "https://storage.example.invalid/reference.png",
+        }])
         self.assertNotIn("modelBId", sent)
         self.assertNotIn("modelBMessageId", sent)
 

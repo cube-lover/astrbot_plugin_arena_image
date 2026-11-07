@@ -386,25 +386,11 @@ class BattleBeginTests(DirectTransportCase):
         self._patch(arena_direct, "httpx", httpx)
         page = BattlePage(
             responses=[
-                _response(
-                    _flight(
-                        {
-                            "success": True,
-                            "data": {
-                                "uploadUrl": "https://upload.example.invalid/put",
-                                "key": "uploads/fixture",
-                            },
-                        }
-                    )
-                ),
-                _response(
-                    _flight(
-                        {
-                            "success": True,
-                            "data": {"url": "https://images.example.invalid/reference.png"},
-                        }
-                    )
-                ),
+                _response(json.dumps({
+                    "uploadUrl": "https://upload.example.invalid/put",
+                    "key": "uploads/fixture",
+                })),
+                _response(json.dumps({"url": "https://images.example.invalid/reference.png"})),
                 _response(STREAM),
             ],
             action_sets=[{"generateUploadUrl": "OFFLINE_UPLOAD", "getSignedUrl": "OFFLINE_SIGNED"}],
@@ -414,8 +400,19 @@ class BattleBeginTests(DirectTransportCase):
         )
         self.assertEqual(len(httpx.puts), 1)  # FakeHTTPX: no actual signed PUT.
         self.assertEqual(page.table_reads, 0)
+        self.assertEqual(page.action_reads, 0)
+        self.assertEqual(page.reload_calls, 0)
         self.assertEqual(page.actions, ["chat_submit"])
         self.assertEqual(len(page.requests), 3)
+        for request, path in zip(page.requests[:2], (
+            "/api/storage/generate-upload-url", "/api/storage/get-signed-url",
+        )):
+            self.assertEqual(request["path"], path)
+            self.assertEqual(request["method"], "POST")
+            self.assertEqual(request["headers"], {
+                "Content-Type": "application/json", "Accept": "application/json",
+            })
+        self.assertEqual(json.loads(page.requests[1]["body"]), {"key": "uploads/fixture"})
         payload = json.loads(page.requests[-1]["body"])
         self.assertEqual(payload["mode"], "battle")
         self.assertNotIn("modelAId", payload)
@@ -423,6 +420,7 @@ class BattleBeginTests(DirectTransportCase):
         self.assertEqual(payload["userMessage"]["content"], "请根据参考图生成图片")
         attachments = payload["userMessage"]["experimental_attachments"]
         self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["name"], "uploads/fixture")
         self.assertEqual(attachments[0]["contentType"], "image/png")
         self.assertEqual(attachments[0]["url"], "https://images.example.invalid/reference.png")
         self.assertEqual(result["context"]["browser_scope"], page.cache_key)

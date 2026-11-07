@@ -16,7 +16,7 @@ from .test_arena_image_hardening import _make_plugin, _plugin_module
 from .test_battle_commands import (
     ACK, Client, Event, Host, battle_module, collect, image_components, text,
 )
-from .test_arena_direct_transport import FakePage, _image_model, _filler_models, _flight, _png_data_url
+from .test_arena_direct_transport import FakePage, _image_model, _filler_models
 from astrbot_plugin_arena_image import arena_direct, arena_relay, battle_reply, bridge_client, model_catalog, qq_delivery
 
 STAGE = Path(__file__).resolve().parents[2]
@@ -1629,6 +1629,24 @@ class BattleMergeContractTests(unittest.TestCase):
                 self.assertEqual(battle_module.BattleCommandsMixin._battle_names_message(code, names),
                                  "Battle 已揭晓\nA：Real A\nB：Real B")
 
+    def test_release_registration_version_does_not_change_method_fingerprints(self):
+        # The release decorator is module/class metadata, not a method body.
+        tree = ast.parse((STAGE / "main.py").read_text(encoding="utf-8"))
+        plugin = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == "ArenaImagePlugin")
+        registration = next(node for node in plugin.decorator_list
+                            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id == "register")
+        self.assertEqual(ast.literal_eval(registration.args[3]), "0.7.17-battle")
+        metadata = (STAGE / "metadata.yaml").read_text(encoding="utf-8")
+        self.assertIn("\nversion: 0.7.17-battle\n", metadata)
+        # No broad decorator-stripping or fixture rewrite: method ASTs remain exact.
+        baseline = _preservation_fixture()["reply_baseline"]["main_function_sha256"]
+        current = _function_fingerprints(STAGE / "main.py")
+        self.assertEqual(len(baseline), 86)
+        self.assertEqual({name for name in baseline if baseline[name] != current[name]},
+                         {"ArenaImagePlugin._deliver_battle_message"})
+
     def test_main_functions_preserved_against_deployed_reply_baseline(self):
         before = _preservation_fixture()["reply_baseline"]["main_function_sha256"]
         after = _function_fingerprints(STAGE / "main.py")
@@ -1638,6 +1656,8 @@ class BattleMergeContractTests(unittest.TestCase):
         # Lifecycle/transport changes from v0.7.12 were already deployed before
         # this patch. Against the actual immutable v0.7.15 snapshot, only the
         # grouped sender changes, to retain its confirmed native receipt ID.
+        # The release-only @register version is outside function fingerprints;
+        # do not weaken full method hashes or change the public baseline fixture.
         changed = {name for name in before if before[name] != after[name]}
         self.assertEqual(changed, {"ArenaImagePlugin._deliver_battle_message"})
 

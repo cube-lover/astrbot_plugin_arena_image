@@ -1597,7 +1597,10 @@ class ArenaPage:
                 "headers": value.get("headers") if isinstance(value.get("headers"), dict) else {},
                 "text": str(value.get("text") or ""),
             }
-            if not deployment_refresh_required(response) or attempt:
+            if (not deployment_refresh_required(response) or attempt
+                    or path in ("/api/storage/generate-upload-url", "/api/storage/get-signed-url")):
+                # Storage operations are fail-closed: page refresh does not prove
+                # a partially completed upload may be replayed safely.
                 return response
             if any(str(key).casefold() == "next-action" for key in (headers or {})):
                 # Upload code must refresh action IDs too, not replay an old
@@ -2452,48 +2455,114 @@ class ArenaDirectClient(BattleProtocolMixin):
     async def _upload_reference(self, page: ArenaPage, value: str) -> dict[str, Any]:
         """Upload one reference image and return its attachment entry.
 
-        Retried exactly once through a tab reload: Arena redeploys several times
-        a day and every deploy invalidates the server-action ids, which used to
-        surface as a flat "img2img is broken" until someone reopened the tab.
+        Reuse a confirmed browser-scoped upload, otherwise use the current
+        official JSON storage contract without guessing removed Action IDs.
         """
         raw, mime = decode_image_value(value)
         digest = hashlib.md5(raw).hexdigest()
         uploads = cache_scope(page)["uploads"]
         async with _LOCK:
             cached = dict(uploads.get(digest) or {})
-        if cached and float(cached.get("expiry") or 0) > time.time() + 60:
+        if (cached and cached.get("upload_contract") == "storage-rest-v1"
+                and float(cached.get("expiry") or 0) > time.time() + 60):
             return {
                 "name": cached["name"],
                 "contentType": cached["contentType"],
                 "url": cached["url"],
             }
 
-        for attempt in (0, 1):
-            actions = await self._next_actions(page, refresh=attempt > 0)
-            upload_action = actions.get("generateUploadUrl") or ""
-            signed_action = actions.get("getSignedUrl") or ""
-            if not upload_action or not signed_action:
-                raise _err(
-                    "没能从竞技场页面读到上传接口（Next-Action）ID，图生图暂时不可用。",
-                    code="upload_action_missing",
-                )
+        # Current Arena uses JSON storage endpoints, not the removed upload
+        # Next Actions. A failed/uncertain protected POST is never replayed here.
+        return await self._upload_reference_rest(page, raw=raw, mime=mime, digest=digest)
+
+    async def _upload_reference_rest(
+        self, page: ArenaPage, *, raw: bytes, mime: str, digest: str,
+    ) -> dict[str, Any]:
+        """Current official JSON -> signed PUT -> JSON signing upload flow."""
+        extension = mimetypes.guess_extension(mime) or ".png"
+        filename = f"{digest[:12]}{'.jpg' if extension == '.jpe' else extension}"
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+        def response_object(response: dict[str, Any]) -> dict[str, Any]:
             try:
-                return await self._upload_once(
-                    page,
-                    raw=raw,
-                    mime=mime,
-                    digest=digest,
-                    upload_action=upload_action,
-                    signed_action=signed_action,
+                obj = json.loads(response.get("text") or "")
+            except (TypeError, ValueError):
+                return {}
+            return obj if isinstance(obj, dict) else {}
+
+        def require_response(response: dict[str, Any], code: str, label: str) -> dict[str, Any]:
+            status = int(response.get("status") or 0)
+            if deployment_refresh_required(response):
+                raise _err(
+                    "官网要求更新页面，参考图上传未确认；请稍后重试原操作。",
+                    code="upload_deployment_refresh_required", status_code=status,
                 )
-            except _StaleActionError:
-                if attempt:
-                    raise _err(
-                        "竞技场刚刚更新了页面，上传接口的编号全换了。已经自动刷新过一次还是不行，"
-                        "过一两分钟再发一次就好。",
-                        code="upload_action_stale",
-                    ) from None
-        raise _err("上传参考图失败。", code="upload_failed")  # pragma: no cover
+            obj = response_object(response)
+            if status != 200 or obj.get("success") is False or obj.get("error"):
+                raise _err(f"{label}（HTTP {status}）。", code=code,
+                           status_code=status or None)
+            return obj
+
+        def signed_url(value: Any) -> str:
+            if not isinstance(value, str) or len(value) > 16384:
+                return ""
+            try:
+                parts = urlsplit(value)
+                if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+                    return ""
+            except ValueError:
+                return ""
+            return value
+
+        async def storage_request(path: str, payload: dict[str, str], code: str) -> dict[str, Any]:
+            try:
+                return await page.fetch(path, headers=headers, body=json.dumps(payload), timeout=60.0)
+            except Exception:
+                # CDP/adapter exceptions may include body or signed key text.
+                # Cancellation still propagates, and no protected POST retries.
+                raise _err("参考图上传接口响应异常，结果未确认。", code=code) from None
+
+        first = await storage_request(
+            "/api/storage/generate-upload-url", {"fileName": filename, "contentType": mime},
+            "upload_url_failed",
+        )
+        obj = require_response(first, "upload_url_failed", "申请参考图上传地址失败")
+        upload_url = signed_url(obj.get("uploadUrl"))
+        key = obj.get("key")
+        if not upload_url or not isinstance(key, str) or not key.strip() or len(key) > 2048:
+            raise _err("参考图上传地址响应不完整，未上传。", code="upload_url_failed")
+        key = key[1:] if key.startswith("/") else key
+        if not key:
+            raise _err("参考图存储标识无效，未上传。", code="upload_url_failed")
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                put = await client.put(upload_url, content=raw, headers={"Content-Type": mime})
+            if put.status_code not in (200, 201, 204):
+                raise _err(f"上传参考图失败（HTTP {put.status_code}）。",
+                           code="upload_failed", status_code=put.status_code)
+        except httpx.HTTPError:
+            # Signed URLs and upstream exception text must not enter chat/logs.
+            raise _err("上传参考图网络异常，结果未确认。", code="upload_failed") from None
+        third = await storage_request(
+            "/api/storage/get-signed-url", {"key": key}, "upload_signed_url_failed",
+        )
+        obj = require_response(third, "upload_signed_url_failed", "获取参考图下载地址失败")
+        download_url = signed_url(obj.get("url"))
+        if not download_url:
+            raise _err("参考图下载地址响应不完整。", code="upload_signed_url_failed")
+        # Current official attachment name is its storage key, not the original
+        # display filename. Keep the same key used for the signed read URL.
+        entry = {"name": key, "contentType": mime, "url": download_url}
+        uploads = cache_scope(page)["uploads"]
+        async with _LOCK:
+            if len(uploads) >= UPLOAD_CACHE_LIMIT:
+                for stale in list(uploads)[:max(1, UPLOAD_CACHE_LIMIT // 10)]:
+                    uploads.pop(stale, None)
+            expiry = signed_url_expiry(download_url)
+            # Unknown lifetimes cannot justify reusing signed links for an hour.
+            uploads[digest] = {**entry, "key": key, "upload_contract": "storage-rest-v1",
+                              "expiry": expiry if expiry is not None else 0.0}
+        return entry
 
     async def _upload_once(
         self,

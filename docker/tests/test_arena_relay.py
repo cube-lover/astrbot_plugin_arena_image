@@ -37,7 +37,6 @@ from tests.test_arena_direct_transport import (
     FakeHTTPX,
     _chunked_cookies,
     _filler_models,
-    _flight,
     _image_model,
     _png_data_url,
     _session_token,
@@ -179,18 +178,17 @@ class FakeBrowser:
 
     def default_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
         path = str(payload.get("path") or "")
-        action = str((payload.get("headers") or {}).get("Next-Action") or "")
-        if action and action == self.actions.get("generateUploadUrl"):
+        if path == "/api/storage/generate-upload-url":
             return {
                 "status": 200,
                 "headers": {},
-                "text": _flight({"data": {"uploadUrl": "https://r2.example/put", "key": "up/abc"}}),
+                "text": json.dumps({"uploadUrl": "https://r2.example/put", "key": "up/abc"}),
             }
-        if action and action == self.actions.get("getSignedUrl"):
+        if path == "/api/storage/get-signed-url":
             return {
                 "status": 200,
                 "headers": {},
-                "text": _flight({"data": {"url": "https://cdn.arena.ai/ref.png?X-Amz-Expires=3600"}}),
+                "text": json.dumps({"url": "https://cdn.arena.ai/ref.png?X-Amz-Expires=3600"}),
             }
         if path == arena_direct.STREAM_CREATE_EVALUATION_PATH:
             return {"status": 200, "headers": {}, "text": STREAM_BODY}
@@ -590,17 +588,30 @@ class FeatureParityTests(RelayCase):
         self.assertEqual(bridge_client.image_urls(result), [ARENA_IMAGE])
         self.assertEqual(
             [verb for verb, _ in seen],
-            ["models", "state", "actions", "fetch", "fetch", "recaptcha", "fetch"],
+            ["models", "state", "fetch", "fetch", "recaptcha", "fetch"],
         )
-        # Steps 1 and 3 ride the relay (they need the visitor's cookies); step 2
-        # is the plain presigned PUT, which still goes out from the plugin.
-        self.assertEqual(fetches[0]["headers"]["Next-Action"], UPLOAD_ACTION)
-        self.assertEqual(fetches[1]["headers"]["Next-Action"], SIGNED_ACTION)
+        # Steps 1 and 3 are JSON storage POSTs through the visitor's browser;
+        # step 2 is the plain presigned PUT from the plugin, not an Action.
+        self.assertEqual(len(fetches), 3)
+        for fetch, path in zip(fetches[:2], (
+            "/api/storage/generate-upload-url", "/api/storage/get-signed-url",
+        )):
+            self.assertEqual(fetch["path"], path)
+            self.assertEqual(fetch["method"], "POST")
+            self.assertEqual(fetch["headers"], {
+                "Content-Type": "application/json", "Accept": "application/json",
+            })
+        first = json.loads(fetches[0]["body"])
+        self.assertEqual(set(first), {"fileName", "contentType"})
+        self.assertTrue(first["fileName"].endswith(".png"))
+        self.assertEqual(first["contentType"], "image/png")
+        self.assertEqual(json.loads(fetches[1]["body"]), {"key": "up/abc"})
         self.assertEqual(len(fake_httpx.puts), 1)
         self.assertEqual(fake_httpx.puts[0]["url"], "https://r2.example/put")
         self.assertEqual(fake_httpx.puts[0]["headers"]["Content-Type"], "image/png")
         attachments = json.loads(fetches[2]["body"])["userMessage"]["experimental_attachments"]
         self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["name"], "up/abc")
         self.assertEqual(attachments[0]["contentType"], "image/png")
         self.assertEqual(attachments[0]["url"], "https://cdn.arena.ai/ref.png?X-Amz-Expires=3600")
 

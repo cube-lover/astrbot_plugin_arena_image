@@ -1749,9 +1749,9 @@ class BattleMergeContractTests(unittest.TestCase):
         registration = next(node for node in plugin.decorator_list
                             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                             and node.func.id == "register")
-        self.assertEqual(ast.literal_eval(registration.args[3]), "0.7.18-battle")
+        self.assertEqual(ast.literal_eval(registration.args[3]), "0.7.19-battle")
         metadata = (STAGE / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn("\nversion: 0.7.18-battle\n", metadata)
+        self.assertIn("\nversion: 0.7.19-battle\n", metadata)
         # No broad decorator-stripping or fixture rewrite: method ASTs remain exact.
         baseline = _preservation_fixture()["reply_baseline"]["main_function_sha256"]
         current = _function_fingerprints(STAGE / "main.py")

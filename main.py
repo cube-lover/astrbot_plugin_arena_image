@@ -224,7 +224,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.18-battle",
+    "0.7.19-battle",
 )
 class ArenaImagePlugin(BattleCommandsMixin, Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -428,9 +428,9 @@ class ArenaImagePlugin(BattleCommandsMixin, Star):
             timeout=90.0, ffprobe=True,
         )
 
-    async def _deliver_video_battle_message(self, event, result):
+    async def _deliver_video_battle_message(self, event, result, *, receipt_callback=None):
         from .video_delivery import deliver_video_battle_message
-        return await deliver_video_battle_message(self, event, result)
+        return await deliver_video_battle_message(self, event, result, receipt_callback=receipt_callback)
 
     def _prune_video_outputs(self, *, output_dir, pending):
         root = Path(output_dir)

@@ -484,27 +484,63 @@ class MessageChain:
         self.chain = chain
 
 
+def expected_forward(first=MP4, second=MP4, footer=delivery.VIDEO_VOTE_FOOTER, self_id=456):
+    return [
+        {"type": "node", "data": {"user_id": self_id, "nickname": "视频 Battle A", "content": [
+            {"type": "text", "data": {"text": delivery.VIDEO_HEADER + "\nA\n"}},
+            {"type": "video", "data": {"file": "base64://" + base64.b64encode(first).decode("ascii")}},
+        ]}},
+        {"type": "node", "data": {"user_id": self_id, "nickname": "视频 Battle B", "content": [
+            {"type": "text", "data": {"text": "\nB\n" + footer}},
+            {"type": "video", "data": {"file": "base64://" + base64.b64encode(second).decode("ascii")}},
+        ]}},
+    ]
+
+
+def forward_nodes(payload):
+    nodes = [{"sender": {"user_id": node["data"]["user_id"], "nickname": node["data"]["nickname"]},
+              "message": copy.deepcopy(node["data"]["content"])} for node in payload]
+    for lane, node in enumerate(nodes):
+        video = node["message"][1]["data"]
+        raw = base64.b64decode(video["file"][9:], validate=True)
+        video.update(file="native-file-" + str(lane), file_size=str(len(raw)))
+    return nodes
+
+
 class LeafApi:
     def __init__(self):
         self._timeout_sec = 0.01
         self.calls = []
         self.readbacks = []
         self.readback_options = {"delay": 0, "error": None, "result": "auto"}
+        self.forward_options = {"delay": 0, "error": None, "result": "auto"}
         self.options = {"receipt": {"message_id": 42}, "error": None, "delay": 0}
         self.started = asyncio.Event()
         self.outcomes = []
         self.on_call = None
 
     async def call_action(self, action, **params):
-        if action == "get_msg":
+        if action in ("get_msg", "get_forward_msg"):
             self.readbacks.append((action, params, self._timeout_sec))
-            await asyncio.sleep(self.readback_options["delay"])
-            if self.readback_options["error"] is not None:
-                raise self.readback_options["error"]
-            result = self.readback_options["result"]
+            options = self.readback_options if action == "get_msg" else self.forward_options
+            await asyncio.sleep(options["delay"])
+            if options["error"] is not None:
+                raise options["error"]
+            result = options["result"]
             if result == "auto":
-                return {"message_id": params["message_id"], "message": copy.deepcopy(self.calls[-1][1]["message"])}
+                if action == "get_msg":
+                    return {"message_id": params["message_id"], "message": [
+                        {"type": "forward", "data": {"id": "native-forward-resource"}}]}
+                sent = next(call for call in reversed(self.calls)
+                            if call[1].get("self_id") == params.get("self_id"))
+                return {"messages": forward_nodes(sent[1]["messages"])}
             return result
+        # Installed inherited schema validates singular message before the
+        # native handler normalizes the plural alias. Do not mask this locally.
+        if action not in ("send_group_forward_msg", "send_private_forward_msg"):
+            raise AssertionError("Unexpected business send action")
+        if not isinstance(params.get("message"), list) or len(params["message"]) != 2:
+            raise AssertionError("Native forward schema requires message nodes")
         self.calls.append((action, params, self._timeout_sec))
         self.started.set()
         await asyncio.sleep(self.options["delay"])
@@ -594,27 +630,32 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(type(receipt).__name__, "BattleMessageReceipt")
         self.assertEqual(len(self.api.calls), 1)
         action, params, deadline = self.api.calls[0]
-        self.assertEqual(action, "send_group_msg")
+        self.assertEqual(action, "send_group_forward_msg")
         self.assertEqual(params["group_id"], 123)
         self.assertEqual(params["self_id"], "456")
         self.assertEqual(params["timeout"], 100)
         self.assertEqual(deadline, 15.1)
         self.assertEqual(self.api._timeout_sec, 0.01)
-        messages = params["message"]
-        self.assertEqual([item["type"] for item in messages], ["text", "text", "video", "text", "video", "text"])
-        self.assertEqual(messages[0]["data"]["text"], "视频 Battle\n")
-        self.assertEqual(messages[1]["data"]["text"], "\nA\n")
-        self.assertEqual(messages[3]["data"]["text"], "\nB\n")
-        self.assertEqual(messages[5]["data"]["text"], "引用本条回复 A / B 投票并揭晓。")
-        for index in (2, 4):
-            self.assertEqual(set(messages[index]["data"]), {"file"})
-            self.assertEqual(base64.b64decode(messages[index]["data"]["file"][9:]), MP4)
+        messages = params["messages"]
+        self.assertEqual(messages, expected_forward())
+        self.assertEqual(params["message"], messages)
+        self.assertIsNot(params["message"], messages)
+        self.assertEqual([item["type"] for item in messages], ["node", "node"])
+        for node, label in zip(messages, ("A", "B")):
+            self.assertEqual(node["data"]["user_id"], 456)
+            self.assertEqual(node["data"]["nickname"], "视频 Battle " + label)
+            self.assertEqual([item["type"] for item in node["data"]["content"]], ["text", "video"])
+            video = node["data"]["content"][1]
+            self.assertEqual(set(video["data"]), {"file"})
+            self.assertEqual(base64.b64decode(video["data"]["file"][9:]), MP4)
         self.assertNotIn("file:", str(messages))
         self.assertNotIn("https:", str(messages))
         self.assertNotIn("secret", str(messages))
         self.assertEqual([type(item) for item in self.event.parsed_chains[0].chain], [Plain, Plain, Video, Plain, Video, Plain])
         self.assertEqual(self.event.bookkeeping, 1)
-        self.assertEqual(self.api.readbacks, [("get_msg", {"message_id": 42, "self_id": "456"}, 15.1)])
+        self.assertEqual(self.api.readbacks, [
+            ("get_msg", {"message_id": 42, "self_id": "456"}, 15.1),
+            ("get_forward_msg", {"message_id": "native-forward-resource", "self_id": "456"}, 15.1)])
         self.assertTrue(all(path.exists() for path in self.paths))
         self.assert_no_fallback()
 
@@ -661,9 +702,11 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.result.chain.append(Plain("unsafe upstream footer " + SIGNED_URL))
         receipt = await self.send()
         self.assertEqual(receipt.message_id, "42")
-        messages = self.api.calls[0][1]["message"]
-        self.assertEqual(messages[-1]["data"]["text"], "引用本条回复 A / B 投票；回复“不投票”随机投票并揭晓。")
-        self.assertEqual(sum(item["type"] == "video" for item in messages), 2)
+        messages = self.api.calls[0][1]["messages"]
+        self.assertEqual(messages[-1]["data"]["content"][0]["data"]["text"],
+                         "\nB\n" + delivery.VIDEO_REVEAL_FOOTER)
+        self.assertEqual(sum(segment["type"] == "video" for node in messages
+                             for segment in node["data"]["content"]), 2)
         self.assertNotIn(SIGNED_URL, str(messages))
         self.assertEqual(len(self.api.calls), 1)
 
@@ -674,7 +717,7 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         receipt = await self.send()
         self.assertEqual(receipt.message_id, "-123")
         action, params, _ = self.api.calls[0]
-        self.assertEqual(action, "send_private_msg")
+        self.assertEqual(action, "send_private_forward_msg")
         self.assertEqual(params["user_id"], 789)
         self.assertNotIn("group_id", params)
         self.assertEqual(len(self.api.calls), 1)
@@ -717,7 +760,7 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_known_rejection_then_success_exact_complete_payload_original_metadata(self):
         # Different videos establish lane ordering as well as completeness.
-        second = MP4[:-4] + b"BBBB"
+        second = MP4[:-4] + b"BBBB-LONGER"
         self.paths[1].write_bytes(second)
         self.result.metadata = {"session": "opaque", "model": "private-model", "url": SIGNED_URL}
         original_chain = self.result.chain
@@ -731,16 +774,9 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.message_id, "43")
         self.assertEqual(len(self.api.calls), 2)
         self.assertEqual(self.api.calls[0], self.api.calls[1])
-        messages = self.api.calls[0][1]["message"]
-        self.assertEqual(messages, [
-            {"type": "text", "data": {"text": delivery.VIDEO_HEADER}},
-            {"type": "text", "data": {"text": "\nA\n"}},
-            {"type": "video", "data": {"file": "base64://" + base64.b64encode(MP4).decode("ascii")}},
-            {"type": "text", "data": {"text": "\nB\n"}},
-            {"type": "video", "data": {"file": "base64://" + base64.b64encode(second).decode("ascii")}},
-            {"type": "text", "data": {"text": delivery.VIDEO_VOTE_FOOTER}},
-        ])
-        self.assertIsNot(messages, self.api.calls[1][1]["message"])
+        messages = self.api.calls[0][1]["messages"]
+        self.assertEqual(messages, expected_forward(second=second))
+        self.assertIsNot(messages, self.api.calls[1][1]["messages"])
         encode.assert_called_once()
         self.assertEqual(len(self.event.parsed_chains), 1)
         self.assertEqual(self.event.bookkeeping, 1)
@@ -906,18 +942,19 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.message_id, "43")
         self.assertEqual(len(self.api.calls), 2)
         self.assertEqual(self.api.calls[0], self.api.calls[1])
-        self.assertEqual(self.api.calls[1][1]["message"][-1]["data"]["text"], delivery.VIDEO_REVEAL_FOOTER)
+        self.assertEqual(self.api.calls[1][1]["messages"][-1]["data"]["content"][0]["data"]["text"], "\nB\n" + delivery.VIDEO_REVEAL_FOOTER)
         self.assertEqual(len(self.event.parsed_chains), 1)
         self.assert_no_fallback()
 
     async def test_complete_readback_coalesced_text_verifies_before_bookkeeping(self):
-        self.api.readback_options["result"] = {"message_id": 42, "message": [
-            {"type": "text", "data": {"text": delivery.VIDEO_HEADER + "\nA\n"}},
-            {"type": "video", "data": {"file": "native-file-a"}},
-            {"type": "text", "data": {"text": "\nB\n"}},
-            {"type": "video", "data": {"file": "native-file-b"}},
-            {"type": "text", "data": {"text": delivery.VIDEO_VOTE_FOOTER}},
-        ], "raw_message": "ignored", "user_id": 789, "group_id": 123}
+        nodes = forward_nodes(expected_forward())
+        nodes[0]["message"] = [
+            {"type": "text", "data": {"text": delivery.VIDEO_HEADER}},
+            {"type": "video", "data": {"file": "native-file-a", "file_size": str(len(MP4))}},
+            {"type": "text", "data": {"text": "\nA\n"}},
+        ]
+        nodes[1]["message"][1]["data"]["file"] = "native-file-b"
+        self.api.forward_options["result"] = {"messages": nodes}
         receipt = await self.send()
         self.assertEqual(receipt.message_id, "42")
         self.assertEqual(len(self.api.calls), 1)
@@ -948,11 +985,13 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.api.calls), 2)
         self.assertEqual(
             {action: params["self_id"] for action, params, _ in self.api.calls},
-            {"send_group_msg": "456", "send_private_msg": "987"},
+            {"send_group_forward_msg": "456", "send_private_forward_msg": "987"},
         )
         self.assertCountEqual(self.api.readbacks, [
             ("get_msg", {"message_id": 42, "self_id": "456"}, 15.1),
             ("get_msg", {"message_id": 42, "self_id": "987"}, 15.1),
+            ("get_forward_msg", {"message_id": "native-forward-resource", "self_id": "456"}, 15.1),
+            ("get_forward_msg", {"message_id": "native-forward-resource", "self_id": "987"}, 15.1),
         ])
         self.assertEqual(len(scoped_apis), 2)
         self.assertIsNot(scoped_apis[0], scoped_apis[1])
@@ -965,51 +1004,50 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         other.fallback.assert_not_awaited()
         self.assert_no_fallback()
 
-        # Do not invent self_id routing when the event does not provide it.
+        # Do not invent bot identity when the event does not provide it.
         self.event.message_obj.raw_message = {}
-        receipt = await self.send()
-        self.assertEqual(receipt.message_id, "42")
-        self.assertNotIn("self_id", self.api.calls[-1][1])
-        self.assertEqual(self.api.readbacks[-1], ("get_msg", {"message_id": 42}, 15.1))
+        before = (len(self.api.calls), len(self.api.readbacks))
+        failure = await self.send()
+        self.assertEqual(failure.code, "video_transport_unavailable")
+        self.assertEqual(failure.attempts, 0)
+        self.assertEqual(before, (len(self.api.calls), len(self.api.readbacks)))
         self.assertEqual(self.api._timeout_sec, 0.01)
         self.assert_no_fallback()
 
     async def test_confirmed_receipt_incomplete_or_unknown_readback_never_votes_or_retries(self):
-        complete = [
-            {"type": "text", "data": {"text": delivery.VIDEO_HEADER + "\nA\n"}},
-            {"type": "video", "data": {"file": SIGNED_URL}},
-            {"type": "text", "data": {"text": "\nB\n"}},
-            {"type": "video", "data": {"file": SIGNED_URL}},
-            {"type": "text", "data": {"text": delivery.VIDEO_VOTE_FOOTER}},
-        ]
+        complete = forward_nodes(expected_forward())
+        for node in complete:
+            node["message"][1]["data"]["file"] = SIGNED_URL
         bad_label = copy.deepcopy(complete)
-        bad_label[2]["data"]["text"] = "\nA\n"
+        bad_label[1]["message"][0]["data"]["text"] = "\nA\n" + delivery.VIDEO_VOTE_FOOTER
         extra = copy.deepcopy(complete)
-        extra.insert(4, {"type": "video", "data": {"file": SIGNED_URL}})
+        extra[1]["message"].append({"type": "video", "data": {"file": SIGNED_URL}})
         missing_file = copy.deepcopy(complete)
-        missing_file[1]["data"] = {}
+        missing_file[0]["message"][1]["data"] = {}
+        no_footer = copy.deepcopy(complete)
+        no_footer[1]["message"][0]["data"]["text"] = "\nB\n"
+        missing_video = copy.deepcopy(complete)
+        missing_video[1]["message"].pop()
         results = (
-            None, {}, {"message_id": 42, "message": "[CQ:video,file=private]"},
-            {"message_id": 42, "raw_message": complete},
-            {"message_id": 42, "content": complete}, {"data": {"message_id": 42, "message": complete}},
-            {"message_id": 99, "message": complete},
-            {"message_id": 42, "status": "async", "message": complete},
-            {"message_id": 42, "retcode": True, "message": complete},
-            *({"message_id": 42, "message": body} for body in (
-                complete[:3] + complete[4:], complete[:-1], bad_label, extra, missing_file,
-                complete[1:] + complete[:1], [])),
+            None, {}, {"messages": "[CQ:video,file=private]"},
+            {"raw_message": complete}, {"content": complete}, {"data": {"messages": complete}},
+            {"status": "async", "messages": complete}, {"retcode": True, "messages": complete},
+            *({"messages": body} for body in (
+                complete[:1], missing_video, no_footer, bad_label, extra, missing_file,
+                list(reversed(complete)), [])),
         )
         for result in results:
             self.api.calls.clear()
             self.api.readbacks.clear()
-            self.api.readback_options["result"] = result
+            self.api.forward_options["result"] = result
             failure = await self.send()
             self.assertEqual(failure.code, "video_verification_uncertain")
             self.assertTrue(failure.confirmed)
             self.assertTrue(failure.uncertain)
+            self.assertEqual(failure.message_id, "42")
             self.assertEqual(failure.attempts, 1)
             self.assertEqual(len(self.api.calls), 1)
-            self.assertEqual(len(self.api.readbacks), 1)
+            self.assertEqual(len(self.api.readbacks), 2)
             self.assertNotIn("PRIVATE", failure.message)
             self.assertNotIn(SIGNED_URL, failure.message)
         self.assertEqual(self.event.bookkeeping, 0)

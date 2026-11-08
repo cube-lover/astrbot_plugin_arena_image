@@ -15,11 +15,15 @@ Host hooks are supplied by ArenaImagePlugin's mvbattle integration:
   the URL, bound download bytes/time, validate a playable MP4 (not just MIME or
   an HTTP 200), and atomically save it under output_dir. Reject on any failure;
   clean partial files on cancellation. This controller also checks scope/ftyp.
-* async _deliver_video_battle_message(event, result): send ONE native message
-  containing the complete ordered A/B chain, without component loss/splitting.
-  Return BattleMessageReceipt ONLY after confirmed delivery of that whole chain;
-  otherwise return a failure/unknown value or raise. Never switch transport or
-  retry an uncertain send. Native dual-video support is not assumed here.
+* async _deliver_video_battle_message(event, result, receipt_callback=None): send
+  ONE native message containing the complete ordered A/B chain, without loss.
+  If supported, await receipt_callback(native_id) immediately after a valid
+  numeric outer receipt, BEFORE get_msg/get_forward verification. Callback
+  failure/cancellation must abort verification, never retry or resend. Return
+  BattleMessageReceipt with that SAME outer ID ONLY after full verification;
+  failure/unknown outcomes retain the saved binding but never enable voting.
+  Legacy hosts without the keyword are called once without a callback; their
+  binding can only be saved after the final receipt. No transport fallback.
 * _prune_video_outputs(*, output_dir, pending): synchronous video-only pruning,
   preserving pending paths. Never call image _prune_outputs or delete image data.
 
@@ -51,12 +55,13 @@ from processing a collision: routing arbitration belongs to the parent.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
 import secrets
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
 
@@ -100,7 +105,10 @@ class VideoBattleHost(Protocol):
         self, candidate: VideoCandidate, *, output_dir: Path
     ) -> Path: ...
     async def _deliver_video_battle_message(
-        self, event: AstrMessageEvent, result: Any
+        self,
+        event: AstrMessageEvent,
+        result: Any,
+        receipt_callback: Callable[[Any], Awaitable[None]] | None = None,
     ) -> BattleMessageReceipt | Any: ...
     def _prune_video_outputs(self, *, output_dir: Path, pending: set[Path]) -> None: ...
 
@@ -142,6 +150,13 @@ class VideoBattleController(BattleCommandsMixin):
                     entry["delivery_attempted"] = True
         except (OSError, ValueError, TypeError, AttributeError, RecursionError):
             pass
+
+    def _battle_trim(self) -> bool:
+        removed = super()._battle_trim()
+        # Video commands require an explicit code or exact native quote, including
+        # known-but-unverified forward cards. Never publish a latest fallback.
+        self._battle_latest.clear()
+        return removed
 
     def _battle_save(self) -> None:
         # Same bounded, atomic snapshot as the mixin, plus a video-only durable
@@ -374,6 +389,9 @@ class VideoBattleController(BattleCommandsMixin):
     ) -> str:
         """Caller holds the session guard, never the generation lock."""
         entry = self._battle_sessions[code]
+        chat, owner = self._battle_identity(event)
+        if (entry["chat"], entry["owner"]) != (chat, owner):
+            raise ValueError("视频发送与会话聊天或发起人不一致")
         result, eligible = self._battle_comparison_result(event, code, prepared)
         if resume and not eligible:
             return f"视频对战 · {code} 尚未确认两路完整可播放 MP4；本场未开放投票，未发送视频。"
@@ -385,24 +403,90 @@ class VideoBattleController(BattleCommandsMixin):
         # absent receipt must not enable another manual send after restart.
         entry["delivery_attempted"] = True
         self._battle_save()
+        deliver = self.host._deliver_video_battle_message
+        # Decide BEFORE sending. A TypeError may happen after a partial native
+        # send; it must never trigger a retry using the legacy signature.
+        try:
+            parameters = inspect.signature(deliver).parameters
+            parameter = parameters.get("receipt_callback")
+            supports_callback = (
+                parameter is not None
+                and parameter.kind in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            ) or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        except (TypeError, ValueError):
+            supports_callback = False
+        saved_id = ""
+        callback_failed = False
+        accepting_receipt = True
+
+        def checked_receipt(value):
+            native_id = message_id(value)
+            if (
+                not native_id
+                or self._battle_sessions.get(code) is not entry
+                or (entry["chat"], entry["owner"]) != (chat, owner)
+                or self._battle_identity(event) != (chat, owner)
+                or entry["vote"] is not None
+                or entry["names"] is not None
+                or code in self._image_codes()
+                or not self._receipt_is_unique(code, chat, native_id)
+            ):
+                raise ValueError("视频回执无效、不唯一或与原会话不一致")
+            return native_id
+
+        async def capture_receipt(value):
+            nonlocal saved_id, callback_failed
+            # A retained callback must not mutate a completed/failed delivery,
+            # especially after final eligibility has already been persisted.
+            if not accepting_receipt:
+                raise ValueError("视频发送已结束，不能保存新的原生回执")
+            previous_id = entry["platform_message_id"]
+            try:
+                if callback_failed:
+                    raise ValueError("视频回执保存失败")
+                native_id = checked_receipt(value)
+                if previous_id and previous_id != native_id:
+                    raise ValueError("不能替换已保存的视频原生回执")
+                entry["platform_message_id"] = native_id
+                entry["vote"] = None
+                self._battle_save()  # Host must await this BEFORE verification.
+                saved_id = native_id
+            except BaseException:
+                callback_failed = True
+                entry["platform_message_id"] = previous_id
+                entry["vote"] = None
+                raise
+
         try:
             timeout = _seconds(self.config.get("video_send_timeout"), 180.0, 600.0)
             async with asyncio.timeout(timeout):
-                outcome = await self.host._deliver_video_battle_message(event, result)
+                if supports_callback:
+                    outcome = await deliver(event, result, receipt_callback=capture_receipt)
+                else:
+                    outcome = await deliver(event, result)
         except Exception:
             outcome = None
-        native_id = (
-            message_id(outcome.message_id)
-            if isinstance(outcome, BattleMessageReceipt)
-            else ""
-        )
+        finally:
+            accepting_receipt = False
+        try:
+            native_id = (
+                checked_receipt(outcome.message_id)
+                if isinstance(outcome, BattleMessageReceipt)
+                else ""
+            )
+        except Exception:
+            native_id = ""
         if (
             not native_id
-            or not self._receipt_is_unique(code, entry["chat"], native_id)
-            or code in self._image_codes()
+            or callback_failed
+            or (supports_callback and not saved_id)
+            or (saved_id and native_id != saved_id)
         ):
             return (
-                f"视频对战 · {code} 未获唯一有效的原生回执，视频可能已送达，"
+                f"视频对战 · {code} 未获唯一有效且一致的原生回执，视频可能已送达，"
                 "不再重发；本场禁止投票。"
             )
         if entry["transport_mode"] != self._battle_mode():
@@ -413,7 +497,8 @@ class VideoBattleController(BattleCommandsMixin):
             self._battle_save()
         except BaseException:
             entry["vote"] = None
-            entry["platform_message_id"] = ""
+            # Keep the pre-verification durable binding. Legacy hosts have none.
+            entry["platform_message_id"] = saved_id
             raise
         return ""
 

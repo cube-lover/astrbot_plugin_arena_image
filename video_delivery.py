@@ -20,21 +20,29 @@ Delivery accepts result.chain with exactly two Video.fromFileSystem components
 created from verified outputs. It rebuilds fixed A/B labels, ignoring supplied
 text (which may contain prompts/models). AstrBot Video.to_dict may retain a
 plugin-local file URI, even though Image serialization inlines images. Therefore
-we use the adapter's component serializer, then replace BOTH video records with
-explicit base64 OneBot payloads. Never send a URI/signed URL or rely on a shared
-NapCat filesystem. The combined raw-file cap is 32 MiB, NOT 64 MiB per video.
-A numeric direct message_id is mandatory. No fallback: only a known, confirmed
-QQ rejection may retry the identical complete message within the configured
-attempt/deadline bounds. Timeout, unknown receipt and cancellation never retry.
-A read-only get_msg must confirm the exact complete dual-video message before a
-votable receipt is returned; failed/unknown readback never permits another send.
-Native QQ dual-video acceptance is unverified.
+we use the adapter's component serializer, then build ONE native forward card
+with two anonymous bot nodes, each containing exactly one explicit base64 video.
+Never send a URI/signed URL or rely on a shared NapCat filesystem. The combined
+raw-file cap is 32 MiB, NOT 64 MiB per video. A numeric outer message_id is
+mandatory. No fallback: only a known, confirmed QQ rejection may retry the
+identical frozen card within the configured attempt/deadline bounds. Timeout,
+unknown receipt and cancellation never retry. An optional awaited receipt
+callback persists the outer ID before read-only get_msg/get_forward_msg confirm
+both ordered nodes. Tencent multiMsg JSON must bind meta.detail.resid to the
+successful receipt's res_id/forward_id; get_forward_msg uses that resource,
+never the numeric outer ID. Native video file_size must match frozen byte counts
+and handles must differ. Size is not a content-hash proof: equal-sized distinct
+source bytes fail closed because the installed readback lacks a verified hash.
+Failed/unknown readback never permits another send or a votable receipt. Native
+QQ presentation has not been live-tested by this implementation task.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 from dataclasses import dataclass
+import hashlib
 import ipaddress
 import json
 import math
@@ -99,6 +107,7 @@ class VideoDeliveryFailure:
     uncertain: bool
     code: str = "video_delivery_failed"
     confirmed: bool = False  # Send confirmed, but readback may not prove completeness.
+    message_id: str = ""  # Validated native OUTER ID only, even when verification fails.
 
 
 def _error(code: str) -> VideoMaterializationError:
@@ -532,7 +541,7 @@ class _PreSendError(ValueError):
 
 
 def prepare_qq_video_sender(event: Any, timeout_seconds: float):
-    """Prepare only a known aiocqhttp raw transport, without sending anything."""
+    """Prepare a scoped aiocqhttp native-forward transport, without sending."""
     try:
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
         from astrbot.api.event import AstrMessageEvent
@@ -541,21 +550,28 @@ def prepare_qq_video_sender(event: Any, timeout_seconds: float):
         scoped = _scoped_api(vars(event.bot)["_api"], timeout_seconds + 15)
         is_group = bool(event.get_group_id())
         target = event.get_group_id() if is_group else event.get_sender_id()
-        if not re.fullmatch(r"[0-9]{1,20}", str(target)) or int(target) <= 0:
+        if isinstance(target, bool) or not re.fullmatch(r"[0-9]{1,20}", str(target)) or int(target) <= 0:
             return None
         raw = getattr(event.message_obj, "raw_message", None)
         self_id = raw.get("self_id") if isinstance(raw, dict) else None
-        self_id = self_id or getattr(event.message_obj, "self_id", None)
-        routing = {"self_id": self_id} if self_id else {}
+        if self_id is None:
+            self_id = getattr(event.message_obj, "self_id", None)
+        # Custom nodes must use this event's bot, not the caller/model or an
+        # invented account. Missing bot identity cannot be sent anonymously.
+        if isinstance(self_id, bool) or not re.fullmatch(r"[0-9]{1,20}", str(self_id)) or int(self_id) <= 0:
+            return None
+        routing = {"self_id": self_id}
         if not callable(getattr(event, "_parse_onebot_json", None)):
             return None
     except (ImportError, AttributeError, KeyError, TypeError, ValueError):
         return None
 
     payload = None
+    resource_id = None
+    video_facts = None  # Private (byte count, SHA-256); never included in nodes.
 
     async def send(chain, inline):
-        nonlocal payload
+        nonlocal payload, resource_id, video_facts
         if payload is None:
             try:
                 messages = await event._parse_onebot_json(chain)
@@ -566,88 +582,228 @@ def prepare_qq_video_sender(event: Any, timeout_seconds: float):
                     and messages[1].get("data", {}).get("text") == "\nA\n"
                     and messages[3].get("data", {}).get("text") == "\nB\n"
                     and messages[5].get("data", {}).get("text") in (VIDEO_VOTE_FOOTER, VIDEO_REVEAL_FOOTER)
+                    and all(isinstance(value, str) and re.fullmatch(r"base64://[A-Za-z0-9+/]+={0,2}", value)
+                            for value in inline)
                 )
             except Exception:
                 valid = False
             if not valid:
-                raise _PreSendError("Unsupported native dual-video serialization")
-            # Freeze both base64 videos and labels/footer once. Drop callback
-            # URLs, thumbnails and serializer metadata; never reread/reencode
-            # files or serialize a different message after a known rejection.
+                raise _PreSendError("Unsupported native video-forward serialization")
+            # Retain facts from the frozen inline bytes, not mutable local
+            # files or native filenames. Bound work inside the send deadline.
+            try:
+                video_facts = _inline_video_facts(inline)
+            except Exception:
+                raise _PreSendError("Invalid frozen video identity") from None
+            # Freeze once. Strip URLs/thumbnails/metadata from serialization;
+            # every known-rejection retry receives a fresh DEEP payload copy.
             payload = [
-                {"type": "text", "data": {"text": VIDEO_HEADER}},
-                {"type": "text", "data": {"text": "\nA\n"}},
-                {"type": "video", "data": {"file": inline[0]}},
-                {"type": "text", "data": {"text": "\nB\n"}},
-                {"type": "video", "data": {"file": inline[1]}},
-                {"type": "text", "data": {"text": messages[5]["data"]["text"]}},
+                {"type": "node", "data": {
+                    "user_id": int(self_id), "nickname": "视频 Battle A",
+                    "content": [
+                        {"type": "text", "data": {"text": VIDEO_HEADER + "\nA\n"}},
+                        {"type": "video", "data": {"file": inline[0]}},
+                    ],
+                }},
+                {"type": "node", "data": {
+                    "user_id": int(self_id), "nickname": "视频 Battle B",
+                    "content": [
+                        {"type": "text", "data": {"text": "\nB\n" + messages[5]["data"]["text"]}},
+                        {"type": "video", "data": {"file": inline[1]}},
+                    ],
+                }},
             ]
         send.attempts += 1
         result = await scoped.call_action(
-            "send_group_msg" if is_group else "send_private_msg",
+            "send_group_forward_msg" if is_group else "send_private_forward_msg",
             **{"group_id" if is_group else "user_id": int(target)},
-            # Fresh containers protect the frozen payload from transport edits.
-            message=[{"type": item["type"], "data": dict(item["data"])} for item in payload],
+            # Installed Ty.schema requires message BEFORE R2.check can
+            # normalize messages -> message. Supply both native aliases with
+            # independent copies; neither adapter edits nor retries can mutate
+            # the frozen two-node card.
+            message=copy.deepcopy(payload), messages=copy.deepcopy(payload),
             timeout=int(timeout_seconds * 1000), **routing,
         )
+        if _native_api_ok(result):
+            resource_id = _receipt_forward_resource(result)
         return result, AstrMessageEvent
 
     async def verify(native_id):
-        readback = await scoped.call_action("get_msg", message_id=int(native_id), **routing)
-        return _verified_dual_video_message(readback, native_id, payload)
+        # Direct aiocqhttp already unwraps the WebUI envelope. The numeric ID
+        # identifies the outer message, NOT the Tencent multiMsg resource.
+        outer = await scoped.call_action("get_msg", message_id=int(native_id), **routing)
+        resid = _forward_outer_resource(outer, native_id, resource_id)
+        if not resid:
+            return False
+        readback = await scoped.call_action("get_forward_msg", message_id=resid, **routing)
+        return _verified_video_forward_message(readback, payload, video_facts)
 
     send.attempts = 0
     send.verify = verify
     return send
 
 
-def _verified_dual_video_message(readback: Any, native_id: str, payload: Any) -> bool:
-    """Fail closed on the known OneBot get_msg {message_id, message: list} shape.
+def _native_api_ok(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    retcode = value.get("retcode", 0)
+    return (value.get("status", "ok") == "ok" and isinstance(retcode, int)
+            and not isinstance(retcode, bool) and retcode == 0)
 
-    Native readback may replace inline video files with platform file identifiers;
-    never compare or expose those values. No raw-string/content/schema guessing.
+
+def _forward_resource_id(value: Any) -> str:
+    return value if (isinstance(value, str) and 0 < len(value) <= 4096
+                     and not any(char.isspace() or ord(char) < 32 for char in value)
+                     and "://" not in value) else ""
+
+
+def _receipt_forward_resource(receipt: dict) -> str | None:
+    """None means absent; empty means invalid/conflicting explicit resources."""
+    values = [receipt[key] for key in ("res_id", "forward_id") if key in receipt]
+    if not values:
+        return None
+    resources = [_forward_resource_id(value) for value in values]
+    return resources[0] if all(resources) and len(set(resources)) == 1 else ""
+
+
+def _forward_outer_resource(readback: Any, native_id: str, receipt_resource: str | None) -> str:
+    """Exact classic forward or Tencent JSON path, never recursive discovery.
+
+    Tencent JSON requires a receipt resource. Legacy classic forward may supply
+    its own explicit id when the receipt lacks resource fields, but any supplied
+    receipt resource must match. Conflicting/invalid receipt fields fail closed.
     """
     from .battle_reply import message_id
     try:
-        if not isinstance(readback, dict) or not isinstance(payload, list):
-            return False
-        retcode = readback.get("retcode", 0)
-        if (readback.get("status", "ok") != "ok" or isinstance(retcode, bool)
-                or not isinstance(retcode, int) or retcode != 0
+        if (receipt_resource == "" or not _native_api_ok(readback)
                 or message_id(readback.get("message_id")) != native_id):
+            return ""
+        segments = readback.get("message")
+        if not isinstance(segments, list) or len(segments) != 1:
+            return ""
+        segment = segments[0]
+        if not isinstance(segment, dict) or not isinstance(segment.get("data"), dict):
+            return ""
+        data = segment["data"]
+        if segment.get("type") == "forward":
+            resid = _forward_resource_id(data.get("id"))
+        elif segment.get("type") == "json" and receipt_resource:
+            raw = data.get("data")
+            if not isinstance(raw, str) or not 0 < len(raw) <= 64 * 1024:
+                return ""
+            card = json.loads(raw)
+            if not isinstance(card, dict) or card.get("app") != "com.tencent.multimsg":
+                return ""
+            meta = card.get("meta")
+            detail = meta.get("detail") if isinstance(meta, dict) else None
+            if not isinstance(detail, dict):
+                return ""
+            resid = _forward_resource_id(detail.get("resid"))
+        else:
+            return ""
+        return resid if resid and (receipt_resource is None or resid == receipt_resource) else ""
+    except Exception:
+        return ""
+
+
+def _inline_video_facts(inline: Any) -> tuple[tuple[int, str], ...]:
+    """Private byte counts/digests of submitted bytes; never forward metadata."""
+    if not isinstance(inline, (list, tuple)) or len(inline) != 2:
+        raise ValueError("Invalid frozen videos")
+    facts = []
+    total = 0
+    for value in inline:
+        if (not isinstance(value, str) or not value.startswith("base64://")
+                or not 0 < len(value) - 9 <= 4 * ((MAX_INLINE_VIDEO_BYTES + 2) // 3)):
+            raise ValueError("Invalid frozen video")
+        raw = base64.b64decode(value[9:], validate=True)
+        total += len(raw)
+        if not raw or total > MAX_INLINE_VIDEO_BYTES:
+            raise ValueError("Invalid frozen video size")
+        facts.append((len(raw), hashlib.sha256(raw).hexdigest()))
+        del raw
+    return tuple(facts)
+
+
+def _native_video_size(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return 0
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]{1,10}", value):
+        return 0
+    number = int(value)
+    return number if 0 < number <= MAX_INLINE_VIDEO_BYTES else 0
+
+
+def _verified_video_forward_message(readback: Any, payload: Any, video_facts: Any = None) -> bool:
+    """Only installed direct {messages: [{sender, message}, ...]} readback.
+
+    Require two ordered anonymous bot nodes, one video each, exact aggregate
+    text per node. Native file handles must be distinct and declared file_size
+    must exactly match submitted bytes per lane. Size is NOT content identity:
+    equal-sized distinct source digests cannot establish lane identity through
+    this installed contract (no verified content hash), so fail closed. Identical
+    source bytes may pass with distinct handles. Native may move text around its
+    single video. Extra/nested nodes or non-text/video segments fail closed.
+    """
+    try:
+        if not _native_api_ok(readback) or not isinstance(payload, list) or len(payload) != 2:
             return False
-        messages = readback.get("message")
-        if not isinstance(messages, list) or len(messages) > 16:
+        if video_facts is None:
+            video_facts = _inline_video_facts([node["data"]["content"][1]["data"]["file"] for node in payload])
+        if (len(video_facts) != 2
+                or (video_facts[0][0] == video_facts[1][0] and video_facts[0][1] != video_facts[1][1])):
             return False
-        # OneBot may coalesce adjacent text segments. Preserve positional text
-        # around exactly two videos rather than insisting on six readback nodes.
-        expected_text = [
-            payload[0]["data"]["text"] + payload[1]["data"]["text"],
-            payload[3]["data"]["text"], payload[5]["data"]["text"],
-        ]
-        text_blocks = ["", "", ""]
-        videos = 0
-        for actual in messages:
-            if not isinstance(actual, dict) or not isinstance(actual.get("data"), dict):
+        nodes = readback.get("messages")
+        if not isinstance(nodes, list) or len(nodes) != 2:
+            return False
+        handles = set()
+        for node, expected, facts in zip(nodes, payload, video_facts):
+            if not isinstance(node, dict):
                 return False
-            data = actual["data"]
-            if actual.get("type") == "text":
-                text = data.get("text")
-                if not isinstance(text, str) or len(text_blocks[videos]) + len(text) > len(expected_text[videos]):
-                    return False
-                text_blocks[videos] += text
-            elif actual.get("type") == "video":
-                if videos >= 2 or not isinstance(data.get("file"), str) or not data["file"]:
-                    return False
-                videos += 1
-            else:
+            sender = node.get("sender")
+            identity = expected["data"]
+            user_id = sender.get("user_id") if isinstance(sender, dict) else None
+            if (isinstance(user_id, bool) or not isinstance(user_id, (int, str))
+                    or not re.fullmatch(r"[0-9]{1,20}", str(user_id))
+                    or int(user_id) != identity["user_id"]
+                    or sender.get("nickname") != identity["nickname"]):
                 return False
-        return videos == 2 and text_blocks == expected_text
+            segments = node.get("message")
+            if not isinstance(segments, list) or not 2 <= len(segments) <= 16:
+                return False
+            expected_text = identity["content"][0]["data"]["text"]
+            actual_text = ""
+            videos = 0
+            for segment in segments:
+                if not isinstance(segment, dict) or not isinstance(segment.get("data"), dict):
+                    return False
+                data = segment["data"]
+                if segment.get("type") == "text":
+                    text = data.get("text")
+                    if not isinstance(text, str) or len(actual_text) + len(text) > len(expected_text):
+                        return False
+                    actual_text += text
+                elif segment.get("type") == "video":
+                    handle = data.get("file")
+                    if (videos or not isinstance(handle, str) or not 0 < len(handle) <= 32768
+                            or not handle.strip() or handle.strip() in handles
+                            or _native_video_size(data.get("file_size")) != facts[0]):
+                        return False
+                    handles.add(handle.strip())
+                    videos += 1
+                else:
+                    return False
+            if videos != 1 or actual_text != expected_text:
+                return False
+        return True
     except Exception:
         return False
 
 
-def _delivery_failure(code: str, attempts: int, uncertain: bool, *, confirmed: bool = False) -> VideoDeliveryFailure:
+def _delivery_failure(
+    code: str, attempts: int, uncertain: bool, *, confirmed: bool = False, message_id: str = "",
+) -> VideoDeliveryFailure:
+    from .battle_reply import message_id as native_message_id
     messages = {
         "video_transport_unavailable": "无法安全传输双视频，未发送；没有启用回退",
         "video_transport_invalid": "双视频内容或传输大小校验失败，未发送",
@@ -655,7 +811,8 @@ def _delivery_failure(code: str, attempts: int, uncertain: bool, *, confirmed: b
         "video_send_uncertain": "双视频消息回执不确定，已停止发送；请勿自动重发",
         "video_verification_uncertain": "平台已确认发送，但未能确认完整双视频呈现；已停止发送，不能投票或自动重发",
     }
-    return VideoDeliveryFailure(messages[code], attempts, uncertain, code, confirmed)
+    return VideoDeliveryFailure(messages[code], attempts, uncertain, code, confirmed,
+                                native_message_id(message_id))
 
 
 def _send_policy(host: Any, config: Any) -> tuple[int, float]:
@@ -680,13 +837,18 @@ def _send_policy(host: Any, config: Any) -> tuple[int, float]:
     return values[0], values[1]
 
 
-async def deliver_complete_video_battle(host: Any, event: Any, result: Any):
+async def deliver_complete_video_battle(host: Any, event: Any, result: Any, receipt_callback=None):
     """Complete A/B sends; retry only known QQ rejection, never uncertainty.
 
     video_send_timeout (<=600s, default 180s) is the TOTAL budget, including local
-    preparation, linear retry waits and read-only get_msg verification. Only the
-    known get_msg message-list shape with both videos and positioned A/B text
-    authorizes voting (adjacent text may be coalesced). qq_video_send_timeout
+    preparation, linear retry waits, optional awaited receipt callback, and
+    read-only get_msg + get_forward_msg verification (one call each, no polling
+    or business retry). Only the bound Tencent multiMsg JSON (or classic
+    forward) outer plus two complete anonymous A/B bot nodes authorize voting.
+    receipt_callback(native_id), or the optional
+    host._video_native_receipt hook, runs after a positive receipt and BEFORE
+    verification. Callback failure fails closed with the outer message_id;
+    cancellation propagates, never resends. qq_video_send_timeout
     optionally lowers each attempt's deadline; alone it also sets the total.
     Shared image _send_max_attempts/_send_retry_delay methods take precedence over
     config fallback (3 attempts, 2s delay; hard caps 6 and 30s respectively).
@@ -706,6 +868,9 @@ async def deliver_complete_video_battle(host: Any, event: Any, result: Any):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(total_timeout)
         max_attempts, delay = _send_policy(host, config)
+        callback = receipt_callback if receipt_callback is not None else getattr(host, "_video_native_receipt", None)
+        if callback is not None and not callable(callback):
+            raise ValueError("Invalid receipt callback")
         sender = prepare_qq_video_sender(event, timeout)
         if sender is None:
             return _delivery_failure("video_transport_unavailable", 0, False)
@@ -751,6 +916,8 @@ async def deliver_complete_video_battle(host: Any, event: Any, result: Any):
                 rejected = _confirmed_rejection(exc)
             except Exception:
                 rejected = False
+            if not attempts:
+                return _delivery_failure("video_transport_invalid", 0, False)
             if not rejected:
                 return _delivery_failure("video_send_uncertain", attempts, True)
             if attempts >= max_attempts:
@@ -767,27 +934,27 @@ async def deliver_complete_video_battle(host: Any, event: Any, result: Any):
             continue
 
         native_id = ""
-        if isinstance(receipt, dict):
-            status_ok = receipt.get("status", "ok") == "ok"
-            retcode = receipt.get("retcode", 0)
-            retcode_ok = isinstance(retcode, int) and not isinstance(retcode, bool) and retcode == 0
-            if status_ok and retcode_ok:
-                native_id = message_id(receipt.get("message_id"))
+        if _native_api_ok(receipt):
+            native_id = message_id(receipt.get("message_id"))
         if not native_id:
             return _delivery_failure("video_send_uncertain", attempts, True)
-        # A positive send receipt alone cannot prove QQ presented both videos.
-        # After confirmation NO readback failure may retry or authorize voting.
+        # Persist the native outer ID even if verification is interrupted.
+        # Await exactly once, never fire/forget. After confirmation NO callback
+        # or readback failure may authorize another send or a votable receipt.
         verified = False
         try:
-            if loop.time() < deadline:
-                async with asyncio.timeout_at(min(deadline, loop.time() + timeout)):
+            async with asyncio.timeout_at(min(deadline, loop.time() + timeout)):
+                if callback is not None:
+                    await callback(native_id)
+                if loop.time() < deadline:
                     verified = await sender.verify(native_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
         if not verified:
-            return _delivery_failure("video_verification_uncertain", attempts, True, confirmed=True)
+            return _delivery_failure("video_verification_uncertain", attempts, True,
+                                     confirmed=True, message_id=native_id)
         # Only local framework bookkeeping after confirmation, never event.send.
         # Metrics errors cannot invalidate a positive receipt or trigger a retry.
         try:

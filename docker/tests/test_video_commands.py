@@ -8,6 +8,7 @@ import importlib
 import json
 import tempfile
 import unittest
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -126,6 +127,44 @@ class Host(ImageHost):
 
     def _prune_video_outputs(self, *, output_dir, pending):
         self.video_prunes.append((output_dir, pending))
+
+
+class CallbackHost(Host):
+    """Parent hook contract: persist outer ID before fake get_msg/get_forward."""
+
+    def __init__(self, directory, config=None):
+        super().__init__(directory, config)
+        self.callback_ids = ["123"]
+        self.callback_calls = []
+        self.verification_started = asyncio.Event()
+        self.verification_release = None
+        self.verification_error = None
+        self.before_callback = None
+        self.snapshots = []
+        self.verification_calls = []
+
+    async def _deliver_video_battle_message(self, event, result, receipt_callback=None):
+        self.native_results.append(result)
+        self.delivery_started.set()
+        if self.before_callback:
+            self.before_callback(event)
+        for native_id in self.callback_ids:
+            self.callback_calls.append(native_id)
+            await receipt_callback(native_id)
+        if not self.callback_ids:
+            return self.receipt
+        # These are offline stand-ins for verification, NOT native API calls.
+        for action in ("get_msg", "get_forward_msg"):
+            self.verification_calls.append(action)
+            self.snapshots.append(json.loads(
+                (self.data_dir / "video_battles" / "battle_sessions.json").read_text()
+            ))
+        self.verification_started.set()
+        if self.verification_release:
+            await self.verification_release.wait()
+        if self.verification_error:
+            raise self.verification_error
+        return self.receipt
 
 
 def videos(results):
@@ -869,3 +908,411 @@ class VideoCommandsTests(unittest.IsolatedAsyncioTestCase):
         help_result = await collect(self.controller.battle_reveal(self.event, "too many args"))
         self.assertIn("mvbattle揭晓", text(help_result))
         self.assertNotIn("/battle不投票", text(help_result))
+
+    def callback_host(self, directory="callback"):
+        self.host = CallbackHost(self.temp.name + "/" + directory)
+        self.controller = VideoBattleController(self.host)
+        return self.host
+
+    async def assert_nonvotable_binding(self, code, native_id="123"):
+        """Exact quotes survive reload, but never become a vote/resend fallback."""
+        for controller in (self.controller, VideoBattleController(self.host)):
+            entry = controller._battle_sessions[code]
+            self.assertEqual(entry["platform_message_id"], native_id)
+            self.assertIsNone(entry["vote"])
+            self.assertTrue(entry["delivery_attempted"])
+            self.assertFalse(controller._battle_latest)
+            self.assertEqual(controller._battle_reply_code(QuoteEvent(native_id=native_id), native_id), code)
+            with self.assertRaises(ValueError):
+                controller._battle_lookup(self.event, "")
+            with self.assertRaises(ValueError):
+                controller._battle_reply_code(QuoteEvent(native_id="999"), "999")
+            for event in (QuoteEvent("A", native_id), QuoteEvent("不投票", native_id)):
+                self.assertIn("禁止投票", text(await collect(controller.battle_reply(event))))
+            for event in (QuoteEvent(native_id=native_id, owner="bob"),
+                          QuoteEvent(native_id=native_id, chat="other-chat")):
+                with self.assertRaises(ValueError):
+                    controller._battle_reply_code(event, native_id)
+            self.assertIn("不能恢复", text(await collect(controller.video_resume(self.event, code))))
+        self.assertFalse(self.votes())
+        self.assertFalse(self.host.client.calls)
+        self.assertEqual(len(self.host.native_results), 1)
+        self.assert_released()
+
+    async def test_native_callback_saves_outer_binding_before_verification_and_final_vote(self):
+        host = self.callback_host()
+        host.verification_release = asyncio.Event()
+        task = asyncio.create_task(self.begin())
+        try:
+            await asyncio.wait_for(host.verification_started.wait(), 1)
+            code, entry = next(iter(self.disk().items()))
+            self.assertEqual(entry["platform_message_id"], "123")
+            self.assertIsNone(entry["vote"])
+            self.assertTrue(entry["delivery_attempted"])
+            self.assertEqual(host.verification_calls, ["get_msg", "get_forward_msg"])
+            self.assertEqual(host.snapshots, [self.disk(), self.disk()])
+            self.assertFalse(self.controller._battle_latest)
+            restarted = VideoBattleController(host)
+            self.assertEqual(restarted._battle_reply_code(QuoteEvent(), "123"), code)
+            self.assertIn("禁止投票", text(await collect(restarted.battle_reply(QuoteEvent()))))
+            self.assertFalse(self.votes())
+            # Both verification APIs must see this durable non-votable snapshot.
+            host.verification_release.set()
+            actual_code, results = await asyncio.wait_for(task, 1)
+            self.assertEqual(actual_code, code)
+            self.assertEqual([r.text for r in results], [ACK])
+            self.assertEqual(self.disk()[code]["vote"], "")
+            self.assertEqual(self.disk()[code]["platform_message_id"], "123")
+            self.assertFalse(self.controller._battle_latest)
+            self.assertEqual(host.callback_calls, ["123"])
+            self.assertFalse(self.votes())
+            self.assert_released()
+        finally:
+            host.verification_release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_failed_verification_keeps_exact_binding_nonvotable_after_restart(self):
+        for index, outcome in enumerate((None, False, SimpleNamespace(
+            uncertain=False, confirmed=True, message_id="456",
+        ), "error")):
+            with self.subTest(outcome=outcome):
+                host = self.callback_host(f"failed-verify-{index}")
+                host.receipt = outcome
+                code, results = await self.begin()
+                self.assertIn("本场禁止投票", text(results))
+                self.assertIn("不再重发", text(results))
+                self.assertTrue(host.verification_started.is_set())
+                await self.assert_nonvotable_binding(code)
+        host = self.callback_host("raised-verify")
+        host.verification_error = RuntimeError("PRIVATE verification")
+        code, results = await self.begin()
+        self.assertNotIn("PRIVATE", text(results))
+        self.assertIn("本场禁止投票", text(results))
+        await self.assert_nonvotable_binding(code)
+
+    async def test_cancel_or_timeout_verification_keeps_durable_binding_without_resend(self):
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                host = self.callback_host("cancel-verify" if cancel else "timeout-verify")
+                host.verification_release = asyncio.Event()
+                host.config["video_send_timeout"] = 2
+                real_timeout = asyncio.timeout
+
+                def bounded_timeout(seconds, real_timeout=real_timeout):
+                    return real_timeout(0.05 if seconds == 2 else 1)
+
+                with patch.object(video_module.asyncio, "timeout", bounded_timeout):
+                    task = asyncio.create_task(self.begin())
+                    try:
+                        await asyncio.wait_for(host.verification_started.wait(), 1)
+                        code = next(iter(self.disk()))
+                        if cancel:
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                        else:
+                            _, results = await asyncio.wait_for(task, 1)
+                            self.assertIn("本场禁止投票", text(results))
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                await self.assert_nonvotable_binding(code)
+
+    async def test_final_receipt_must_match_saved_outer_id_not_inner_forward_id(self):
+        for index, final_id in enumerate(("456", "forward-resource", True, 0)):
+            with self.subTest(final_id=final_id):
+                host = self.callback_host(f"mismatch-{index}")
+                host.receipt = BattleMessageReceipt(final_id)
+                code, results = await self.begin()
+                self.assertIn("本场禁止投票", text(results))
+                await self.assert_nonvotable_binding(code)
+
+    async def test_native_callback_save_failure_aborts_before_verification_or_vote(self):
+        host = self.callback_host()
+        original = self.controller._battle_save
+
+        def fail_binding():
+            if any(e["platform_message_id"] for e in self.controller._battle_sessions.values()):
+                raise OSError("PRIVATE disk")
+            original()
+
+        with patch.object(self.controller, "_battle_save", fail_binding):
+            code, results = await self.begin()
+        self.assertFalse(host.verification_started.is_set())
+        self.assertFalse(host.snapshots)
+        self.assertEqual(host.callback_calls, ["123"])
+        for entry in (self.disk()[code], self.controller._battle_sessions[code],
+                      VideoBattleController(host)._battle_sessions[code]):
+            self.assertEqual(entry["platform_message_id"], "")
+            self.assertIsNone(entry["vote"])
+            self.assertTrue(entry["delivery_attempted"])
+        self.assertIn("本场禁止投票", text(results))
+        self.assertNotIn("PRIVATE", text(results))
+        self.assertFalse(self.votes())
+        self.assert_released()
+
+    async def test_final_vote_save_failure_preserves_preverification_binding(self):
+        self.callback_host()
+        original = self.controller._battle_save
+
+        def fail_eligibility():
+            if any(e["vote"] == "" for e in self.controller._battle_sessions.values()):
+                raise OSError("PRIVATE disk")
+            original()
+
+        with patch.object(self.controller, "_battle_save", fail_eligibility):
+            code, results = await self.begin()
+        self.assertIn("本场未开放投票", text(results))
+        await self.assert_nonvotable_binding(code)
+
+    async def test_invalid_or_ambiguous_callback_receipts_never_bind_or_verify(self):
+        invalid = (None, False, True, 0, "", "123,456", "123 456", "1" * 21,
+                   "forward-resource", {"message_id": "123"}, BattleMessageReceipt("123"))
+        for index, native_id in enumerate(invalid):
+            with self.subTest(native_id=native_id):
+                host = self.callback_host(f"invalid-callback-{index}")
+                host.callback_ids = [native_id]
+                code, results = await self.begin()
+                self.assertFalse(host.verification_started.is_set())
+                self.assertEqual(self.disk()[code]["platform_message_id"], "")
+                self.assertIsNone(self.disk()[code]["vote"])
+                self.assertTrue(self.disk()[code]["delivery_attempted"])
+                self.assertIn("本场禁止投票", text(results))
+                self.assertFalse(self.votes())
+                self.assert_released()
+
+    async def test_callback_rebinding_is_rejected_and_first_binding_stays_nonvotable(self):
+        host = self.callback_host()
+        host.callback_ids = ["123", "456"]
+        code, results = await self.begin()
+        self.assertFalse(host.verification_started.is_set())
+        self.assertIn("本场禁止投票", text(results))
+        await self.assert_nonvotable_binding(code)
+
+    async def test_callback_image_or_video_receipt_collision_never_stores_second_binding(self):
+        for image in (True, False):
+            with self.subTest(image=image):
+                host = self.callback_host("image-collision" if image else "video-collision")
+                if image:
+                    host._battle_sessions["FEDCBA"] = {
+                        "chat": self.event.unified_msg_origin, "platform_message_id": "123",
+                    }
+                else:
+                    old, _ = await self.begin()
+                    self.assertEqual(self.disk()[old]["vote"], "")
+                    host.verification_started.clear()
+                code, results = await self.begin()
+                self.assertEqual(self.disk()[code]["platform_message_id"], "")
+                self.assertIsNone(self.disk()[code]["vote"])
+                self.assertTrue(self.disk()[code]["delivery_attempted"])
+                self.assertFalse(host.verification_started.is_set())
+                self.assertIn("本场禁止投票", text(results))
+                self.assertFalse(self.votes())
+                self.assert_released()
+
+    async def test_callback_checks_original_chat_owner_code_and_session_identity(self):
+        for mutation in ("chat", "owner", "event", "code", "replace"):
+            with self.subTest(mutation=mutation):
+                host = self.callback_host("identity-" + mutation)
+
+                def change(event, mutation=mutation, host=host):
+                    code, entry = next(iter(self.controller._battle_sessions.items()))
+                    if mutation in {"chat", "owner"}:
+                        entry[mutation] = "different"
+                    elif mutation == "event":
+                        event.unified_msg_origin = "different"
+                    elif mutation == "code":
+                        host._battle_sessions[code] = {"chat": entry["chat"]}
+                    else:
+                        self.controller._battle_sessions[code] = dict(entry)
+
+                host.before_callback = change
+                code, results = await self.begin(Event())
+                self.assertFalse(host.verification_started.is_set())
+                self.assertEqual(self.disk()[code]["platform_message_id"], "")
+                self.assertIsNone(self.disk()[code]["vote"])
+                self.assertIn("本场禁止投票", text(results))
+                self.assertFalse(self.votes())
+                self.assert_released()
+
+    async def test_late_collision_during_verification_cannot_enable_voting(self):
+        host = self.callback_host()
+        host.verification_release = asyncio.Event()
+        task = asyncio.create_task(self.begin())
+        try:
+            await asyncio.wait_for(host.verification_started.wait(), 1)
+            code = next(iter(self.disk()))
+            host._battle_sessions["FEDCBA"] = {
+                "chat": self.event.unified_msg_origin, "platform_message_id": "123",
+            }
+            host.verification_release.set()
+            _, results = await asyncio.wait_for(task, 1)
+            self.assertIn("本场禁止投票", text(results))
+            self.assertEqual(self.disk()[code]["platform_message_id"], "123")
+            self.assertIsNone(self.disk()[code]["vote"])
+            restarted = VideoBattleController(host)
+            self.assertIn("冲突", text(await collect(restarted.battle_reply(QuoteEvent()))))
+            self.assertFalse(self.votes())
+            self.assert_released()
+        finally:
+            host.verification_release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_partial_pair_callback_binding_is_durable_but_never_votable(self):
+        host = self.callback_host()
+        host.video_client.response["sides"]["b"]["finished"] = False
+        code, results = await self.begin()
+        self.assertEqual([r.text for r in results], [ACK])
+        self.assertEqual(len(videos(host.native_results)), 1)
+        self.assertIn("本场禁止投票", text(host.native_results))
+        await self.assert_nonvotable_binding(code)
+
+    async def test_supported_host_without_callback_never_votes_on_hidden_or_final_receipt(self):
+        for index, outcome in enumerate((None, False, BattleMessageReceipt("123"))):
+            with self.subTest(outcome=outcome):
+                host = self.callback_host(f"no-callback-{index}")
+                host.callback_ids = []
+                host.receipt = outcome
+                code, results = await self.begin()
+                self.assertFalse(host.callback_calls)
+                self.assertFalse(host.verification_started.is_set())
+                self.assertEqual(self.disk()[code]["platform_message_id"], "")
+                self.assertIsNone(self.disk()[code]["vote"])
+                self.assertTrue(self.disk()[code]["delivery_attempted"])
+                self.assertIn("本场禁止投票", text(results))
+                self.assertFalse(self.votes())
+
+    async def test_signature_supports_keyword_only_and_kwargs_without_legacy_retry(self):
+        host = self.callback_host()
+        original = host._deliver_video_battle_message
+
+        async def keyword_only(event, result, *, receipt_callback=None):
+            return await original(event, result, receipt_callback=receipt_callback)
+
+        async def kwargs(event, result, **options):
+            self.assertEqual(set(options), {"receipt_callback"})
+            return await original(event, result, **options)
+
+        for index, hook in enumerate((keyword_only, kwargs)):
+            host.callback_ids = [str(123 + index)]
+            host.receipt = BattleMessageReceipt(str(123 + index))
+            with patch.object(host, "_deliver_video_battle_message", hook):
+                code, _ = await self.begin()
+            self.assertEqual(self.disk()[code]["vote"], "")
+            self.assertEqual(self.disk()[code]["platform_message_id"], str(123 + index))
+        self.assertEqual(len(host.native_results), 2)
+        self.assertFalse(self.votes())
+
+    async def test_positional_only_or_uninspectable_legacy_host_is_called_once_without_keyword(self):
+        original = self.host._deliver_video_battle_message
+
+        async def positional_only(event, result, receipt_callback=None, /):
+            self.assertIsNone(receipt_callback)
+            return await original(event, result)
+
+        with patch.object(self.host, "_deliver_video_battle_message", positional_only):
+            code, _ = await self.begin()
+        self.assertEqual(self.disk()[code]["vote"], "")
+        self.host.receipt = BattleMessageReceipt("456")
+        with patch.object(video_module.inspect, "signature", side_effect=ValueError("opaque")):
+            code, _ = await self.begin()
+        self.assertEqual(self.disk()[code]["vote"], "")
+        self.assertEqual(len(self.host.native_results), 2)
+        self.assertFalse(self.votes())
+
+    async def test_typeerror_after_partial_send_never_retries_either_host_signature(self):
+        for callback in (True, False):
+            with self.subTest(callback=callback):
+                host = self.callback_host("typeerror-callback" if callback else "typeerror-legacy")
+
+                async def new_hook(_event, result, receipt_callback=None, *, host=host):
+                    host.native_results.append(result)
+                    await receipt_callback("123")
+                    raise TypeError("PRIVATE after partial send")
+
+                async def legacy_hook(_event, result, *, host=host):
+                    host.native_results.append(result)
+                    raise TypeError("PRIVATE after partial send")
+
+                with patch.object(host, "_deliver_video_battle_message", new_hook if callback else legacy_hook):
+                    code, results = await self.begin()
+                self.assertEqual(len(host.native_results), 1)
+                self.assertIsNone(self.disk()[code]["vote"])
+                self.assertTrue(self.disk()[code]["delivery_attempted"])
+                self.assertEqual(self.disk()[code]["platform_message_id"], "123" if callback else "")
+                self.assertIn("本场禁止投票", text(results))
+                self.assertNotIn("PRIVATE", text(results))
+                self.assertFalse(self.votes())
+                self.assert_released()
+
+    async def test_swallowed_callback_failure_or_late_callback_cannot_enable_vote(self):
+        host = self.callback_host()
+        captured = []
+
+        async def swallowed(_event, result, receipt_callback=None):
+            host.native_results.append(result)
+            captured.append(receipt_callback)
+            with suppress(ValueError):
+                await receipt_callback("ambiguous")
+            return BattleMessageReceipt("123")
+
+        with patch.object(host, "_deliver_video_battle_message", swallowed):
+            code, results = await self.begin()
+        self.assertIn("本场禁止投票", text(results))
+        with self.assertRaises(ValueError):
+            await captured[0]("123")
+        self.assertEqual(self.disk()[code]["platform_message_id"], "")
+        self.assertIsNone(self.disk()[code]["vote"])
+        self.assertFalse(self.votes())
+        self.assert_released()
+
+    async def test_cancelled_callback_save_aborts_verification_and_never_votes_or_resends(self):
+        host = self.callback_host()
+        original = self.controller._battle_save
+
+        def cancelled_save():
+            if any(e["platform_message_id"] for e in self.controller._battle_sessions.values()):
+                raise asyncio.CancelledError
+            original()
+
+        with (
+            patch.object(self.controller, "_battle_save", cancelled_save),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.begin()
+        code = next(iter(self.disk()))
+        self.assertFalse(host.verification_calls)
+        self.assertEqual(self.disk()[code]["platform_message_id"], "")
+        self.assertEqual(self.controller._battle_sessions[code]["platform_message_id"], "")
+        self.assertIsNone(self.disk()[code]["vote"])
+        self.assertTrue(self.disk()[code]["delivery_attempted"])
+        restarted = VideoBattleController(host)
+        self.assertIn("不能恢复", text(await collect(restarted.video_resume(self.event, code))))
+        self.assertEqual(len(host.native_results), 1)
+        self.assertFalse(self.votes())
+        self.assert_released()
+
+    async def test_successful_delivery_ignores_retained_callback_without_changing_vote(self):
+        host = self.callback_host()
+        original = host._deliver_video_battle_message
+        captured = []
+
+        async def retaining(event, result, receipt_callback=None):
+            captured.append(receipt_callback)
+            return await original(event, result, receipt_callback=receipt_callback)
+
+        with patch.object(host, "_deliver_video_battle_message", retaining):
+            code, _ = await self.begin()
+        for native_id in ("123", "456"):
+            with self.assertRaises(ValueError):
+                await captured[0](native_id)
+        self.assertEqual(self.disk()[code]["vote"], "")
+        self.assertEqual(self.controller._battle_sessions[code]["vote"], "")
+        self.assertEqual(self.disk()[code]["platform_message_id"], "123")
+        self.assertFalse(self.votes())
+        self.assert_released()

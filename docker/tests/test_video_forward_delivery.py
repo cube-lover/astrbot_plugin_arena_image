@@ -14,6 +14,10 @@ from astrbot_plugin_arena_image import video_delivery as delivery
 from . import test_video_delivery as fixtures
 
 
+def synthetic_mp4(length, fill):
+    return fixtures.MP4 + bytes([fill]) * (length - len(fixtures.MP4))
+
+
 class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         fixtures.DeliveryTest.setUp(self)
@@ -58,10 +62,8 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params, {
             "group_id": 123, "self_id": "456", "timeout": 200,
             "message": fixtures.expected_forward(second=self.second),
-            "messages": fixtures.expected_forward(second=self.second),
         })
-        self.assertIsNot(params["message"], params["messages"])
-        self.assertIsNot(params["message"][0]["data"]["content"], params["messages"][0]["data"]["content"])
+        self.assertNotIn("messages", params)
         self.assertEqual(scoped_timeout, 15.2)
         self.assertEqual(self.api._timeout_sec, 0.01)
         self.assertEqual(self.api.readbacks, [
@@ -72,7 +74,7 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([vars(item) for item in original_chain], original_state)
         self.assertEqual(len(self.event.parsed_chains), 1)
         self.assertEqual(self.event.bookkeeping, 1)
-        for node, expected in zip(params["messages"], (fixtures.MP4, self.second)):
+        for node, expected in zip(params["message"], (fixtures.MP4, self.second)):
             self.assertEqual(set(node), {"type", "data"})
             self.assertEqual(set(node["data"]), {"user_id", "nickname", "content"})
             content = node["data"]["content"]
@@ -93,7 +95,112 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
             }},
         }, ensure_ascii=False)}}]}
 
+    async def test_captured_large_forward_request_stays_under_onebot_limit_without_plural_alias(self):
+        first_length, second_length = 11777293, 13088999
+        self.paths[0].write_bytes(synthetic_mp4(first_length, ord("A")))
+        self.second = synthetic_mp4(second_length, ord("B"))
+        self.paths[1].write_bytes(self.second)
+        self.host.config.update(video_send_timeout=10, qq_video_send_timeout=10)
+
+        receipt = await self.send()
+
+        self.assertEqual(receipt.message_id, "42")
+        self.assertEqual(self.paths[0].stat().st_size, first_length)
+        self.assertEqual(self.paths[1].stat().st_size, second_length)
+        action, params, _ = self.api.calls[0]
+        captured = fixtures.serialized_forward_request(action, params)
+        self.assertLessEqual(
+            len(captured) + delivery.ONEBOT_ENVELOPE_RESERVE_BYTES,
+            delivery.MAX_ONEBOT_WS_BYTES,
+        )
+        self.assertEqual(delivery.MAX_ONEBOT_WS_BYTES, 50 * 1024 * 1024)
+        self.assertEqual(delivery.ONEBOT_ENVELOPE_RESERVE_BYTES, 4096)
+        self.assertEqual(action, "send_group_forward_msg")
+        self.assertEqual(
+            [len(base64.b64decode(node["data"]["content"][1]["data"]["file"][9:], validate=True))
+             for node in params["message"]],
+            [first_length, second_length],
+        )
+        self.assertNotIn("messages", params)
+        self.assertNotIn('"messages"', captured)
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(len(self.api.readbacks), 2)
+        self.assertEqual(self.event.bookkeeping, 1)
+        self.event.fallback.assert_not_awaited()
+
+    async def test_pre_send_packet_limit_boundary_admits_equality_and_rejects_one_byte_over(self):
+        action = "send_group_forward_msg"
+        params = {
+            "group_id": 123,
+            "self_id": "456",
+            "timeout": 200,
+            "message": fixtures.expected_forward(second=self.second),
+        }
+        packet_limit = (
+            len(fixtures.serialized_forward_request(action, params))
+            + delivery.ONEBOT_ENVELOPE_RESERVE_BYTES
+        )
+        with patch.object(delivery, "MAX_ONEBOT_WS_BYTES", packet_limit), \
+                patch.object(delivery.asyncio, "to_thread", wraps=asyncio.to_thread) as worker:
+            self.assertTrue(delivery._forward_request_fits(action, params))
+            receipt = await self.send()
+        worker.assert_any_await(delivery._forward_request_fits, action, params)
+        self.assertEqual(receipt.message_id, "42")
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(self.api.calls[0][0:2], (action, params))
+        self.assertNotIn("messages", self.api.calls[0][1])
+        self.assertEqual(len(self.api.readbacks), 2)
+
+        self.api.calls.clear()
+        self.api.readbacks.clear()
+        self.api.started.clear()
+        self.api.outcomes = [fixtures.REJECTION, {"message_id": 99}]
+        self.event.bookkeeping = 0
+        callback = AsyncMock()
+        with patch.object(delivery, "MAX_ONEBOT_WS_BYTES", packet_limit - 1), \
+                patch.object(delivery.asyncio, "to_thread", wraps=asyncio.to_thread) as worker:
+            self.assertFalse(delivery._forward_request_fits(action, params))
+            failure = await self.send(callback)
+        worker.assert_any_await(delivery._forward_request_fits, action, params)
+        self.assertIsInstance(failure, delivery.VideoDeliveryFailure)
+        self.assertFalse(failure.uncertain)
+        self.assertFalse(failure.confirmed)
+        self.assertEqual(failure.message_id, "")
+        self.assertEqual(failure.attempts, 0)
+        self.assertFalse(self.api.started.is_set())
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.api.readbacks, [])
+        self.assertEqual(self.api.outcomes, [fixtures.REJECTION, {"message_id": 99}])
+        self.assertEqual(self.event.bookkeeping, 0)
+        callback.assert_not_awaited()
+        self.event.fallback.assert_not_awaited()
+
+    async def test_confirmed_rejection_then_size_check_timeout_is_not_an_uncertain_send(self):
+        self.api.outcomes = [fixtures.REJECTION, {"message_id": 99}]
+        checks = 0
+
+        async def worker(function, *args):
+            nonlocal checks
+            if function is delivery._forward_request_fits:
+                checks += 1
+                if checks == 2:
+                    await asyncio.sleep(10)
+            return function(*args)
+
+        with patch.object(delivery.asyncio, "to_thread", AsyncMock(side_effect=worker)):
+            failure = await self.send()
+        self.assertEqual(checks, 2)
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(self.api.readbacks, [])
+        self.assertEqual(failure.attempts, 1)
+        self.assertEqual(failure.code, "video_send_rejected")
+        self.assertFalse(failure.uncertain)
+        self.assertFalse(failure.confirmed)
+        self.event.fallback.assert_not_awaited()
+
     async def test_native_json_card_uses_receipt_resid_not_outer_numeric_id(self):
+        # This checks resource binding with large bytes, not a 200ms deadline.
+        self.host.config.update(video_send_timeout=10, qq_video_send_timeout=10)
         # Match the captured declared sizes with synthetic local bytes only.
         self.paths[0].write_bytes(fixtures.MP4 + b"A" * (9324824 - len(fixtures.MP4)))
         self.second = fixtures.MP4 + b"B" * (7292073 - len(fixtures.MP4))
@@ -109,8 +216,8 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.message_id, "42")
         callback.assert_awaited_once_with("42")
         self.assertEqual(self.api.readbacks, [
-            ("get_msg", {"message_id": 42, "self_id": "456"}, 15.2),
-            ("get_forward_msg", {"message_id": "fixture-resid", "self_id": "456"}, 15.2),
+            ("get_msg", {"message_id": 42, "self_id": "456"}, 25.0),
+            ("get_forward_msg", {"message_id": "fixture-resid", "self_id": "456"}, 25.0),
         ])
         self.event.fallback.assert_not_awaited()
 
@@ -240,7 +347,8 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError(fixtures.SIGNED_URL)
 
                 inline = delivery._inline_videos(self.paths)
-                with patch.object(delivery.asyncio, "to_thread", AsyncMock(return_value=inline)):
+                with patch.object(delivery.asyncio, "to_thread", AsyncMock(side_effect=
+                        lambda function, *args: inline if function is delivery._inline_videos else function(*args))):
                     if mode == "cancel":
                         with self.assertRaises(asyncio.CancelledError):
                             await self.send(callback)
@@ -346,12 +454,11 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         async def api_call(api, action, **params):
             if action == "send_group_forward_msg":
-                observed.append(copy.deepcopy(params["messages"]))
-                self.assertEqual(params["message"], params["messages"])
+                observed.append(copy.deepcopy(params["message"]))
+                self.assertNotIn("messages", params)
                 if len(observed) == 1:
-                    params["message"][0]["data"]["content"].clear()
-                    params["messages"][0]["data"]["content"][1]["data"]["file"] = "file:///unsafe"
-                    params["messages"][1]["data"]["content"].clear()
+                    params["message"][0]["data"]["content"][1]["data"]["file"] = "file:///unsafe"
+                    params["message"][1]["data"]["content"].clear()
                     self.paths[1].write_bytes(b"changed after prepare")
                     self.host.config["battle_allow_reveal_without_vote"] = True
                     self.event.drop_video = True
@@ -365,8 +472,8 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.message_id, "43")
         self.assertEqual(observed, [expected, expected])
         self.assertEqual(self.api.calls[1][1]["message"], expected)
-        self.assertEqual(self.api.calls[1][1]["messages"], expected)
-        self.assertIsNot(self.api.calls[0][1]["messages"], self.api.calls[1][1]["messages"])
+        self.assertTrue(all("messages" not in params for _, params, _ in self.api.calls))
+        self.assertIsNot(self.api.calls[0][1]["message"], self.api.calls[1][1]["message"])
         self.assertEqual(len(self.event.parsed_chains), 1)
         encode.assert_called_once()
         callback.assert_awaited_once_with("43")
@@ -435,7 +542,7 @@ class ForwardDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts[0][0], facts[1][0])
         self.assertNotEqual(facts[0][1], facts[1][1])
         # Private digest/byte counts are never added to the public forward card.
-        self.assertEqual(self.api.calls[0][1]["messages"], fixtures.expected_forward(second=self.second))
+        self.assertEqual(self.api.calls[0][1]["message"], fixtures.expected_forward(second=self.second))
         for _, digest in facts:
             self.assertNotIn(digest, str(self.api.calls[0][1]))
 

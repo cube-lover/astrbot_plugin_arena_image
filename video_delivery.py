@@ -64,6 +64,8 @@ from .qq_delivery import _scoped_api
 
 DEFAULT_MAX_VIDEO_BYTES = 64 * 1024 * 1024
 MAX_INLINE_VIDEO_BYTES = 32 * 1024 * 1024  # Two videos combined, before base64.
+MAX_ONEBOT_WS_BYTES = 50 * 1024 * 1024  # Installed NapCat WebSocket maxPayload.
+ONEBOT_ENVELOPE_RESERVE_BYTES = 4096  # Transport-added echo and framing fields.
 DEFAULT_VIDEO_TIMEOUT = 90.0
 DEFAULT_VIDEO_SEND_TIMEOUT = 180.0
 DEFAULT_SEND_MAX_ATTEMPTS = 3
@@ -536,6 +538,16 @@ def _confirmed_rejection(exc: Exception) -> bool:
                for text in texts)
 
 
+def _forward_request_fits(action: str, params: dict) -> bool:
+    """Bound the ASCII JSON wire body, with room for transport-added fields.
+
+    ensure_ascii=True also bounds UTF-8 serializers using literal Unicode.
+    Check the whole request rather than raw MP4 sizes or base64 alone.
+    """
+    size = len(json.dumps({"action": action, "params": params}, ensure_ascii=True))
+    return size + ONEBOT_ENVELOPE_RESERVE_BYTES <= MAX_ONEBOT_WS_BYTES
+
+
 class _PreSendError(ValueError):
     """Local serializer failure, before any platform call."""
 
@@ -613,17 +625,19 @@ def prepare_qq_video_sender(event: Any, timeout_seconds: float):
                     ],
                 }},
             ]
+        action = "send_group_forward_msg" if is_group else "send_private_forward_msg"
+        params = {
+            "group_id" if is_group else "user_id": int(target),
+            # The installed schema requires message before alias normalization.
+            # Supplying messages as well duplicates both inline videos on wire.
+            "message": copy.deepcopy(payload),
+            "timeout": int(timeout_seconds * 1000),
+            **routing,
+        }
+        if not await asyncio.to_thread(_forward_request_fits, action, params):
+            raise _PreSendError("Native video-forward request exceeds packet limit")
         send.attempts += 1
-        result = await scoped.call_action(
-            "send_group_forward_msg" if is_group else "send_private_forward_msg",
-            **{"group_id" if is_group else "user_id": int(target)},
-            # Installed Ty.schema requires message BEFORE R2.check can
-            # normalize messages -> message. Supply both native aliases with
-            # independent copies; neither adapter edits nor retries can mutate
-            # the frozen two-node card.
-            message=copy.deepcopy(payload), messages=copy.deepcopy(payload),
-            timeout=int(timeout_seconds * 1000), **routing,
-        )
+        result = await scoped.call_action(action, **params)
         if _native_api_ok(result):
             resource_id = _receipt_forward_resource(result)
         return result, AstrMessageEvent
@@ -900,6 +914,7 @@ async def deliver_complete_video_battle(host: Any, event: Any, result: Any, rece
         if loop.time() >= deadline:
             # No platform call yet, or the last call was a confirmed rejection.
             return _delivery_failure("video_send_rejected" if attempts else "video_transport_invalid", attempts, False)
+        attempts_before = sender.attempts
         attempts += 1
         try:
             async with asyncio.timeout_at(min(deadline, loop.time() + timeout)):
@@ -912,12 +927,17 @@ async def deliver_complete_video_battle(host: Any, event: Any, result: Any, rece
             # Serialization may consume the deadline before any platform call.
             # The prepared transport counts only actual call_action invocations.
             attempts = sender.attempts
+            if attempts == attempts_before:
+                # Preparation timed out before another platform invocation.
+                # Earlier calls, if any, were confirmed rejections.
+                return _delivery_failure(
+                    "video_send_rejected" if attempts else "video_transport_invalid",
+                    attempts, False,
+                )
             try:
                 rejected = _confirmed_rejection(exc)
             except Exception:
                 rejected = False
-            if not attempts:
-                return _delivery_failure("video_transport_invalid", 0, False)
             if not rejected:
                 return _delivery_failure("video_send_uncertain", attempts, True)
             if attempts >= max_attempts:

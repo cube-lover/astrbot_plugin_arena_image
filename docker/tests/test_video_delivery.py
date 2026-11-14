@@ -507,6 +507,10 @@ def forward_nodes(payload):
     return nodes
 
 
+def serialized_forward_request(action, params):
+    return json.dumps({"action": action, "params": params}, ensure_ascii=True)
+
+
 class LeafApi:
     def __init__(self):
         self._timeout_sec = 0.01
@@ -533,10 +537,9 @@ class LeafApi:
                         {"type": "forward", "data": {"id": "native-forward-resource"}}]}
                 sent = next(call for call in reversed(self.calls)
                             if call[1].get("self_id") == params.get("self_id"))
-                return {"messages": forward_nodes(sent[1]["messages"])}
+                return {"messages": forward_nodes(sent[1]["message"])}
             return result
-        # Installed inherited schema validates singular message before the
-        # native handler normalizes the plural alias. Do not mask this locally.
+        # The installed native forward schema requires singular message.
         if action not in ("send_group_forward_msg", "send_private_forward_msg"):
             raise AssertionError("Unexpected business send action")
         if not isinstance(params.get("message"), list) or len(params["message"]) != 2:
@@ -636,10 +639,9 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["timeout"], 100)
         self.assertEqual(deadline, 15.1)
         self.assertEqual(self.api._timeout_sec, 0.01)
-        messages = params["messages"]
+        messages = params["message"]
         self.assertEqual(messages, expected_forward())
-        self.assertEqual(params["message"], messages)
-        self.assertIsNot(params["message"], messages)
+        self.assertNotIn("messages", params)
         self.assertEqual([item["type"] for item in messages], ["node", "node"])
         for node, label in zip(messages, ("A", "B")):
             self.assertEqual(node["data"]["user_id"], 456)
@@ -665,9 +667,12 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         # This test targets a timeout AFTER the actual send boundary, not slow
         # thread-pool startup during preparation. Inline the already-read fixture.
         inline = delivery._inline_videos(self.paths)
-        with patch.object(delivery.asyncio, "to_thread", AsyncMock(return_value=inline)) as prepare:
+        with patch.object(delivery.asyncio, "to_thread", AsyncMock(side_effect=
+                lambda function, *args: inline if function is delivery._inline_videos else function(*args))) as prepare:
             failure = await self.send()
-        prepare.assert_awaited_once_with(delivery._inline_videos, self.paths)
+        self.assertEqual(prepare.await_count, 2)
+        prepare.assert_any_await(delivery._inline_videos, self.paths)
+        prepare.assert_any_await(delivery._forward_request_fits, "send_group_forward_msg", self.api.calls[0][1])
         self.assertTrue(self.api.started.is_set())
         self.assertEqual(failure.code, "video_send_uncertain")
         self.assertTrue(failure.uncertain)
@@ -702,7 +707,7 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.result.chain.append(Plain("unsafe upstream footer " + SIGNED_URL))
         receipt = await self.send()
         self.assertEqual(receipt.message_id, "42")
-        messages = self.api.calls[0][1]["messages"]
+        messages = self.api.calls[0][1]["message"]
         self.assertEqual(messages[-1]["data"]["content"][0]["data"]["text"],
                          "\nB\n" + delivery.VIDEO_REVEAL_FOOTER)
         self.assertEqual(sum(segment["type"] == "video" for node in messages
@@ -720,6 +725,8 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action, "send_private_forward_msg")
         self.assertEqual(params["user_id"], 789)
         self.assertNotIn("group_id", params)
+        self.assertEqual(params["message"], expected_forward())
+        self.assertNotIn("messages", params)
         self.assertEqual(len(self.api.calls), 1)
         self.assert_no_fallback()
 
@@ -774,9 +781,9 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.message_id, "43")
         self.assertEqual(len(self.api.calls), 2)
         self.assertEqual(self.api.calls[0], self.api.calls[1])
-        messages = self.api.calls[0][1]["messages"]
+        messages = self.api.calls[0][1]["message"]
         self.assertEqual(messages, expected_forward(second=second))
-        self.assertIsNot(messages, self.api.calls[1][1]["messages"])
+        self.assertIsNot(messages, self.api.calls[1][1]["message"])
         encode.assert_called_once()
         self.assertEqual(len(self.event.parsed_chains), 1)
         self.assertEqual(self.event.bookkeeping, 1)
@@ -942,7 +949,7 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.message_id, "43")
         self.assertEqual(len(self.api.calls), 2)
         self.assertEqual(self.api.calls[0], self.api.calls[1])
-        self.assertEqual(self.api.calls[1][1]["messages"][-1]["data"]["content"][0]["data"]["text"], "\nB\n" + delivery.VIDEO_REVEAL_FOOTER)
+        self.assertEqual(self.api.calls[1][1]["message"][-1]["data"]["content"][0]["data"]["text"], "\nB\n" + delivery.VIDEO_REVEAL_FOOTER)
         self.assertEqual(len(self.event.parsed_chains), 1)
         self.assert_no_fallback()
 
@@ -1117,17 +1124,25 @@ class DeliveryTest(unittest.IsolatedAsyncioTestCase):
     async def test_bounded_send_timeout_and_cancellation_never_resend(self):
         self.host.config["qq_video_send_timeout"] = 0.02
         self.api.options["delay"] = 10
-        failure = await self.send()
-        self.assertTrue(failure.uncertain)
-        self.assertEqual(len(self.api.calls), 1)
-        self.api.calls.clear()
-        self.api.started.clear()
-        task = asyncio.create_task(self.send())
-        await self.api.started.wait()
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        self.assertEqual(len(self.api.calls), 1)
+
+        async def prepare(function, *args):
+            # Exercise timeout/cancellation AFTER the real platform boundary;
+            # thread-pool scheduling is covered by preparation timeout tests.
+            return function(*args)
+
+        with patch.object(delivery.asyncio, "to_thread", AsyncMock(side_effect=prepare)):
+            failure = await self.send()
+            self.assertTrue(self.api.started.is_set())
+            self.assertTrue(failure.uncertain)
+            self.assertEqual(len(self.api.calls), 1)
+            self.api.calls.clear()
+            self.api.started.clear()
+            task = asyncio.create_task(self.send())
+            await self.api.started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(len(self.api.calls), 1)
         self.assert_no_fallback()
 
     async def test_serializer_dropping_one_video_fails_without_platform_call(self):
